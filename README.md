@@ -6,6 +6,8 @@ The environment uses **Packer**, **PowerShell**, **Ansible**, **K3s**, **embedde
 
 > **Project status:** Core V2 cluster provisioning, three-node control-plane formation, API high availability, controlled node-failure recovery, and Flux reconciliation have been implemented and validated. Additional platform services are being introduced incrementally through GitOps.
 
+![Highly Available Kubernetes Platform Lab architecture](docs/images/platform-architecture.png)
+
 ## What This Demonstrates
 
 - Reproducible infrastructure construction rather than manually configured servers
