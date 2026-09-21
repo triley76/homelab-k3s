@@ -1,0 +1,2 @@
+instance-id: k3s-base
+local-hostname: k3s-base

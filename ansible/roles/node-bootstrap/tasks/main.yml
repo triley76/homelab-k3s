@@ -1,0 +1,37 @@
+---
+- name: Set permanent hostname
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Ensure hostname resolves locally
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1'
+    line: "127.0.1.1 {{ inventory_hostname }}"
+
+- name: Disable cloud-init network configuration
+  ansible.builtin.copy:
+    dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    content: |
+      network: {config: disabled}
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Install permanent Netplan configuration
+  ansible.builtin.template:
+    src: 60-static-network.yaml.j2
+    dest: /etc/netplan/60-static-network.yaml
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Remove cloud-init generated Netplan configuration
+  ansible.builtin.file:
+    path: /etc/netplan/50-cloud-init.yaml
+    state: absent
+
+- name: Validate Netplan configuration
+  ansible.builtin.command:
+    cmd: netplan generate
+  changed_when: false

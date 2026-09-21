@@ -1,0 +1,25 @@
+---
+- name: Wait for k3s to be ready
+  ansible.builtin.wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    state: present
+    timeout: 180
+  when: inventory_hostname == groups['servers'][0]
+
+- name: Install kube-vip RBAC manifest
+  ansible.builtin.copy:
+    src: kube-vip-rbac.yaml
+    dest: /var/lib/rancher/k3s/server/manifests/kube-vip-rbac.yaml
+    owner: root
+    group: root
+    mode: '0644'
+  when: inventory_hostname == groups['servers'][0]
+
+- name: Install kube-vip daemonset manifest
+  ansible.builtin.template:
+    src: kube-vip-daemonset.yaml.j2
+    dest: /var/lib/rancher/k3s/server/manifests/kube-vip-daemonset.yaml
+    owner: root
+    group: root
+    mode: '0644'
+  when: inventory_hostname == groups['servers'][0]

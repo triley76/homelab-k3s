@@ -1,0 +1,73 @@
+---
+- name: Validate V2 cluster nodes before k3s installation
+  hosts: servers
+  become: false
+  gather_facts: true
+
+  tasks:
+    - name: Verify inventory hostname matches node hostname
+      ansible.builtin.assert:
+        that:
+          - ansible_hostname == inventory_hostname
+        fail_msg: >-
+          Hostname mismatch: inventory expects {{ inventory_hostname }},
+          node reports {{ ansible_hostname }}.
+
+    - name: Verify kube-vip network interface exists
+      ansible.builtin.assert:
+        that:
+          - kube_vip_interface in ansible_interfaces
+        fail_msg: >-
+          Required interface {{ kube_vip_interface }} does not exist on
+          {{ inventory_hostname }}.
+
+    - name: Verify expected IPv4 address is assigned
+      ansible.builtin.assert:
+        that:
+          - ansible_host in ansible_all_ipv4_addresses
+        fail_msg: >-
+          Expected address {{ ansible_host }} is not assigned to
+          {{ inventory_hostname }}.
+
+    - name: Verify default gateway
+      ansible.builtin.assert:
+        that:
+          - ansible_default_ipv4.gateway == gateway
+        fail_msg: >-
+          Expected gateway {{ gateway }}, found
+          {{ ansible_default_ipv4.gateway | default('none') }}.
+
+    - name: Verify DNS resolution
+      ansible.builtin.command:
+        cmd: getent hosts github.com
+      changed_when: false
+
+    - name: Check for existing k3s binary
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+
+    - name: Check for existing k3s data
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s
+      register: k3s_data
+
+    - name: Require clean k3s state
+      ansible.builtin.assert:
+        that:
+          - not k3s_binary.stat.exists
+          - not k3s_data.stat.exists
+        fail_msg: >-
+          Existing k3s installation or data detected on
+          {{ inventory_hostname }}. Refusing fresh-cluster bootstrap.
+
+    - name: Verify k3s installer endpoint is reachable
+      ansible.builtin.uri:
+        url: https://get.k3s.io
+        method: HEAD
+        status_code:
+          - 200
+          - 301
+          - 302
+        timeout: 15
+      changed_when: false

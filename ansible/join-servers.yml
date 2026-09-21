@@ -1,0 +1,15 @@
+---
+- name: Prepare additional k3s servers
+  hosts: servers[1:]
+  become: true
+  roles:
+    - k3s-common
+
+- name: Join additional k3s servers
+  hosts: servers[1:]
+  serial: 1
+  become: true
+  vars:
+    k3s_mode: join
+  roles:
+    - k3s-server

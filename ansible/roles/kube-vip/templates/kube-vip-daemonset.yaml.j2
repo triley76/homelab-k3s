@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-vip-ds
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: {name: kube-vip-ds}
+  template:
+    metadata:
+      labels: {name: kube-vip-ds}
+    spec:
+      serviceAccountName: kube-vip
+      containers:
+      - name: kube-vip
+        image: ghcr.io/kube-vip/kube-vip:v0.8.0
+        args: ["manager"]
+        env:
+        - name: vip_arp
+          value: "true"
+        - name: address
+          value: "{{ vip_address }}"
+        - name: vip_interface
+          value: "{{ kube_vip_interface }}"
+        - name: cp_enable
+          value: "true"
+        securityContext:
+          capabilities:
+            add:
+              - NET_ADMIN
+              - NET_RAW
+      hostNetwork: true

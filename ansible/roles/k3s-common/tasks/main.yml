@@ -1,0 +1,19 @@
+---
+- name: Set hostname
+  hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Ensure hostname resolves locally
+  lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1'
+    line: "127.0.1.1 {{ inventory_hostname }}"
+
+- name: Install base packages
+  apt:
+    name:
+      - curl
+      - open-iscsi
+      - nfs-common
+    state: present
+    update_cache: true

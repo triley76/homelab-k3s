@@ -1,0 +1,32 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  network:
+    version: 2
+    ethernets:
+      ens160:
+        dhcp4: true
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY user@example.com
+  storage:
+    layout:
+      name: direct
+  identity:
+    hostname: k3s-base-v2
+    username: ansible
+    password: "REPLACE_WITH_YOUR_SHA512_PASSWORD_HASH"
+  packages:
+    - open-vm-tools
+    - curl
+  user-data:
+    disable_root: false
+  late-commands:
+    - curtin in-target -- systemctl enable ssh
+    - echo 'ansible ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/ansible
+    - chmod 440 /target/etc/sudoers.d/ansible

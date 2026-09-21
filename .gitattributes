@@ -1,0 +1,16 @@
+# Normalize text files in the repository to LF.
+* text=auto eol=lf
+
+# Explicit text formats used by this project.
+*.py       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.j2       text eol=lf
+*.hcl      text eol=lf
+*.pkr.hcl  text eol=lf
+*.ps1      text eol=lf
+*.md       text eol=lf
+*.ini      text eol=lf
+*.cfg      text eol=lf
+*.example  text eol=lf
+*.txt      text eol=lf

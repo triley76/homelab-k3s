@@ -1,0 +1,72 @@
+---
+- name: Validate k3s role mode
+  ansible.builtin.assert:
+    that:
+      - k3s_mode is defined
+      - k3s_mode in ['init', 'join']
+    fail_msg: "k3s_mode must be explicitly set to 'init' or 'join'."
+
+- name: Ensure k3s configuration directory exists
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Configure initial k3s server
+  ansible.builtin.template:
+    src: config-init.yaml.j2
+    dest: /etc/rancher/k3s/config.yaml
+    owner: root
+    group: root
+    mode: '0600'
+  when: k3s_mode == 'init'
+
+- name: Install pinned k3s version on initial server
+  ansible.builtin.shell: |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}" sh -
+  args:
+    creates: /usr/local/bin/k3s
+  when: k3s_mode == 'init'
+
+- name: Wait for initial k3s server token
+  ansible.builtin.wait_for:
+    path: /var/lib/rancher/k3s/server/node-token
+    state: present
+    timeout: 180
+  when: k3s_mode == 'init'
+
+- name: Read cluster token from initial server
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: k3s_token_raw
+  when: k3s_mode == 'join'
+  no_log: true
+
+- name: Install cluster token on joining servers
+  ansible.builtin.copy:
+    content: "{{ k3s_token_raw.content | b64decode | trim }}"
+    dest: /etc/rancher/k3s/cluster-token
+    owner: root
+    group: root
+    mode: '0600'
+  when: k3s_mode == 'join'
+  no_log: true
+
+- name: Configure joining k3s servers
+  ansible.builtin.template:
+    src: config-join.yaml.j2
+    dest: /etc/rancher/k3s/config.yaml
+    owner: root
+    group: root
+    mode: '0600'
+  when: k3s_mode == 'join'
+
+- name: Install pinned k3s version on joining servers
+  ansible.builtin.shell: |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}" sh -
+  args:
+    creates: /usr/local/bin/k3s
+  when: k3s_mode == 'join'

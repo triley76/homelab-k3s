@@ -1,0 +1,6 @@
+---
+- name: Bootstrap cluster node identity and networking
+  hosts: bootstrap
+  become: true
+  roles:
+    - node-bootstrap

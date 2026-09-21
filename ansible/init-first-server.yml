@@ -1,0 +1,14 @@
+---
+- name: Prepare first k3s server
+  hosts: servers[0]
+  become: true
+  roles:
+    - k3s-common
+
+- name: Initialize first k3s server
+  hosts: servers[0]
+  become: true
+  vars:
+    k3s_mode: init
+  roles:
+    - k3s-server

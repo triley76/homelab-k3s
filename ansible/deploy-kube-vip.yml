@@ -1,0 +1,6 @@
+---
+- name: Deploy kube-vip control plane VIP
+  hosts: servers[0]
+  become: true
+  roles:
+    - kube-vip
