@@ -159,20 +159,20 @@ The GitOps foundation has been validated. Networking services, ingress, persiste
 
 ```text
 .
-â”œâ”€â”€ ansible/                 Ansible orchestration and roles
-â”œâ”€â”€ config/                  Local workstation configuration template
-â”œâ”€â”€ docs/
-â”‚   â”œâ”€â”€ architecture.md      Detailed platform architecture
-â”‚   â”œâ”€â”€ build.md             Reproducible build procedure
-â”‚   â”œâ”€â”€ validation.md        Validation and failure-test evidence
-â”‚   â””â”€â”€ decisions/           Architecture Decision Records
-â”œâ”€â”€ packer/                  VMware Ubuntu base-image definition
-â”œâ”€â”€ bootstrap_nodes.ps1      Bootstrap orchestration
-â”œâ”€â”€ clone_nodes.ps1          VMware node cloning
-â”œâ”€â”€ discover_nodes.ps1       Node discovery
-â”œâ”€â”€ generate_bootstrap_inventory.ps1
-â”œâ”€â”€ nodes.py                 Cluster configuration source of truth
-â””â”€â”€ README.md
+|-- ansible/                 Ansible orchestration and roles
+|-- config/                  Local workstation configuration template
+|-- docs/
+|   |-- architecture.md      Detailed platform architecture
+|   |-- build.md             Reproducible build procedure
+|   |-- validation.md        Validation and failure-test evidence
+|   `-- decisions/           Architecture Decision Records
+|-- packer/                  VMware Ubuntu base-image definition
+|-- bootstrap_nodes.ps1      Bootstrap orchestration
+|-- clone_nodes.ps1          VMware node cloning
+|-- discover_nodes.ps1       Node discovery
+|-- generate_bootstrap_inventory.ps1
+|-- nodes.py                 Cluster configuration source of truth
+`-- README.md
 ```
 
 ## Design Decisions
