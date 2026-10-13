@@ -1,0 +1,30 @@
+---
+# Controlled time-synchronization remediation for an existing cluster.
+# Run once per server with --limit, verifying cluster and etcd health between
+# servers. See docs/time-synchronization.md. K3s is not stopped or restarted.
+- name: Configure Chrony time synchronization on one existing k3s server
+  hosts: servers
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  max_fail_percentage: 0
+
+  vars:
+    # Existing etcd members: never allow Chrony's startup step.
+    time_sync_allow_startup_step: false
+
+  pre_tasks:
+    - name: Require an explicit single-server limit
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_play_hosts_all | length == 1
+        fail_msg: >-
+          Run this playbook for exactly one server at a time, for example
+          with --limit k3s01. See docs/time-synchronization.md.
+        quiet: true
+      run_once: true
+
+  roles:
+    - time-sync

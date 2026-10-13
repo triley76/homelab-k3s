@@ -1,0 +1,38 @@
+---
+# Public NTP sources written to the Chrony sources.d drop-in. Each entry must be
+# a complete "server" or "pool" directive; sources.d accepts no other
+# directives. Private time servers belong in local inventory variables, not in
+# this repository.
+time_sync_sources:
+  - pool pool.ntp.org iburst maxsources 4
+
+# Drop-in read through Ubuntu's packaged "sourcedir /etc/chrony/sources.d".
+time_sync_sources_path: /etc/chrony/sources.d/homelab.sources
+
+# Whether Ubuntu's packaged, startup-only "makestep 1 3" may stay effective.
+# Safe default: false. Fresh-build playbooks set it to true. It is honored only
+# while K3s is absent; on a node with K3s the role always runs Chrony in
+# no-startup-step mode, whatever this variable says.
+time_sync_allow_startup_step: false
+
+# Paths that indicate an existing K3s installation.
+time_sync_k3s_indicators:
+  - /usr/local/bin/k3s
+  - /var/lib/rancher/k3s
+
+# No-startup-step mode adds chronyd -R through this systemd drop-in. -R makes
+# chronyd ignore "initstepslew" and any "makestep" with a positive limit.
+time_sync_no_step_dropin: /etc/systemd/system/chrony.service.d/10-homelab-no-startup-step.conf
+
+# Ubuntu 24.04's packaged ExecStart, which the drop-in reproduces with -R added.
+# The role fails closed if the installed unit differs.
+time_sync_chronyd_starter: /usr/lib/systemd/scripts/chronyd-starter.sh
+time_sync_packaged_execstart: "ExecStart=!/usr/lib/systemd/scripts/chronyd-starter.sh $DAEMON_OPTS"
+
+# Post-configuration wait for at least one selectable source. This checks that
+# Chrony can use a source, not that the final offset target has been reached.
+time_sync_source_wait_retries: 12
+time_sync_source_wait_delay: 5
+
+# VMware Tools command; periodic time synchronization is disabled when present.
+time_sync_vmware_toolbox_cmd: /usr/bin/vmware-toolbox-cmd

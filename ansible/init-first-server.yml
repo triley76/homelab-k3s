@@ -2,7 +2,11 @@
 - name: Prepare first k3s server
   hosts: servers[0]
   become: true
+  vars:
+    # Honored only while K3s is absent; see roles/time-sync/defaults/main.yml.
+    time_sync_allow_startup_step: true
   roles:
+    - time-sync
     - k3s-common
 
 - name: Initialize first k3s server
@@ -12,3 +16,17 @@
     k3s_mode: init
   roles:
     - k3s-server
+
+# After K3s is installed, re-run time-sync in no-startup-step mode so that no
+# built node keeps the packaged startup step. The role installs and verifies
+# the -R drop-in and restarts chronyd only if the running process lacks -R.
+# K3s is not stopped or restarted.
+- name: Persist no-startup-step time synchronization on the first k3s server
+  hosts: servers[0]
+  serial: 1
+  any_errors_fatal: true
+  become: true
+  vars:
+    time_sync_allow_startup_step: false
+  roles:
+    - time-sync

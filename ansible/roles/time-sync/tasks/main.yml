@@ -1,0 +1,383 @@
+---
+- name: Require the Ubuntu 24.04 Chrony packaging this role was written for
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['distribution'] == 'Ubuntu'
+      - ansible_facts['distribution_version'] == '24.04'
+    fail_msg: >-
+      The time-sync role supports Ubuntu 24.04 only; found
+      {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
+    quiet: true
+
+- name: Validate the configured NTP sources
+  ansible.builtin.assert:
+    that:
+      - time_sync_sources | length > 0
+      - time_sync_sources | reject('match', '^(server|pool) [A-Za-z0-9.:-]+( [a-z0-9 ]+)?$') | list | length == 0
+    fail_msg: >-
+      time_sync_sources must contain only "server" or "pool" directives,
+      the only directives Chrony accepts from sources.d.
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# Mode: a bounded startup step is allowed only on a fresh build that requested
+# it and has no K3s yet. Every other case runs Chrony with chronyd -R.
+# ---------------------------------------------------------------------------
+- name: Check for an existing K3s installation
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ time_sync_k3s_indicators }}"
+  register: time_sync_k3s_paths
+
+- name: Resolve the startup-step mode
+  ansible.builtin.set_fact:
+    time_sync_k3s_present: "{{ time_sync_k3s_paths.results | selectattr('stat.exists') | list | length > 0 }}"
+    time_sync_startup_step_effective: >-
+      {{ (time_sync_allow_startup_step | bool)
+      and (time_sync_k3s_paths.results | selectattr('stat.exists') | list | length == 0) }}
+
+- name: Report the startup-step mode
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'fresh-build mode: the packaged startup-only makestep 1 3 stays effective (no K3s present)'
+      if time_sync_startup_step_effective | bool
+      else 'no-startup-step mode: chronyd runs with -R' }}
+
+- name: Gather package facts
+  ansible.builtin.package_facts:
+    manager: apt
+
+- name: Gather service facts
+  ansible.builtin.service_facts:
+
+- name: Record the pre-existing Chrony state
+  ansible.builtin.set_fact:
+    time_sync_chrony_was_installed: "{{ 'chrony' in ansible_facts.packages }}"
+    time_sync_chrony_was_active: >-
+      {{ ansible_facts.services['chrony.service'] is defined
+      and ansible_facts.services['chrony.service'].state == 'running' }}
+
+# Second, independent guard against the package postinst starting chronyd. An
+# administrator mask survives the postinst's "deb-systemd-helper unmask", which
+# only removes masks that the helper itself created.
+- name: Mask chrony.service until its configuration is verified
+  ansible.builtin.systemd_service:
+    name: chrony.service
+    masked: true
+  when: not time_sync_chrony_was_installed | bool
+
+- name: Ensure the chrony.service drop-in directory exists
+  ansible.builtin.file:
+    path: "{{ time_sync_no_step_dropin | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: not time_sync_startup_step_effective | bool
+
+- name: Install the no-startup-step drop-in
+  ansible.builtin.template:
+    src: chrony-no-startup-step.conf.j2
+    dest: "{{ time_sync_no_step_dropin }}"
+    owner: root
+    group: root
+    mode: '0644'
+  register: time_sync_dropin_present
+  when: not time_sync_startup_step_effective | bool
+
+- name: Remove the no-startup-step drop-in on a fresh build
+  ansible.builtin.file:
+    path: "{{ time_sync_no_step_dropin }}"
+    state: absent
+  register: time_sync_dropin_absent
+  when: time_sync_startup_step_effective | bool
+
+- name: Reload systemd after a drop-in change
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: (time_sync_dropin_present is changed) or (time_sync_dropin_absent is changed)
+
+# ---------------------------------------------------------------------------
+# systemd-timesyncd is stopped and masked before Chrony is installed. The
+# policy-rc.d guard below would also block the timesyncd package's own stop
+# during removal, which would leave it running.
+# ---------------------------------------------------------------------------
+- name: Stop and disable systemd-timesyncd while its unit is installed
+  ansible.builtin.systemd_service:
+    name: systemd-timesyncd.service
+    state: stopped
+    enabled: false
+  when:
+    - ansible_facts.services['systemd-timesyncd.service'] is defined
+    - ansible_facts.services['systemd-timesyncd.service'].status not in ['masked', 'not-found']
+
+# Masking works whether or not the unit is installed, and keeps a later
+# reinstallation from starting a second time daemon.
+- name: Mask systemd-timesyncd
+  ansible.builtin.systemd_service:
+    name: systemd-timesyncd.service
+    masked: true
+
+- name: Check for VMware Tools
+  ansible.builtin.stat:
+    path: "{{ time_sync_vmware_toolbox_cmd }}"
+  register: time_sync_vmware_toolbox
+
+# The status text is localized by open-vm-tools, so the C locale is forced and
+# only the two English tokens are accepted.
+- name: Read VMware Tools periodic time synchronization state
+  ansible.builtin.command:
+    argv:
+      - "{{ time_sync_vmware_toolbox_cmd }}"
+      - timesync
+      - status
+  environment:
+    LC_ALL: C
+  register: time_sync_vmware_status
+  changed_when: false
+  failed_when: time_sync_vmware_status.stdout | trim not in ['Enabled', 'Disabled']
+  when: time_sync_vmware_toolbox.stat.exists
+
+# Only periodic synchronization is disabled. One-off corrections after events
+# such as resume or snapshot restore are hypervisor settings and are unchanged.
+- name: Disable VMware Tools periodic time synchronization
+  ansible.builtin.command:
+    argv:
+      - "{{ time_sync_vmware_toolbox_cmd }}"
+      - timesync
+      - disable
+  environment:
+    LC_ALL: C
+  changed_when: true
+  when:
+    - time_sync_vmware_toolbox.stat.exists
+    - time_sync_vmware_status.stdout | default('') | trim == 'Enabled'
+
+# First guard against autostart: policy-rc.d exit 101 makes the postinst's
+# deb-systemd-invoke skip starting chrony.service. Chrony conflicts with
+# time-daemon, so apt also removes the systemd-timesyncd package here.
+- name: Install Chrony without starting it
+  ansible.builtin.apt:
+    name: chrony
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    policy_rc_d: 101
+
+- name: Fail closed if package installation started Chrony
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - chrony.service
+  register: time_sync_after_install
+  changed_when: false
+  failed_when: time_sync_after_install.stdout != 'inactive'
+  when: not time_sync_chrony_was_active | bool
+
+- name: Read the packaged Chrony configuration
+  ansible.builtin.slurp:
+    src: /etc/chrony/chrony.conf
+  register: time_sync_chrony_conf
+
+- name: Require the packaged sources.d include
+  ansible.builtin.assert:
+    that:
+      - >-
+        time_sync_chrony_conf.content | b64decode
+        | regex_findall('(?m)^\s*sourcedir\s+/etc/chrony/sources\.d\s*$')
+        | length > 0
+    fail_msg: >-
+      /etc/chrony/chrony.conf does not include /etc/chrony/sources.d, so the
+      managed sources file would be ignored. The packaged configuration has
+      been changed locally; resolve that before applying this role.
+    quiet: true
+
+- name: Install the explicit NTP sources drop-in
+  ansible.builtin.template:
+    src: homelab.sources.j2
+    dest: "{{ time_sync_sources_path }}"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload Chrony sources
+
+# ---------------------------------------------------------------------------
+# Pre-start verification. Any failure here leaves chrony.service stopped (and
+# masked on a first install), which is the fail-closed state.
+# ---------------------------------------------------------------------------
+- name: Print the effective Chrony configuration
+  # chronyd -p parses chrony.conf and its confdir files, prints them and exits
+  # before touching the clock.
+  ansible.builtin.command:
+    argv:
+      - chronyd
+      - -p
+  environment:
+    LC_ALL: C
+  register: time_sync_effective_config
+  changed_when: false
+
+- name: Reject unconditional clock steps
+  ansible.builtin.assert:
+    that:
+      - time_sync_effective_config.stdout_lines | select('match', '^\s*makestep\s+\S+\s+-') | list | length == 0
+    fail_msg: >-
+      A makestep directive with a negative limit allows clock steps at any
+      time, and chronyd -R does not suppress it.
+    quiet: true
+
+- name: Read the packaged chrony.service unit
+  ansible.builtin.slurp:
+    src: /usr/lib/systemd/system/chrony.service
+  register: time_sync_packaged_unit
+  when: not time_sync_startup_step_effective | bool
+
+- name: Read the effective chrony.service ExecStart
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - chrony.service
+      - --property=ExecStart
+      - --value
+  register: time_sync_execstart
+  changed_when: false
+  when: not time_sync_startup_step_effective | bool
+
+- name: Read the chronyd daemon options
+  ansible.builtin.slurp:
+    src: /etc/default/chrony
+  register: time_sync_default_chrony
+  when: not time_sync_startup_step_effective | bool
+
+# /etc/default/chrony is a shell fragment; only its DAEMON_OPTS assignment is
+# read. -s, -q and -Q can set the clock at startup.
+- name: Require the no-startup-step configuration before starting Chrony
+  vars:
+    time_sync_daemon_opts: >-
+      {{ (time_sync_default_chrony.content | b64decode
+      | regex_findall('(?m)^\s*DAEMON_OPTS="([^"]*)"\s*$') | last | default('')).split() }}
+  ansible.builtin.assert:
+    that:
+      - (time_sync_packaged_unit.content | b64decode).splitlines() | select('equalto', time_sync_packaged_execstart) | list | length == 1
+      - time_sync_execstart.stdout | regex_findall('path=') | length == 1
+      - time_sync_execstart.stdout is search('argv\[\]=\S*chronyd-starter\.sh [^;]*\s-R(\s|;)')
+      - time_sync_daemon_opts | select('match', '^-[A-Za-z0-9]*[sqQ]') | list | length == 0
+    fail_msg: >-
+      Cannot guarantee that Chrony will not step the clock at startup. The
+      packaged ExecStart must be "{{ time_sync_packaged_execstart }}", the
+      effective ExecStart must be the single drop-in command with -R, and
+      DAEMON_OPTS must not contain -s, -q or -Q. Chrony has not been started.
+    quiet: true
+  when: not time_sync_startup_step_effective | bool
+
+- name: Unmask chrony.service
+  ansible.builtin.systemd_service:
+    name: chrony.service
+    masked: false
+
+- name: Enable and start Chrony
+  ansible.builtin.systemd_service:
+    name: chrony.service
+    enabled: true
+    state: started
+
+# ---------------------------------------------------------------------------
+# No-startup-step mode must end with the RUNNING chronyd carrying -R, not only
+# its next start. The drop-in and the effective ExecStart were verified above,
+# so a restart here starts chronyd with -R, which ignores the packaged
+# positive-limit makestep. Any failure stops Chrony (the fail-closed state).
+# ---------------------------------------------------------------------------
+- name: Bring the running chronyd into no-startup-step mode
+  when: not time_sync_startup_step_effective | bool
+  block:
+    - name: Read the running chronyd main PID
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - chrony.service
+          - --property=MainPID
+          - --value
+      register: time_sync_pid_before
+      changed_when: false
+
+    - name: Read the running chronyd arguments
+      ansible.builtin.command:
+        argv:
+          - ps
+          - -o
+          - args=
+          - -p
+          - "{{ time_sync_pid_before.stdout | trim }}"
+      register: time_sync_args_before
+      changed_when: false
+      failed_when: false
+
+    # Restart only when the running process lacks the distinct -R argument, or
+    # when a daemon that was already running predates a drop-in change.
+    - name: Decide whether chronyd must be restarted
+      ansible.builtin.set_fact:
+        time_sync_restart_required: >-
+          {{ (time_sync_args_before.rc | default(1) != 0)
+          or ((time_sync_args_before.stdout | default('') | trim) is not search('(^|\s)-R(\s|$)'))
+          or ((time_sync_dropin_present is changed) and (time_sync_chrony_was_active | bool)) }}
+
+    - name: Restart chronyd with the verified -R drop-in
+      ansible.builtin.systemd_service:
+        name: chrony.service
+        state: restarted
+      when: time_sync_restart_required | bool
+
+    - name: Read the chronyd main PID after the transition
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - chrony.service
+          - --property=MainPID
+          - --value
+      register: time_sync_pid_after
+      changed_when: false
+
+    - name: Read the chronyd arguments after the transition
+      ansible.builtin.command:
+        argv:
+          - ps
+          - -o
+          - args=
+          - -p
+          - "{{ time_sync_pid_after.stdout | trim }}"
+      register: time_sync_chronyd_args
+      changed_when: false
+      failed_when: false
+
+    - name: Require the running chronyd to carry -R
+      ansible.builtin.assert:
+        that:
+          - time_sync_chronyd_args.rc == 0
+          - time_sync_chronyd_args.stdout | trim is search('(^|\s)-R(\s|$)')
+        fail_msg: >-
+          The running chronyd does not carry -R after the no-startup-step
+          transition.
+        quiet: true
+
+  rescue:
+    - name: Stop Chrony because no-startup-step mode could not be verified
+      ansible.builtin.systemd_service:
+        name: chrony.service
+        state: stopped
+
+    - name: Fail closed
+      ansible.builtin.fail:
+        msg: >-
+          Chrony could not be brought into verified no-startup-step mode and
+          has been stopped. No time daemon is running on this node. Failed
+          task: {{ ansible_failed_task.name | default('unknown') }}.
+
+- name: Apply pending Chrony source changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Validate the time-synchronization configuration
+  ansible.builtin.include_tasks: validate.yml

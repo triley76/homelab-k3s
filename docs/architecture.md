@@ -268,23 +268,27 @@ ansible/site.yml
 
 The workflow is intentionally ordered.
 
-### 1. Prepare All Servers
+### 1. Configure Time Synchronization
+
+The `time-sync` role replaces `systemd-timesyncd` with Chrony and disables VMware Tools periodic time synchronization, so that each node has a single time daemon before embedded etcd is created. The play is serial. Step 6 converts every node to no-startup-step mode once K3s exists. See [Time Synchronization](time-synchronization.md).
+
+### 2. Prepare All Servers
 
 The `k3s-common` role prepares all Kubernetes server nodes with common prerequisites.
 
-### 2. Initialize the First Server
+### 3. Initialize the First Server
 
 The server marked as the initial node is configured first.
 
 It initializes the K3s cluster and embedded etcd datastore.
 
-### 3. Deploy kube-vip
+### 4. Deploy kube-vip
 
 kube-vip is deployed after the initial server becomes available.
 
 It provides the virtual API endpoint used to access the Kubernetes control plane.
 
-### 4. Join Additional Servers
+### 5. Join Additional Servers
 
 The remaining server nodes are joined to the cluster sequentially.
 
@@ -301,6 +305,10 @@ This is deliberate.
 During development, concurrent control-plane joins exposed an etcd learner issue. Changing the workflow to sequential joins produced a more controlled and reliable cluster-formation process.
 
 This is an example of the automation being changed in response to observed platform behavior rather than treating the initial implementation as final.
+
+### 6. Persist No-Startup-Step Time Synchronization
+
+After K3s is installed and joined, the `time-sync` role runs again on every server, serially and fail-fast. It installs and verifies a systemd drop-in that starts chronyd with `-R`. It restarts chronyd only if the running process lacks `-R`, and requires the running process to carry `-R`. Chrony therefore cannot step the clock at startup on any embedded-etcd member, including after later reboots. K3s is not stopped or restarted. See [Time Synchronization](time-synchronization.md).
 
 ## K3s Control Plane
 

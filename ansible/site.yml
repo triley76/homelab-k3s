@@ -1,4 +1,18 @@
 ---
+# Serial so that an accidental re-run against an existing cluster never changes
+# time synchronization on every etcd member at once. Existing clusters use
+# configure-time-sync.yml with --limit instead.
+- name: Configure time synchronization before k3s installation
+  hosts: servers
+  serial: 1
+  any_errors_fatal: true
+  become: true
+  vars:
+    # Honored only while K3s is absent; see roles/time-sync/defaults/main.yml.
+    time_sync_allow_startup_step: true
+  roles:
+    - time-sync
+
 - name: Prepare all k3s cluster nodes
   hosts: servers
   become: true
@@ -27,3 +41,17 @@
     k3s_mode: join
   roles:
     - k3s-server
+
+# After K3s is installed, re-run time-sync in no-startup-step mode so that no
+# built node keeps the packaged startup step. The role installs and verifies
+# the -R drop-in and restarts chronyd only if the running process lacks -R.
+# K3s is not stopped or restarted.
+- name: Persist no-startup-step time synchronization on all k3s servers
+  hosts: servers
+  serial: 1
+  any_errors_fatal: true
+  become: true
+  vars:
+    time_sync_allow_startup_step: false
+  roles:
+    - time-sync
