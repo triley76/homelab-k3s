@@ -1,0 +1,6 @@
+# Managed by Ansible (homelab-k3s time-sync role).
+# chronyd -R ignores "initstepslew" and any "makestep" with a positive limit,
+# so Chrony cannot step the clock at startup on a node that runs K3s.
+[Service]
+ExecStart=
+ExecStart=!{{ time_sync_chronyd_starter }} $DAEMON_OPTS -R

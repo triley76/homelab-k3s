@@ -1,0 +1,148 @@
+---
+# Service and configuration validation run at the end of every role apply.
+# It does not require the final offset target: a freshly started Chrony may
+# still be slewing. The later acceptance check is validate-time-sync.yml.
+
+- name: Read Chrony and systemd-timesyncd unit states
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - "{{ item.query }}"
+      - "{{ item.unit }}"
+  loop:
+    - key: chrony_active
+      unit: chrony.service
+      query: is-active
+    - key: chrony_enabled
+      unit: chrony.service
+      query: is-enabled
+    - key: timesyncd_active
+      unit: systemd-timesyncd.service
+      query: is-active
+    - key: timesyncd_enabled
+      unit: systemd-timesyncd.service
+      query: is-enabled
+  loop_control:
+    label: "{{ item.query }} {{ item.unit }}"
+  register: time_sync_unit_states
+  changed_when: false
+  failed_when: false
+
+# systemctl prints fixed state keywords here, not localized prose.
+- name: Require Chrony running and systemd-timesyncd masked
+  vars:
+    time_sync_states: >-
+      {{ dict(time_sync_unit_states.results | map(attribute='item.key')
+      | zip(time_sync_unit_states.results | map(attribute='stdout'))) }}
+  ansible.builtin.assert:
+    that:
+      - time_sync_states['chrony_active'] == 'active'
+      - time_sync_states['chrony_enabled'] == 'enabled'
+      - time_sync_states['timesyncd_active'] == 'inactive'
+      - time_sync_states['timesyncd_enabled'] == 'masked'
+    fail_msg: >-
+      Expected chrony.service active and enabled, and
+      systemd-timesyncd.service inactive and masked (a masked unit cannot be
+      enabled). Observed: {{ time_sync_states }}.
+    quiet: true
+
+# Final, independent re-read: in no-startup-step mode the running chronyd must
+# carry the distinct -R argument when the role finishes, whether this run
+# started it, restarted it, or found it already compliant.
+- name: Re-read the running chronyd main PID
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - chrony.service
+      - --property=MainPID
+      - --value
+  register: time_sync_final_pid
+  changed_when: false
+  when: not time_sync_startup_step_effective | bool
+
+- name: Re-read the running chronyd arguments
+  ansible.builtin.command:
+    argv:
+      - ps
+      - -o
+      - args=
+      - -p
+      - "{{ time_sync_final_pid.stdout | trim }}"
+  register: time_sync_final_args
+  changed_when: false
+  failed_when: false
+  when: not time_sync_startup_step_effective | bool
+
+- name: Require the running chronyd to carry -R
+  ansible.builtin.assert:
+    that:
+      - time_sync_final_args.rc == 0
+      - time_sync_final_args.stdout | trim is search('(^|\s)-R(\s|$)')
+    fail_msg: >-
+      chronyd is running without -R at the end of a no-startup-step run.
+      Stop and investigate before continuing.
+    quiet: true
+  when: not time_sync_startup_step_effective | bool
+
+- name: Confirm VMware Tools periodic time synchronization is disabled
+  ansible.builtin.command:
+    argv:
+      - "{{ time_sync_vmware_toolbox_cmd }}"
+      - timesync
+      - status
+  environment:
+    LC_ALL: C
+  register: time_sync_vmware_final
+  changed_when: false
+  failed_when: time_sync_vmware_final.stdout | trim != 'Disabled'
+  when: time_sync_vmware_toolbox.stat.exists
+
+- name: Confirm chronyc tracking succeeds
+  ansible.builtin.command:
+    argv:
+      - chronyc
+      - -c
+      - tracking
+  environment:
+    LC_ALL: C
+  register: time_sync_tracking
+  changed_when: false
+  failed_when: >-
+    time_sync_tracking.rc != 0
+    or (time_sync_tracking.stdout | trim).split(',') | length < 14
+
+# CSV columns: mode, state, name, ... State "*" is the selected source and "+"
+# a combined source; either is usable.
+- name: Wait for at least one usable NTP source
+  ansible.builtin.command:
+    argv:
+      - chronyc
+      - -c
+      - sources
+  environment:
+    LC_ALL: C
+  register: time_sync_sources_csv
+  changed_when: false
+  until: >-
+    time_sync_sources_csv.rc == 0
+    and time_sync_sources_csv.stdout_lines | select('match', '^\^,[*+],') | list | length > 0
+  retries: "{{ time_sync_source_wait_retries }}"
+  delay: "{{ time_sync_source_wait_delay }}"
+
+- name: Confirm the node remains reachable
+  ansible.builtin.wait_for_connection:
+    timeout: 60
+
+# Informational only. Convergence below the acceptance target is assessed
+# later with validate-time-sync.yml, not here.
+- name: Report initial Chrony tracking values
+  vars:
+    time_sync_fields: "{{ (time_sync_tracking.stdout | trim).split(',') }}"
+  ansible.builtin.debug:
+    msg:
+      - "Leap status: {{ time_sync_fields[13] }}"
+      - "System time offset (s): {{ time_sync_fields[4] }}"
+      - "Last offset (s): {{ time_sync_fields[5] }}"
+      - "Frequency (ppm): {{ time_sync_fields[7] }}"
+      - "Usable sources: {{ time_sync_sources_csv.stdout_lines | select('match', '^\\^,[*+],') | list | length }}"

@@ -1,0 +1,454 @@
+---
+# Read-only time-synchronization acceptance report. Every task only reads
+# state; nothing is installed, configured, started, stopped or stepped.
+#
+# Report only (default):
+#   ansible-playbook validate-time-sync.yml
+# Fail when an acceptance criterion is not met:
+#   ansible-playbook validate-time-sync.yml -e time_sync_enforce_acceptance=true
+#
+# Machine-readable sources are used where they exist: chronyc -c (CSV),
+# systemctl state keywords, and kubectl JSONPath or JSON. The VMware Tools status is
+# localized prose, so it is read in the C locale and compared with two fixed
+# tokens. etcd warnings are matched by their fixed message text.
+- name: Report time-synchronization state on k3s servers
+  hosts: servers
+  become: true
+  gather_facts: true
+  gather_subset:
+    - min
+
+  vars:
+    time_sync_enforce_acceptance: false
+    time_sync_report_window: 1h
+    time_sync_max_offset_seconds: 0.1
+    time_sync_preferred_offset_seconds: 0.01
+    time_sync_vmware_toolbox_cmd: /usr/bin/vmware-toolbox-cmd
+    # Existing-cluster acceptance requires chronyd to run with -R. Set false
+    # only to report on a fresh-built cluster that keeps the startup step.
+    time_sync_require_no_startup_step: true
+    time_sync_expected_kustomizations:
+      - flux-system/flux-system
+      - flux-system/infrastructure-controllers
+      - flux-system/infrastructure-configs
+      - flux-system/monitoring
+      - flux-system/monitoring-configs
+      - flux-system/apps
+    time_sync_monitoring_namespaces:
+      - monitoring
+      - monitoring-node-exporter
+    # Prometheus and Alertmanager; node-exporter.
+    time_sync_min_monitoring_statefulsets: 2
+    time_sync_min_monitoring_daemonsets: 1
+    time_sync_canary_namespace: platform-demo
+    time_sync_canary_deployment: platform-canary
+
+  tasks:
+    - name: Read Chrony tracking (CSV)
+      ansible.builtin.command:
+        argv: [chronyc, -c, tracking]
+      environment:
+        LC_ALL: C
+      register: time_sync_tracking
+      changed_when: false
+      failed_when: false
+
+    - name: Read Chrony sources (CSV)
+      ansible.builtin.command:
+        argv: [chronyc, -c, sources]
+      environment:
+        LC_ALL: C
+      register: time_sync_sources_csv
+      changed_when: false
+      failed_when: false
+
+    - name: Read unit states
+      ansible.builtin.command:
+        argv: [systemctl, "{{ item.query }}", "{{ item.unit }}"]
+      loop:
+        - key: timesyncd_active
+          unit: systemd-timesyncd.service
+          query: is-active
+        - key: timesyncd_enabled
+          unit: systemd-timesyncd.service
+          query: is-enabled
+        - key: chrony_active
+          unit: chrony.service
+          query: is-active
+        - key: k3s_active
+          unit: k3s.service
+          query: is-active
+      loop_control:
+        label: "{{ item.query }} {{ item.unit }}"
+      register: time_sync_unit_states
+      changed_when: false
+      failed_when: false
+
+    - name: Check for VMware Tools
+      ansible.builtin.stat:
+        path: "{{ time_sync_vmware_toolbox_cmd }}"
+      register: time_sync_vmware_toolbox
+
+    - name: Read VMware Tools periodic time synchronization state
+      ansible.builtin.command:
+        argv: ["{{ time_sync_vmware_toolbox_cmd }}", timesync, status]
+      environment:
+        LC_ALL: C
+      register: time_sync_vmware_status
+      changed_when: false
+      failed_when: false
+      when: time_sync_vmware_toolbox.stat.exists
+
+    - name: Read the running chronyd main PID
+      ansible.builtin.command:
+        argv: [systemctl, show, chrony.service, --property=MainPID, --value]
+      register: time_sync_main_pid
+      changed_when: false
+      failed_when: false
+
+    - name: Read the running chronyd arguments
+      ansible.builtin.command:
+        argv: [ps, -o, args=, -p, "{{ time_sync_main_pid.stdout | default('0') | trim }}"]
+      register: time_sync_chronyd_args
+      changed_when: false
+      failed_when: false
+
+    - name: Read the active kernel clocksource
+      ansible.builtin.slurp:
+        src: /sys/devices/system/clocksource/clocksource0/current_clocksource
+      register: time_sync_clocksource
+
+    # etcd logs "prober found high clock drift" when a peer's clock differs
+    # by more than one second. Only the count is reported; the log lines
+    # contain peer identifiers that are not needed here.
+    - name: Count recent etcd clock-drift warnings
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit=k3s.service
+          - --since=-{{ time_sync_report_window }}
+          - --no-pager
+          - --quiet
+          - --output=cat
+          - --grep=found high clock drift
+      register: time_sync_drift
+      changed_when: false
+      failed_when: time_sync_drift.rc not in [0, 1]
+
+    - name: Build the per-node report
+      vars:
+        time_sync_fields: "{{ (time_sync_tracking.stdout | trim).split(',') if time_sync_tracking.rc == 0 else [] }}"
+        time_sync_valid: "{{ time_sync_fields | length >= 14 }}"
+        time_sync_states: >-
+          {{ dict(time_sync_unit_states.results | map(attribute='item.key')
+          | zip(time_sync_unit_states.results | map(attribute='stdout'))) }}
+      ansible.builtin.set_fact:
+        time_sync_report:
+          node: "{{ inventory_hostname }}"
+          utc_timestamp: "{{ ansible_facts['date_time']['iso8601'] }}"
+          chrony_active: "{{ time_sync_states['chrony_active'] }}"
+          tracking_valid: "{{ time_sync_valid | bool }}"
+          reference: "{{ time_sync_fields[1] if time_sync_valid | bool else 'unavailable' }}"
+          stratum: "{{ time_sync_fields[2] if time_sync_valid | bool else 'unavailable' }}"
+          leap_status: "{{ time_sync_fields[13] if time_sync_valid | bool else 'unavailable' }}"
+          system_time_offset_s: "{{ time_sync_fields[4] | float if time_sync_valid | bool else 'unavailable' }}"
+          last_offset_s: "{{ time_sync_fields[5] | float if time_sync_valid | bool else 'unavailable' }}"
+          rms_offset_s: "{{ time_sync_fields[6] | float if time_sync_valid | bool else 'unavailable' }}"
+          frequency_ppm: "{{ time_sync_fields[7] | float if time_sync_valid | bool else 'unavailable' }}"
+          skew_ppm: "{{ time_sync_fields[9] | float if time_sync_valid | bool else 'unavailable' }}"
+          update_interval_s: "{{ time_sync_fields[12] | float if time_sync_valid | bool else 'unavailable' }}"
+          sources_total: "{{ time_sync_sources_csv.stdout_lines | select('match', '^[\\^=#],') | list | length }}"
+          sources_usable: "{{ time_sync_sources_csv.stdout_lines | select('match', '^\\^,[*+],') | list | length }}"
+          timesyncd_active: "{{ time_sync_states['timesyncd_active'] }}"
+          timesyncd_enabled: "{{ time_sync_states['timesyncd_enabled'] }}"
+          vmware_periodic_sync: >-
+            {{ (time_sync_vmware_status.stdout | trim) if time_sync_vmware_toolbox.stat.exists else 'not-installed' }}
+          clocksource: "{{ time_sync_clocksource.content | b64decode | trim }}"
+          chronyd_started_with_R: >-
+            {{ time_sync_chronyd_args.rc == 0 and (time_sync_chronyd_args.stdout | trim) is search('(^|\s)-R(\s|$)') }}
+          k3s_active: "{{ time_sync_states['k3s_active'] }}"
+          etcd_clock_drift_warnings: "{{ time_sync_drift.stdout_lines | length }}"
+          etcd_clock_drift_window: "{{ time_sync_report_window }}"
+
+    - name: Evaluate per-node acceptance criteria
+      vars:
+        time_sync_offset: >-
+          {{ [time_sync_report.system_time_offset_s | float | abs, time_sync_report.last_offset_s | float | abs] | max
+          if time_sync_report.tracking_valid | bool else 999 }}
+      ansible.builtin.set_fact:
+        time_sync_checks:
+          chrony_synchronized: >-
+            {{ time_sync_report.chrony_active == 'active' and time_sync_report.tracking_valid | bool
+            and time_sync_report.leap_status != 'Not synchronised' and time_sync_report.sources_usable | int > 0 }}
+          offset_below_max: "{{ time_sync_offset | float < time_sync_max_offset_seconds | float }}"
+          offset_below_preferred: "{{ time_sync_offset | float < time_sync_preferred_offset_seconds | float }}"
+          frequency_not_pinned_at_500ppm: >-
+            {{ time_sync_report.tracking_valid | bool
+            and ((time_sync_report.frequency_ppm | float | abs) - 500) | abs > 0.001 }}
+          timesyncd_inactive_and_masked: >-
+            {{ time_sync_report.timesyncd_active == 'inactive' and time_sync_report.timesyncd_enabled == 'masked' }}
+          vmware_periodic_sync_disabled: "{{ time_sync_report.vmware_periodic_sync in ['Disabled', 'not-installed'] }}"
+          k3s_active: "{{ time_sync_report.k3s_active == 'active' }}"
+          no_etcd_clock_drift_warnings: "{{ time_sync_report.etcd_clock_drift_warnings | int == 0 }}"
+          chrony_no_startup_step: >-
+            {{ (not time_sync_require_no_startup_step | bool) or (time_sync_report.chronyd_started_with_R | bool) }}
+
+    - name: Show the per-node report
+      ansible.builtin.debug:
+        msg:
+          report: "{{ time_sync_report }}"
+          checks: "{{ time_sync_checks }}"
+
+    - name: Read Kubernetes node readiness
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - nodes
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.name}{"="}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+      register: time_sync_nodes
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Read etcd readiness through the API server
+      ansible.builtin.command:
+        argv: [k3s, kubectl, get, --raw, /readyz/etcd]
+      register: time_sync_etcd_ready
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Read Flux Kustomization readiness
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - kustomizations.kustomize.toolkit.fluxcd.io
+          - --all-namespaces
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"="}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+      register: time_sync_flux
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Read Deployment availability
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - deployments
+          - --all-namespaces
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"="}{.status.availableReplicas}{"/"}{.spec.replicas}{"\n"}{end}'
+      register: time_sync_deployments
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Read Pods
+      ansible.builtin.command:
+        argv: [k3s, kubectl, get, pods, --all-namespaces, -o, json]
+      register: time_sync_pods
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Read StatefulSets and DaemonSets
+      ansible.builtin.command:
+        argv: [k3s, kubectl, get, 'statefulsets,daemonsets', --all-namespaces, -o, json]
+      register: time_sync_workloads
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Read the canary Deployment
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - deployment
+          - "{{ time_sync_canary_deployment }}"
+          - --namespace={{ time_sync_canary_namespace }}
+          - -o
+          - json
+      register: time_sync_canary
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    # Flux: each expected Kustomization must appear exactly once with
+    # Ready=True. Extra Kustomizations are reported, not failed, so that a later
+    # platform layer does not invalidate time-synchronization acceptance; their
+    # readiness is reported alongside.
+    - name: Evaluate Flux Kustomizations
+      vars:
+        time_sync_flux_lines: "{{ time_sync_flux.stdout_lines if time_sync_flux.rc == 0 else [] }}"
+        time_sync_flux_names: "{{ time_sync_flux_lines | map('regex_replace', '=.*$', '') | list }}"
+        time_sync_flux_ready: "{{ time_sync_flux_lines | select('match', '^[^=]+=True$') | map('regex_replace', '=True$', '') | list }}"
+      ansible.builtin.set_fact:
+        time_sync_flux_eval:
+          read_ok: "{{ time_sync_flux.rc == 0 }}"
+          missing: "{{ time_sync_expected_kustomizations | reject('in', time_sync_flux_names) | list }}"
+          duplicates: >-
+            {%- set ns = namespace(out=[]) -%}
+            {%- for name in time_sync_flux_names | unique -%}
+            {%- if time_sync_flux_names | select('equalto', name) | list | length > 1 -%}
+            {%- set ns.out = ns.out + [name] -%}
+            {%- endif -%}
+            {%- endfor -%}
+            {{ ns.out | join(';;') }}
+          not_ready: >-
+            {{ time_sync_expected_kustomizations | select('in', time_sync_flux_names)
+            | reject('in', time_sync_flux_ready) | list }}
+          extra: "{{ time_sync_flux_names | reject('in', time_sync_expected_kustomizations) | list }}"
+          extra_not_ready: >-
+            {{ time_sync_flux_names | reject('in', time_sync_expected_kustomizations)
+            | reject('in', time_sync_flux_ready) | list }}
+      run_once: true
+
+    # Monitoring workloads. Kubernetes omits zero-valued status counters, so an
+    # absent or null readyReplicas, numberReady, desiredNumberScheduled or
+    # availableReplicas is read as 0. An absent or null spec.replicas is a
+    # problem in its own right (the API server always sets it). Empty results
+    # are problems, never healthy.
+    - name: Evaluate monitoring and canary workloads
+      vars:
+        time_sync_pod_items: >-
+          {{ ((time_sync_pods.stdout | from_json)['items'] if time_sync_pods.rc == 0 else [])
+          | selectattr('metadata.namespace', 'in', time_sync_monitoring_namespaces) | list }}
+        time_sync_workload_items: >-
+          {{ ((time_sync_workloads.stdout | from_json)['items'] if time_sync_workloads.rc == 0 else [])
+          | selectattr('metadata.namespace', 'in', time_sync_monitoring_namespaces) | list }}
+        time_sync_statefulsets: "{{ time_sync_workload_items | selectattr('kind', 'equalto', 'StatefulSet') | list }}"
+        time_sync_daemonsets: "{{ time_sync_workload_items | selectattr('kind', 'equalto', 'DaemonSet') | list }}"
+        time_sync_canary_obj: "{{ (time_sync_canary.stdout | from_json) if time_sync_canary.rc == 0 else {} }}"
+      ansible.builtin.set_fact:
+        time_sync_workload_problems: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- if time_sync_pods.rc != 0 -%}{%- set ns.out = ns.out + ['pods: read failed'] -%}{%- endif -%}
+          {%- if time_sync_workloads.rc != 0 -%}{%- set ns.out = ns.out + ['statefulsets/daemonsets: read failed'] -%}{%- endif -%}
+          {%- for namespace_name in time_sync_monitoring_namespaces -%}
+          {%- if time_sync_pod_items | selectattr('metadata.namespace', 'equalto', namespace_name) | list | length == 0 -%}
+          {%- set ns.out = ns.out + [namespace_name ~ ': no pods'] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- for pod in time_sync_pod_items -%}
+          {%- set pod_id = pod.metadata.namespace ~ '/' ~ pod.metadata.name -%}
+          {%- set pod_status = pod.status | default({}, true) -%}
+          {%- if pod_status.phase | default('', true) != 'Running' -%}
+          {%- set ns.out = ns.out + [pod_id ~ ': phase ' ~ (pod_status.phase | default('unknown', true))] -%}
+          {%- endif -%}
+          {%- set ready_names = pod_status.containerStatuses | default([], true)
+          | selectattr('ready', 'equalto', true) | map(attribute='name') | list -%}
+          {%- for container in (pod.spec | default({}, true)).containers | default([], true) -%}
+          {%- if container.name not in ready_names -%}
+          {%- set ns.out = ns.out + [pod_id ~ ': container ' ~ container.name ~ ' not ready'] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {%- if time_sync_statefulsets | length < time_sync_min_monitoring_statefulsets | int -%}
+          {%- set ns.out = ns.out + ['statefulsets: ' ~ (time_sync_statefulsets | length) ~ ' found, '
+          ~ time_sync_min_monitoring_statefulsets ~ ' required'] -%}
+          {%- endif -%}
+          {%- for sts in time_sync_statefulsets -%}
+          {%- set sts_id = 'statefulset ' ~ sts.metadata.namespace ~ '/' ~ sts.metadata.name -%}
+          {%- set desired = (sts.spec | default({}, true)).replicas -%}
+          {%- set ready = (sts.status | default({}, true)).readyReplicas | default(0, true) | int -%}
+          {%- if desired is not defined or desired is none -%}
+          {%- set ns.out = ns.out + [sts_id ~ ': spec.replicas absent'] -%}
+          {%- elif desired | int < 1 or ready != desired | int -%}
+          {%- set ns.out = ns.out + [sts_id ~ ': ready ' ~ ready ~ ' of ' ~ desired] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if time_sync_daemonsets | length < time_sync_min_monitoring_daemonsets | int -%}
+          {%- set ns.out = ns.out + ['daemonsets: ' ~ (time_sync_daemonsets | length) ~ ' found, '
+          ~ time_sync_min_monitoring_daemonsets ~ ' required'] -%}
+          {%- endif -%}
+          {%- for ds in time_sync_daemonsets -%}
+          {%- set ds_id = 'daemonset ' ~ ds.metadata.namespace ~ '/' ~ ds.metadata.name -%}
+          {%- set desired = (ds.status | default({}, true)).desiredNumberScheduled | default(0, true) | int -%}
+          {%- set ready = (ds.status | default({}, true)).numberReady | default(0, true) | int -%}
+          {%- if desired < 1 or ready != desired -%}
+          {%- set ns.out = ns.out + [ds_id ~ ': ready ' ~ ready ~ ' of ' ~ desired] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set canary_id = 'deployment ' ~ time_sync_canary_namespace ~ '/' ~ time_sync_canary_deployment -%}
+          {%- if time_sync_canary.rc != 0 -%}
+          {%- set ns.out = ns.out + [canary_id ~ ': not found'] -%}
+          {%- else -%}
+          {%- set desired = (time_sync_canary_obj.spec | default({}, true)).replicas -%}
+          {%- set available = (time_sync_canary_obj.status | default({}, true)).availableReplicas | default(0, true) | int -%}
+          {%- if desired is not defined or desired is none -%}
+          {%- set ns.out = ns.out + [canary_id ~ ': spec.replicas absent'] -%}
+          {%- elif desired | int < 1 or available != desired | int -%}
+          {%- set ns.out = ns.out + [canary_id ~ ': available ' ~ available ~ ' of ' ~ desired] -%}
+          {%- endif -%}
+          {%- endif -%}
+          {{ ns.out | join(';;') }}
+        time_sync_workload_counts:
+          monitoring_pods: "{{ time_sync_pod_items | length }}"
+          monitoring_statefulsets: "{{ time_sync_statefulsets | length }}"
+          monitoring_daemonsets: "{{ time_sync_daemonsets | length }}"
+      run_once: true
+
+    - name: Build the cluster report
+      vars:
+        # A Deployment is fully available when available equals desired
+        # replicas; one deliberately scaled to zero reports "=/0".
+        time_sync_unavailable: >-
+          {{ time_sync_deployments.stdout_lines
+          | reject('match', '^[^=]+=(\d+)/\1$')
+          | reject('match', '^[^=]+=0?/0$') | list }}
+        time_sync_flux_duplicates: "{{ time_sync_flux_eval.duplicates.split(';;') | reject('equalto', '') | list }}"
+        time_sync_problem_list: "{{ time_sync_workload_problems.split(';;') | reject('equalto', '') | list }}"
+      ansible.builtin.set_fact:
+        time_sync_cluster:
+          nodes: "{{ time_sync_nodes.stdout_lines }}"
+          all_nodes_ready: >-
+            {{ time_sync_nodes.rc == 0 and time_sync_nodes.stdout_lines | length > 0
+            and time_sync_nodes.stdout_lines | reject('match', '^[^=]+=True$') | list | length == 0 }}
+          etcd_ready: "{{ time_sync_etcd_ready.rc == 0 and time_sync_etcd_ready.stdout | trim == 'ok' }}"
+          flux_kustomizations: "{{ time_sync_flux.stdout_lines }}"
+          flux_missing: "{{ time_sync_flux_eval.missing }}"
+          flux_duplicates: "{{ time_sync_flux_duplicates }}"
+          flux_not_ready: "{{ time_sync_flux_eval.not_ready }}"
+          flux_extra: "{{ time_sync_flux_eval.extra }}"
+          flux_extra_not_ready: "{{ time_sync_flux_eval.extra_not_ready }}"
+          expected_flux_kustomizations_ready: >-
+            {{ time_sync_flux_eval.read_ok | bool
+            and time_sync_flux_eval.missing | length == 0
+            and time_sync_flux_duplicates | length == 0
+            and time_sync_flux_eval.not_ready | length == 0 }}
+          deployments_not_fully_available: "{{ time_sync_unavailable }}"
+          all_deployments_available: "{{ time_sync_deployments.rc == 0 and time_sync_unavailable | length == 0 }}"
+          workload_counts: "{{ time_sync_workload_counts }}"
+          workload_problems: "{{ time_sync_problem_list }}"
+          monitoring_and_canary_healthy: "{{ time_sync_problem_list | length == 0 }}"
+      run_once: true
+
+    - name: Show the cluster report
+      ansible.builtin.debug:
+        var: time_sync_cluster
+      run_once: true
+
+    - name: Enforce acceptance criteria
+      ansible.builtin.assert:
+        that:
+          - time_sync_checks.values() | map('bool') | select('equalto', false) | list | length == 0
+          - time_sync_cluster.all_nodes_ready | bool
+          - time_sync_cluster.etcd_ready | bool
+          - time_sync_cluster.expected_flux_kustomizations_ready | bool
+          - time_sync_cluster.all_deployments_available | bool
+          - time_sync_cluster.monitoring_and_canary_healthy | bool
+        fail_msg: >-
+          Acceptance not met on {{ inventory_hostname }}. Node checks:
+          {{ time_sync_checks }}. See the cluster report above.
+        quiet: true
+      when: time_sync_enforce_acceptance | bool

@@ -1,0 +1,10 @@
+---
+# Sources in sources.d are applied without restarting chronyd, so a source change
+# does not re-arm the packaged startup-only makestep behavior.
+- name: Reload Chrony sources
+  ansible.builtin.command:
+    argv:
+      - chronyc
+      - reload
+      - sources
+  changed_when: true

@@ -117,6 +117,9 @@ PowerShell clone/discovery
 Ansible node bootstrap
   |
   v
+Chrony time synchronization
+  |
+  v
 K3s server initialization
   |
   v
@@ -124,6 +127,9 @@ kube-vip
   |
   v
 Serial server joins
+  |
+  v
+No-startup-step time synchronization (chronyd -R)
   |
   v
 Three-node HA control plane
@@ -137,6 +143,8 @@ One configuration module, [`nodes.py`](nodes.py), provides the authoritative clu
 The Ansible orchestration initializes the first K3s server and then joins additional servers **serially**. This ordering was introduced after testing exposed an etcd learner issue during concurrent control-plane joins.
 
 That behavior is documented as part of the platform design rather than hidden inside the automation.
+
+Before K3s is installed, the `time-sync` role replaces `systemd-timesyncd` with Chrony and disables VMware Tools periodic time synchronization, because embedded etcd, TLS and signed cloud API requests all depend on accurate clocks. After K3s is installed, the role runs again, one server at a time, so that every built node runs chronyd with `-R` and cannot step its clock at startup. Existing clusters are remediated one server at a time; see [docs/time-synchronization.md](docs/time-synchronization.md).
 
 ## GitOps Boundary
 
@@ -164,6 +172,7 @@ The GitOps foundation has been validated. Networking services, ingress, persiste
 |-- docs/
 |   |-- architecture.md      Detailed platform architecture
 |   |-- build.md             Reproducible build procedure
+|   |-- time-synchronization.md  Chrony configuration and per-node rollout
 |   |-- validation.md        Validation and failure-test evidence
 |   `-- decisions/           Architecture Decision Records
 |-- packer/                  VMware Ubuntu base-image definition

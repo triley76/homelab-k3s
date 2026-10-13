@@ -372,6 +372,20 @@ site.yml
 
 The bootstrap playbook depends on the temporary bootstrap inventory generated during VM discovery. Static syntax validation therefore confirms the playbook structure but does not substitute for a live bootstrap execution.
 
+The time-synchronization playbooks were later syntax-checked the same way, with ansible-core 2.16.3:
+
+```text
+
+configure-time-sync.yml
+
+validate-time-sync.yml
+
+```
+
+`ansible/tests/time_sync_expressions.py` also checks the time-synchronization playbook and role structure, including the post-K3s no-startup-step play in every build playbook. It exercises the decision logic of the `time-sync` role and the acceptance playbook locally, against mocked command output.
+
+Syntax checks and expression tests do not show that Chrony converges on the live nodes. The live rollout and acceptance procedure are described in [time-synchronization.md](time-synchronization.md); no live result is recorded yet.
+
 ### Packer
 
 The Packer configuration was processed with `packer fmt` and passed `packer fmt -check`.
