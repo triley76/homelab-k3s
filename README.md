@@ -4,7 +4,7 @@ A reproducible three-node Kubernetes platform built to demonstrate infrastructur
 
 The environment uses **Packer**, **PowerShell**, **Ansible**, **K3s**, **embedded etcd**, **kube-vip**, and **Flux** to automate the lifecycle from base virtual-machine construction through a highly available Kubernetes control plane and GitOps reconciliation.
 
-> **Project status:** Core V2 cluster provisioning, three-node control-plane formation, API high availability, controlled node-failure recovery, and Flux reconciliation have been implemented and validated. Additional platform services are being introduced incrementally through GitOps.
+> **Project status:** Core V2 cluster provisioning, three-node control-plane formation, API high availability, controlled node-failure recovery, Flux reconciliation, and safe Chrony time synchronization have been implemented and validated. Additional platform services are being introduced incrementally through GitOps.
 
 ![Highly Available Kubernetes Platform Lab architecture](docs/images/platform-architecture.png)
 
@@ -80,6 +80,7 @@ The addresses above use the RFC 5737 documentation range and are examples rather
 | Control-plane node failure and recovery | Validated |
 | Flux Git source reconciliation | Validated |
 | Flux Kustomization reconciliation | Validated |
+| Serial Chrony rollout and enforced one-hour stability window | Validated |
 | GitOps platform-service expansion | In progress |
 
 The current Kubernetes baseline is pinned to **K3s v1.36.4+k3s1**. Flux **2.9.5** has been bootstrapped and validated against the V2 cluster.
