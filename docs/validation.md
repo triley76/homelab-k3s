@@ -308,6 +308,54 @@ This demonstrates that the GitOps control plane can retrieve and reconcile the d
 
 It does not imply that every planned Kubernetes platform service has already been deployed.
 
+## Time Synchronization Validation
+
+Chrony remediation was deployed to the live three-node embedded-etcd cluster on 2026-10-14.
+
+### Procedure
+
+1. A pre-change embedded-etcd snapshot was created and its file checksum verified.
+2. The nodes were processed individually in the order `k3s01`, `k3s02`, `k3s03`; every Ansible invocation used an explicit one-node `--limit`.
+3. Cluster and workload health were checked between nodes.
+4. Each changed node received an observation period before the next node was touched.
+5. After all nodes converged, acceptance was enforced seven times, with sample starts ten minutes apart.
+
+### Observed Result
+
+- All three nodes ran Chrony with the distinct `-R` argument and reported normal synchronization.
+- `systemd-timesyncd` was inactive and masked on every node.
+- VMware Tools periodic time synchronization was disabled on every node.
+- No enforced sample found a time offset beyond the accepted threshold or a frequency pinned at ±500 ppm.
+- No sample found an etcd high-clock-drift warning in its 15-minute lookback.
+- All three Kubernetes nodes and etcd remained ready.
+- The six required Flux Kustomizations remained present exactly once and ready.
+- All Deployments remained available.
+- Monitoring Pods, StatefulSets and the node-exporter DaemonSet remained healthy.
+- Both replicas of `platform-canary` remained healthy.
+- A separate 30-minute LAN monitor completed 3,397 successful requests with zero failures and observed both canary replicas.
+- A repeat run against the already compliant `k3s02` reported zero changes, providing live idempotency evidence for that node.
+
+### Evidence Inventory
+
+| Evidence | Result | SHA-256 |
+| --- | --- | --- |
+| Pre-change etcd snapshot | Created and verified | `0e808a766136a04a771eb8d8d5f013f90568e2c115b409012ec218766b4bbb15` |
+| `k3s01` apply | Passed | `4e8870f0c9963cb8ba867c6433167c6f46b195dc300ff1241a3b09cf62b69fd2` |
+| `k3s01` post-change validation | Passed | `21b9763e9b5cdff5863c7591906e5f41c57830ed3b8d1673a13d918138f2ee5a` |
+| `k3s01` 30-minute LAN monitor | 3,397 successes; 0 failures | `20d64ab03d9dcbbdb51c7c53e5b2bd0947d820a350efdd74907a331d6a5b18a6` |
+| `k3s02` pre-change report | Passed | `72c1e02f4a9fecaa7022cabf145c8ec09653d5262a2cc733ed032ca6663a1726` |
+| `k3s02` compliant re-run | Passed; 0 changes | `fa750adcddc37c821e2d489386006c66c35c29300dd1b6ceed98fb76c0e38a42` |
+| `k3s02` post-change validation | Passed | `86d911826fc14997586263bb57ec167de65f0a114216bcfdf32469d3b42a9b30` |
+| `k3s03` apply | Passed | `0d041fd3dc50e0c19d431e7f3bf6c249753e8531a380ac45b6a40eacec3cdd4e` |
+| First enforced all-cluster acceptance | Passed | `640d9956e34d1f6fd3a4e09cddb829770d9332b56589d02ed5b8471046e0893b` |
+| Seven-sample stability window | All samples passed | `41086676c2c89b53e162d47b8e35ea260cbced4335708f090fdc2ac3bbd8aa64` |
+
+The raw evidence files are retained outside the public repository because they include environment-specific runtime details. The checksums bind this validation record to those retained artifacts.
+
+### Remaining Boundary
+
+This demonstrates the observed serial rollout and a one-hour stability window. It does not yet demonstrate persistence across reboot, suspend/resume, snapshot restore or a future Chrony package upgrade, and it is not a production-duration reliability test.
+
 ## Repository Validation
 
 Before preparing the public portfolio version of this repository, the automation was subjected to additional static validation.
@@ -384,7 +432,7 @@ validate-time-sync.yml
 
 `ansible/tests/time_sync_expressions.py` also checks the time-synchronization playbook and role structure, including the post-K3s no-startup-step play in every build playbook. It exercises the decision logic of the `time-sync` role and the acceptance playbook locally, against mocked command output.
 
-Syntax checks and expression tests do not show that Chrony converges on the live nodes. The live rollout and acceptance procedure are described in [time-synchronization.md](time-synchronization.md); no live result is recorded yet.
+Syntax checks and expression tests alone do not show live convergence. That gap was closed by the serial rollout and enforced acceptance exercise recorded in [Time Synchronization Validation](#time-synchronization-validation) and described in [time-synchronization.md](time-synchronization.md).
 
 ### Packer
 
