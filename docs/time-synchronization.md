@@ -2,9 +2,9 @@
 
 ## Status
 
-The `time-sync` Ansible role, the per-node remediation playbook and the read-only acceptance playbook are implemented in this repository.
+The `time-sync` Ansible role, the per-node remediation playbook and the enforced acceptance playbook are implemented and validated on the running three-node cluster.
 
-**They have not yet been applied to the running cluster.** Only static checks and local expression tests have been run (see [Evidence Boundaries](#evidence-boundaries)). Live convergence is demonstrated only by the per-node rollout and acceptance procedure below.
+The live rollout completed on 2026-10-14. Each embedded-etcd member was changed separately in the documented order, with a health gate between nodes. All three nodes converged on Chrony with no-startup-step mode, and seven enforced acceptance samples passed across a one-hour observation window. See [Live Rollout Evidence](#live-rollout-evidence) and [validation.md](validation.md).
 
 ## Why Accurate Time Matters
 
@@ -357,15 +357,41 @@ Its parsing is limited to:
 python3 ansible/tests/time_sync_expressions.py
 ```
 
+## Live Rollout Evidence
+
+The existing cluster was remediated on 2026-10-14 using the procedure above.
+
+- A pre-change embedded-etcd snapshot was created and verified before the first node:
+  - snapshot: `pre-time-sync-phase7-20261014T174053Z-k3s01-1791999654`;
+  - size: 14,057,504 bytes;
+  - SHA-256: `0e808a766136a04a771eb8d8d5f013f90568e2c115b409012ec218766b4bbb15`.
+- `k3s01`, `k3s02` and `k3s03` were processed separately with an explicit one-node `--limit`.
+- After each node, the rollout paused for observation and rechecked node timing, etcd, Kubernetes, Flux, monitoring and the platform canary before continuing.
+- A 30-minute external LAN canary monitor around the first change completed 3,397 successful requests with zero failures and observed both canary replicas.
+- The first enforced all-cluster check passed after the third node converged.
+- Seven additional enforced samples, starting ten minutes apart, passed from 20:00 through 21:01 UTC:
+  - Chrony stayed synchronized on all three nodes;
+  - every running chronyd carried the distinct `-R` argument;
+  - `systemd-timesyncd` remained inactive and masked;
+  - VMware Tools periodic time synchronization remained disabled;
+  - offsets stayed within the enforced limit and frequency corrections were not pinned at ±500 ppm;
+  - no etcd high-clock-drift warnings occurred in any sample's 15-minute lookback;
+  - all nodes and etcd stayed ready;
+  - all six required Flux Kustomizations stayed ready;
+  - all Deployments, monitoring workloads and the platform canary stayed healthy.
+- The final stability artifact is `phase7-time-sync-stability-20261014T200015Z.txt`, SHA-256 `41086676c2c89b53e162d47b8e35ea260cbced4335708f090fdc2ac3bbd8aa64`.
+
+The raw operational artifacts contain environment-specific runtime details and are retained outside this public repository. Their filenames and checksums are recorded in [validation.md](validation.md).
+
 ## Evidence Boundaries
 
-Static checks and the expression tests show that the playbooks parse, that the decision logic behaves as specified on the mocked inputs, and that the tasks are written to be idempotent. They do **not** show that:
+The live rollout directly demonstrates safe serial convergence and one hour of stable behavior for this specific three-node VMware lab. It also demonstrates a no-change re-run on a compliant node. It does **not** establish that:
 
-- `policy_rc_d`, the pre-install mask and the drop-in behave as described on these nodes. They follow from the Ubuntu 24.04 maintainer scripts, `deb-systemd-helper`, `deb-systemd-invoke`, the Ansible 2.16 `apt` module and the Chrony 4.5 source, all inspected for this change; none has been observed on a node;
-- Chrony converges on these VMware guests, or reaches the 100 ms or 10 ms targets;
-- the etcd drift warnings stop;
-- disabling VMware Tools periodic synchronization persists across VM restarts on this hypervisor;
-- the role is idempotent on a live node (a second run reporting no changes has not been observed);
-- the CSV columns, `ExecStart` property format and Kubernetes JSON match live output, rather than the documented and mocked formats.
+- the configuration survives a future VM reboot, suspend/resume cycle, snapshot restore or Chrony package upgrade;
+- every VMware one-off time correction is harmless;
+- public NTP sources are always reachable;
+- the result generalizes to other hypervisors, operating systems, Chrony releases or network conditions;
+- the cluster is immune to every clock, etcd or multi-node failure mode;
+- the one-hour observation window is equivalent to long-term production monitoring.
 
-Those claims require the live per-node rollout and the acceptance check above, recorded in [validation.md](validation.md).
+Those scenarios require separate tests. The validation record intentionally distinguishes this observed rollout from those untested conditions.
