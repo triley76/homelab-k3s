@@ -434,6 +434,20 @@ validate-time-sync.yml
 
 Syntax checks and expression tests alone do not show live convergence. That gap was closed by the serial rollout and enforced acceptance exercise recorded in [Time Synchronization Validation](#time-synchronization-validation) and described in [time-synchronization.md](time-synchronization.md).
 
+The recovery-tools playbooks were syntax-checked the same way, with ansible-core 2.16.3 and a dummy inventory, together with `site.yml`:
+
+```text
+
+configure-recovery-tools.yml
+
+validate-recovery-tools.yml
+
+```
+
+`ansible/tests/recovery_tools_expressions.py` checks the `recovery-tools` role and playbook structure. It runs the role's inspection, decision, platform, pin and verification tasks against mocked results. It runs the extracted-binary validation against local stand-in binaries, and checks that nothing reaches the destination unless both pass. It runs the real single-host guard against a throwaway local inventory with real `--limit` values, and the role's own working-directory cleanup locally. It downloads and installs nothing.
+
+The recovery-tools role has not been run against a node. Downloading, checksum verification against the real archive, installation, the server's `age --version` result and idempotence on a real node remain to be shown by a separately approved live run. See [recovery-tools.md](recovery-tools.md).
+
 ### Packer
 
 The Packer configuration was processed with `packer fmt` and passed `packer fmt -check`.

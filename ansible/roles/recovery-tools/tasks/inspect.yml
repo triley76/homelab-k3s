@@ -1,0 +1,71 @@
+---
+# Read-only inspection of the installed age binaries. Used by the role before
+# and after installation, and by validate-recovery-tools.yml.
+#
+# Only metadata is read: no file contents and no checksums. A binary is executed
+# (with --version only) when it is a regular, root-owned file that group and
+# others cannot write; a symbolic link or any other file is never executed.
+- name: Inspect the age install paths
+  ansible.builtin.stat:
+    path: "{{ recovery_tools_install_dir }}/{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ recovery_tools_age_binaries }}"
+  register: recovery_tools_stat
+
+- name: Read the version of each trusted age binary
+  ansible.builtin.command:
+    argv:
+      - "{{ item.stat.path }}"
+      - --version
+  loop: "{{ recovery_tools_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - item.stat.exists
+    - item.stat.isreg
+    - not item.stat.islnk
+    - item.stat.uid == 0
+    - not item.stat.wgrp
+    - not item.stat.woth
+    - item.stat.xusr
+  register: recovery_tools_version
+  changed_when: false
+  failed_when: false
+
+- name: Reset the age binary report
+  ansible.builtin.set_fact:
+    recovery_tools_age_report: {}
+
+# One entry per binary. "compliant" means: a regular file, not a symbolic link,
+# owned by root:root, mode 0755, reporting exactly the pinned version.
+- name: Summarize the age binaries
+  vars:
+    recovery_tools_s: "{{ item.0.stat }}"
+    recovery_tools_v: "{{ item.1 }}"
+    recovery_tools_found_version: >-
+      {{ (recovery_tools_v.stdout | default('') | trim)
+      if (recovery_tools_v.rc | default(1)) == 0 else 'unavailable' }}
+  ansible.builtin.set_fact:
+    recovery_tools_age_report: >-
+      {{ recovery_tools_age_report | combine({item.0.item: {
+        'exists': recovery_tools_s.exists | bool,
+        'regular_file': recovery_tools_s.isreg | default(false) | bool,
+        'symlink': recovery_tools_s.islnk | default(false) | bool,
+        'directory': recovery_tools_s.isdir | default(false) | bool,
+        'owner_uid': recovery_tools_s.uid | default(-1) | int,
+        'group_gid': recovery_tools_s.gid | default(-1) | int,
+        'mode': recovery_tools_s.mode | default('absent'),
+        'version': recovery_tools_found_version,
+        'compliant': (recovery_tools_s.isreg | default(false) | bool)
+          and not (recovery_tools_s.islnk | default(false) | bool)
+          and (recovery_tools_s.uid | default(-1) | int) == 0
+          and (recovery_tools_s.gid | default(-1) | int) == 0
+          and (recovery_tools_s.mode | default('')) == '0755'
+          and recovery_tools_found_version == 'v' ~ recovery_tools_age_version
+      }}) }}
+  loop: "{{ recovery_tools_stat.results | zip(recovery_tools_version.results) | list }}"
+  loop_control:
+    label: "{{ item.0.item }}"

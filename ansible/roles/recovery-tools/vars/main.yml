@@ -1,0 +1,21 @@
+---
+# Pinned age release for Phase 7 recovery operations. The home-cluster recovery
+# helpers require exactly this version and fail closed on any other.
+#
+# These are role vars, not defaults, so inventory and play variables cannot
+# change them. The role also asserts the exact pin, so an extra-vars override
+# fails closed instead of installing something else. Changing the version is a
+# reviewed change to the version, the checksum and that assertion together.
+recovery_tools_age_version: "1.3.2"
+
+# SHA-256 of age-v1.3.2-linux-amd64.tar.gz from the official FiloSottile/age
+# GitHub release.
+recovery_tools_age_sha256: cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10
+
+recovery_tools_age_archive: "age-v{{ recovery_tools_age_version }}-linux-amd64.tar.gz"
+recovery_tools_age_url: "https://github.com/FiloSottile/age/releases/download/v{{ recovery_tools_age_version }}/{{ recovery_tools_age_archive }}"
+
+recovery_tools_install_dir: /usr/local/bin
+recovery_tools_age_binaries:
+  - age
+  - age-keygen

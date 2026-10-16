@@ -412,6 +412,12 @@ Prepare all servers
 
         v
 
+Install pinned recovery tools on the first server
+
+        |
+
+        v
+
 Initialize first K3s server
 
         |
@@ -447,6 +453,12 @@ The `time-sync` role runs first, one server at a time. It masks `systemd-timesyn
 Before K3s exists, Ubuntu's bounded startup-only `makestep 1 3` stays effective. After the K3s servers are initialized and joined, a final play runs the role again on every server, one at a time. It installs and verifies the `-R` drop-in, restarts chronyd only if the running process lacks `-R`, and requires the running process to carry `-R`. A successfully built node therefore cannot step its clock at startup, including after later reboots. K3s is not stopped or restarted.
 
 For an existing cluster, use `ansible/configure-time-sync.yml` one server at a time instead. See [Time Synchronization](time-synchronization.md).
+
+### Recovery Tools
+
+The `recovery-tools` role installs exactly `age` v1.3.2 (`age` and `age-keygen`) on the first server only, for the encrypted recovery material of the backup design. It downloads the official release archive and verifies its pinned SHA-256. It checks that both extracted binaries are regular files that run and report exactly v1.3.2, and only then installs them into `/usr/local/bin` as `root:root` mode `0755`. All of this happens in a private working directory that is always removed. The two files are not replaced as one transaction, so after a failed or interrupted run the tools must not be used until validation passes; a controlled rerun repairs them. apt is not used, because Ubuntu's packaged version may differ. The role is idempotent and changes no service.
+
+For an existing cluster, use `ansible/configure-recovery-tools.yml --limit k3s01` (exactly that limit) after separate approval, then `ansible/validate-recovery-tools.yml`. See [Recovery Tools](recovery-tools.md).
 
 ### Common Server Preparation
 
