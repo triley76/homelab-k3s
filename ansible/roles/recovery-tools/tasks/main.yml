@@ -1,0 +1,210 @@
+---
+# Installs exactly the pinned age release into /usr/local/bin. Not from apt:
+# Ubuntu's packaged age may be a different version. Nothing here touches K3s,
+# etcd, Chrony, VMware Tools or any service.
+
+- name: Record the target platform
+  ansible.builtin.set_fact:
+    recovery_tools_platform:
+      system: "{{ ansible_facts['system'] }}"
+      distribution: "{{ ansible_facts['distribution'] }}"
+      version: "{{ ansible_facts['distribution_version'] }}"
+      architecture: "{{ ansible_facts['architecture'] }}"
+
+- name: Require Ubuntu 24.04 on x86_64
+  ansible.builtin.assert:
+    that:
+      - recovery_tools_platform.system == 'Linux'
+      - recovery_tools_platform.distribution == 'Ubuntu'
+      - recovery_tools_platform.version == '24.04'
+      - recovery_tools_platform.architecture == 'x86_64'
+    fail_msg: >-
+      The recovery-tools role supports Linux Ubuntu 24.04 on x86_64 only; found
+      {{ recovery_tools_platform.system }} {{ recovery_tools_platform.distribution }}
+      {{ recovery_tools_platform.version }} on {{ recovery_tools_platform.architecture }}.
+    quiet: true
+
+- name: Require the pinned age release
+  ansible.builtin.assert:
+    that:
+      - recovery_tools_age_version == '1.3.2'
+      - recovery_tools_age_sha256 == 'cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10'
+      - recovery_tools_age_url == 'https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz'
+      - recovery_tools_install_dir == '/usr/local/bin'
+      - recovery_tools_age_binaries == ['age', 'age-keygen']
+    fail_msg: >-
+      The age version, checksum, URL or install path differs from the reviewed
+      pin in roles/recovery-tools/vars/main.yml; refusing to install.
+    quiet: true
+
+- name: Inspect the installed age binaries
+  ansible.builtin.include_tasks: inspect.yml
+
+# A symbolic link is replaced. Anything else that is not a regular file (for
+# example a directory) is never removed automatically.
+- name: Refuse install paths that are neither a regular file nor a symbolic link
+  ansible.builtin.assert:
+    that:
+      - >-
+        recovery_tools_age_report.values() | selectattr('exists')
+        | rejectattr('regular_file') | rejectattr('symlink') | list | length == 0
+    fail_msg: >-
+      An age install path exists but is neither a regular file nor a symbolic
+      link. It is not removed automatically; inspect it and remove it by hand.
+    quiet: true
+
+- name: Decide whether the pinned release must be installed
+  ansible.builtin.set_fact:
+    recovery_tools_install_required: >-
+      {{ recovery_tools_age_report.values() | rejectattr('compliant') | list | length > 0 }}
+
+- name: Report the installation decision
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'installing age v' ~ recovery_tools_age_version
+      if recovery_tools_install_required | bool
+      else 'age v' ~ recovery_tools_age_version ~ ' is already installed correctly; nothing to change' }}
+
+# Download, extraction, validation of the extracted binaries and installation
+# happen in a private, root-only working directory that is removed afterwards,
+# whether or not the installation succeeded.
+- name: Install the pinned age release
+  when: recovery_tools_install_required | bool
+  block:
+    - name: Create a private working directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: recovery-tools-age.
+      register: recovery_tools_tmp
+
+    - name: Restrict the working directory to root
+      ansible.builtin.file:
+        path: "{{ recovery_tools_tmp.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Create the extraction directory
+      ansible.builtin.file:
+        path: "{{ recovery_tools_tmp.path }}/extract"
+        state: directory
+        mode: '0700'
+
+    - name: Download the pinned age release and verify its SHA-256
+      ansible.builtin.get_url:
+        url: "{{ recovery_tools_age_url }}"
+        dest: "{{ recovery_tools_tmp.path }}/{{ recovery_tools_age_archive }}"
+        checksum: "sha256:{{ recovery_tools_age_sha256 }}"
+        mode: '0600'
+        timeout: "{{ recovery_tools_download_timeout }}"
+
+    - name: Extract only age and age-keygen
+      ansible.builtin.unarchive:
+        src: "{{ recovery_tools_tmp.path }}/{{ recovery_tools_age_archive }}"
+        dest: "{{ recovery_tools_tmp.path }}/extract"
+        remote_src: true
+        include: "{{ recovery_tools_age_binaries | map('regex_replace', '^', 'age/') | list }}"
+
+    # Nothing under the install directory changes until both extracted binaries
+    # are regular files that run from the working directory and report exactly
+    # the pinned version.
+    - name: Inspect the extracted age binaries
+      ansible.builtin.stat:
+        path: "{{ recovery_tools_tmp.path }}/extract/age/{{ item }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      loop: "{{ recovery_tools_age_binaries }}"
+      register: recovery_tools_extracted_stat
+
+    - name: Require each extracted binary to be a regular file
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not item.stat.islnk
+        fail_msg: >-
+          The extracted {{ item.item }} is missing, a symbolic link or not a
+          regular file; nothing under {{ recovery_tools_install_dir }} was changed.
+        quiet: true
+      loop: "{{ recovery_tools_extracted_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Run each extracted binary from the working directory
+      ansible.builtin.command:
+        argv:
+          - "{{ recovery_tools_tmp.path }}/extract/age/{{ item }}"
+          - --version
+      loop: "{{ recovery_tools_age_binaries }}"
+      register: recovery_tools_extracted_version
+      changed_when: false
+      failed_when: false
+
+    - name: Require each extracted binary to report the pinned version
+      ansible.builtin.assert:
+        that:
+          - (item.rc | default(1)) == 0
+          - (item.stdout | default('') | trim) == 'v' ~ recovery_tools_age_version
+        fail_msg: >-
+          The extracted {{ item.item }} did not run or did not report
+          v{{ recovery_tools_age_version }}; nothing under
+          {{ recovery_tools_install_dir }} was changed.
+        quiet: true
+      loop: "{{ recovery_tools_extracted_version.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # From here on, each file is replaced atomically by its own task, but the
+    # pair is not one transaction. An interrupted or failed run can leave one
+    # new and one old binary, or none where a link was removed. The final
+    # verification fails closed in that case, and a controlled rerun repairs it.
+    - name: Remove a symbolic link at an age install path
+      ansible.builtin.file:
+        path: "{{ recovery_tools_install_dir }}/{{ item.key }}"
+        state: absent
+      loop: "{{ recovery_tools_age_report | dict2items | selectattr('value.symlink') | list }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Install age and age-keygen
+      ansible.builtin.copy:
+        src: "{{ recovery_tools_tmp.path }}/extract/age/{{ item }}"
+        dest: "{{ recovery_tools_install_dir }}/{{ item }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0755'
+      loop: "{{ recovery_tools_age_binaries }}"
+
+  always:
+    - name: Remove the working directory
+      ansible.builtin.file:
+        path: "{{ recovery_tools_tmp.path }}"
+        state: absent
+      when: recovery_tools_tmp.path is defined
+
+- name: Re-inspect the age binaries
+  ansible.builtin.include_tasks: inspect.yml
+
+- name: Verify the pinned age binaries
+  ansible.builtin.assert:
+    that:
+      - recovery_tools_age_report[item].regular_file | bool
+      - not (recovery_tools_age_report[item].symlink | bool)
+      - recovery_tools_age_report[item].owner_uid | int == 0
+      - recovery_tools_age_report[item].group_gid | int == 0
+      - recovery_tools_age_report[item].mode == '0755'
+      - recovery_tools_age_report[item].version == 'v' ~ recovery_tools_age_version
+    fail_msg: >-
+      {{ recovery_tools_install_dir }}/{{ item }} is not a root-owned, mode 0755
+      regular file reporting v{{ recovery_tools_age_version }}:
+      {{ recovery_tools_age_report[item] }}
+    quiet: true
+  loop: "{{ recovery_tools_age_binaries }}"
+
+- name: Report the verified age binaries
+  ansible.builtin.debug:
+    msg: "{{ recovery_tools_age_report }}"

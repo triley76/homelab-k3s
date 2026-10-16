@@ -19,6 +19,15 @@
   roles:
     - k3s-common
 
+# Pinned age for Phase 7 recovery operations, on the first server only. It is
+# independent of K3s and changes no service. Existing clusters use
+# configure-recovery-tools.yml --limit k3s01 instead.
+- name: Install the pinned age recovery tools on the first server
+  hosts: servers[0]
+  become: true
+  roles:
+    - recovery-tools
+
 - name: Initialize first k3s server
   hosts: servers[0]
   become: true

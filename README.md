@@ -147,6 +147,8 @@ That behavior is documented as part of the platform design rather than hidden in
 
 Before K3s is installed, the `time-sync` role replaces `systemd-timesyncd` with Chrony and disables VMware Tools periodic time synchronization, because embedded etcd, TLS and signed cloud API requests all depend on accurate clocks. After K3s is installed, the role runs again, one server at a time, so that every built node runs chronyd with `-R` and cannot step its clock at startup. Existing clusters are remediated one server at a time; see [docs/time-synchronization.md](docs/time-synchronization.md).
 
+The `recovery-tools` role installs a pinned `age` release (v1.3.2, checksum-verified, not from apt) on the first server only, for the encrypted recovery material of the backup design. On an existing cluster it is installed with `configure-recovery-tools.yml --limit k3s01`, which needs separate approval and has not yet been run against a node; see [docs/recovery-tools.md](docs/recovery-tools.md).
+
 ## GitOps Boundary
 
 This repository is responsible for **constructing the Kubernetes infrastructure**:
@@ -173,6 +175,7 @@ The GitOps foundation has been validated. Networking services, ingress, persiste
 |-- docs/
 |   |-- architecture.md      Detailed platform architecture
 |   |-- build.md             Reproducible build procedure
+|   |-- recovery-tools.md    Pinned age installation for recovery operations
 |   |-- time-synchronization.md  Chrony configuration and per-node rollout
 |   |-- validation.md        Validation and failure-test evidence
 |   `-- decisions/           Architecture Decision Records

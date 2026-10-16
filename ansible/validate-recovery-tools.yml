@@ -1,0 +1,57 @@
+---
+# Read-only report on the age recovery tools of the first server. Nothing is
+# installed or changed, and no privilege escalation is used. Only metadata and
+# version strings are reported: no file contents and no checksums.
+#
+# Report only (default):
+#   ansible-playbook validate-recovery-tools.yml
+# Fail when an acceptance criterion is not met:
+#   ansible-playbook validate-recovery-tools.yml -e recovery_tools_enforce_acceptance=true
+- name: Report the age recovery tools on the first k3s server
+  hosts: servers[0]
+  become: false
+  gather_facts: true
+  gather_subset:
+    - min
+
+  vars:
+    recovery_tools_enforce_acceptance: false
+
+  tasks:
+    - name: Inspect the installed age binaries
+      ansible.builtin.include_role:
+        name: recovery-tools
+        tasks_from: inspect.yml
+        public: true
+
+    - name: Build the report
+      ansible.builtin.set_fact:
+        recovery_tools_validation:
+          node: "{{ inventory_hostname }}"
+          utc_timestamp: "{{ ansible_facts['date_time']['iso8601'] }}"
+          platform: >-
+            {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+            {{ ansible_facts['architecture'] }}
+          pinned_version: "v{{ recovery_tools_age_version }}"
+          install_dir: "{{ recovery_tools_install_dir }}"
+          binaries: "{{ recovery_tools_age_report }}"
+        recovery_tools_checks:
+          platform_supported: >-
+            {{ ansible_facts['distribution'] == 'Ubuntu' and ansible_facts['distribution_version'] == '24.04'
+            and ansible_facts['architecture'] == 'x86_64' }}
+          age_compliant: "{{ recovery_tools_age_report['age'].compliant | bool }}"
+          age_keygen_compliant: "{{ recovery_tools_age_report['age-keygen'].compliant | bool }}"
+
+    - name: Show the report
+      ansible.builtin.debug:
+        msg:
+          report: "{{ recovery_tools_validation }}"
+          checks: "{{ recovery_tools_checks }}"
+
+    - name: Enforce the acceptance criteria
+      ansible.builtin.assert:
+        that:
+          - recovery_tools_checks.values() | map('bool') | select('equalto', false) | list | length == 0
+        fail_msg: "Recovery-tools acceptance failed: {{ recovery_tools_checks }}"
+        quiet: true
+      when: recovery_tools_enforce_acceptance | bool

@@ -1,0 +1,3 @@
+---
+# Seconds allowed for the release download from GitHub.
+recovery_tools_download_timeout: 60

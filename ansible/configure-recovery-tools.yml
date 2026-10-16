@@ -1,0 +1,41 @@
+---
+# Controlled installation of the pinned age release on the existing first
+# server, for Phase 7 recovery operations. See docs/recovery-tools.md.
+#
+# Run only with an explicit limit of exactly the first server:
+#   ansible-playbook configure-recovery-tools.yml --limit k3s01
+#
+# Installs two binaries into /usr/local/bin. K3s, etcd, Chrony, VMware Tools and
+# cluster workloads are not touched; no service is started, stopped or restarted.
+- name: Install the pinned age recovery tools on the first k3s server
+  hosts: servers
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  max_fail_percentage: 0
+
+  vars:
+    recovery_tools_target_host: k3s01
+
+  pre_tasks:
+    # The limit must be exactly the target's name: an omitted limit, a pattern,
+    # a group, a list or another host is refused, even when it would resolve to
+    # the target alone. The target must also be the first server, as in site.yml.
+    - name: Require an explicit limit of exactly the first server
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit == recovery_tools_target_host
+          - ansible_play_hosts_all | length == 1
+          - ansible_play_hosts_all[0] == recovery_tools_target_host
+          - groups['servers'][0] == recovery_tools_target_host
+        fail_msg: >-
+          Run this playbook only with --limit {{ recovery_tools_target_host }}
+          (exactly that host name; no pattern, group or list). See
+          docs/recovery-tools.md.
+        quiet: true
+      run_once: true
+
+  roles:
+    - recovery-tools
