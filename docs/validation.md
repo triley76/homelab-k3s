@@ -446,6 +446,45 @@ validate-recovery-tools.yml
 
 `ansible/tests/recovery_tools_expressions.py` checks the `recovery-tools` role and playbook structure. It runs the role's inspection, decision, platform, pin and verification tasks against mocked results. It runs the extracted-binary validation against local stand-in binaries, and checks that nothing reaches the destination unless both pass. It runs the real single-host guard against a throwaway local inventory with real `--limit` values, and the role's own working-directory cleanup locally. It downloads and installs nothing.
 
+The Stage 3 secrets-encryption playbooks were syntax-checked the same way, with ansible-core 2.16.3 and a dummy inventory:
+
+```text
+
+snapshot-etcd.yml
+
+secrets-encryption-enable.yml
+
+secrets-encryption-restart.yml
+
+secrets-encryption-rotate.yml
+
+secrets-encryption-canary.yml
+
+secrets-encryption-disable.yml
+
+secrets-encryption-reencrypt.yml
+
+validate-secrets-encryption.yml
+
+install-etcdctl-rehearsal.yml
+
+```
+
+`ansible/tests/secrets_encryption_expressions.py` checks:
+
+- the role and playbook structure;
+- the guard, using the real phase playbooks with real `--limit` values, confirmations and environments. Refused cases must stop inside the guard, before facts or privilege escalation. They include rehearsal-only work against an inventory containing a live host name, and not-yet-rehearsal-approved rollback paths;
+- status parsing, which fails closed;
+- the health, preservation and snapshot gates;
+- every phase decision, including the fixed restart order and confirmation replay;
+- state-directory and ledger link safety;
+- the etcdctl installer's check-before-install order;
+- the exact single-key raw canary verification pipeline, with a stub etcdctl;
+- the canary lifecycle, with a stub k3s;
+- that no canary value, raw etcd record, hash-mismatch node name or protected path appears in the output.
+
+No K3s behavior has been observed: the required k3d rehearsal, the three-VM rehearsal and the live procedure remain to be performed. See [secrets-encryption.md](secrets-encryption.md).
+
 The recovery-tools role has not been run against a node. Downloading, checksum verification against the real archive, installation, the server's `age --version` result and idempotence on a real node remain to be shown by a separately approved live run. See [recovery-tools.md](recovery-tools.md).
 
 ### Packer

@@ -81,6 +81,7 @@ The addresses above use the RFC 5737 documentation range and are examples rather
 | Flux Git source reconciliation | Validated |
 | Flux Kustomization reconciliation | Validated |
 | Serial Chrony rollout and enforced one-hour stability window | Validated |
+| Kubernetes Secrets encryption at rest (secretbox) | Implemented and statically tested; not yet rehearsed or applied |
 | GitOps platform-service expansion | In progress |
 
 The current Kubernetes baseline is pinned to **K3s v1.36.4+k3s1**. Flux **2.9.5** has been bootstrapped and validated against the V2 cluster.
@@ -149,6 +150,13 @@ Before K3s is installed, the `time-sync` role replaces `systemd-timesyncd` with 
 
 The `recovery-tools` role installs a pinned `age` release (v1.3.2, checksum-verified, not from apt) on the first server only, for the encrypted recovery material of the backup design. On an existing cluster it is installed with `configure-recovery-tools.yml --limit k3s01`, which needs separate approval and has not yet been run against a node; see [docs/recovery-tools.md](docs/recovery-tools.md).
 
+The `secrets-encryption` role and its phase playbooks encode the K3s `v1.36.4+k3s1` procedure for enabling Secrets encryption at rest on the existing cluster:
+
+- `enable`, a restart of each server, `rotate-keys` (which activates encryption and rewrites every existing Secret) and a second restart of each server;
+- each step a separate, single-server, confirmed invocation behind health, preservation and snapshot gates.
+
+It is statically tested only. It has not been rehearsed or run against the cluster, and `site.yml` does not use it; see [docs/secrets-encryption.md](docs/secrets-encryption.md).
+
 ## GitOps Boundary
 
 This repository is responsible for **constructing the Kubernetes infrastructure**:
@@ -176,6 +184,7 @@ The GitOps foundation has been validated. Networking services, ingress, persiste
 |   |-- architecture.md      Detailed platform architecture
 |   |-- build.md             Reproducible build procedure
 |   |-- recovery-tools.md    Pinned age installation for recovery operations
+|   |-- secrets-encryption.md  Secrets encryption at rest (Stage 3) procedure
 |   |-- time-synchronization.md  Chrony configuration and per-node rollout
 |   |-- validation.md        Validation and failure-test evidence
 |   `-- decisions/           Architecture Decision Records

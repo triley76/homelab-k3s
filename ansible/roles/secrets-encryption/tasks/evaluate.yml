@@ -1,0 +1,163 @@
+---
+# Common health gate, evaluated from the summary built by summarize.yml. Phase
+# files add their own conditions after it. Pure evaluation. Empty, missing,
+# null, duplicated or unparsable results are problems, never healthy.
+- name: Evaluate the common health gate
+  vars:
+    se_servers: "{{ groups['servers'] }}"
+    se_node_lines: "{{ secrets_encryption_nodes_probe.stdout_lines | default([]) if secrets_encryption_nodes_probe.rc | default(1) == 0 else [] }}"
+    se_node_names: "{{ se_node_lines | map('regex_replace', '\\|.*$', '') | list }}"
+    se_etcd_nodes: >-
+      {{ secrets_encryption_etcd_nodes_probe.stdout_lines | default([]) | map('regex_replace', '^node/', '') | list
+      if secrets_encryption_etcd_nodes_probe.rc | default(1) == 0 else [] }}
+    se_flux_lines: >-
+      {{ secrets_encryption_flux_probe.stdout_lines | default([])
+      if (secrets_encryption_flux_probe.rc | default(1) == 0) else [] }}
+    se_flux_names: "{{ se_flux_lines | map('regex_replace', '=.*$', '') | list }}"
+    se_flux_ready: "{{ se_flux_lines | select('match', '^[^=]+=True$') | map('regex_replace', '=True$', '') | list }}"
+    se_helm_lines: >-
+      {{ secrets_encryption_helm_probe.stdout_lines | default([])
+      if (secrets_encryption_helm_probe.rc | default(1) == 0) else [] }}
+    se_deploy_lines: "{{ secrets_encryption_deployments_probe.stdout_lines | default([]) }}"
+    se_sts_lines: "{{ secrets_encryption_statefulsets_probe.stdout_lines | default([]) }}"
+    se_ds_lines: "{{ secrets_encryption_daemonsets_probe.stdout_lines | default([]) }}"
+    se_full_re: '^[^=/]+/[^=/]+=(\d+)/\1$'
+    se_zero_re: '^[^=/]+/[^=/]+=0?/0$'
+    se_available_re: '^[^=]+=([1-9][0-9]*)/\1$'
+  ansible.builtin.set_fact:
+    secrets_encryption_health_problems: >-
+      {%- set ns = namespace(out=[]) -%}
+      {#- Each server - service, version, local API and etcd, status, Chrony, swap, disk, state directory -#}
+      {%- for name in se_servers -%}
+      {%- set s = secrets_encryption_servers[name] -%}
+      {%- set st = secrets_encryption_storage[name] -%}
+      {%- if not s.active | bool -%}{%- set ns.out = ns.out + [name ~ ': k3s.service not active'] -%}{%- endif -%}
+      {%- if s.start_epoch | int < 0 or s.nrestarts | int < 0 -%}{%- set ns.out = ns.out + [name ~ ': service state unreadable'] -%}{%- endif -%}
+      {%- if s.version != secrets_encryption_supported_k3s_version -%}
+      {%- set ns.out = ns.out + [name ~ ': K3s ' ~ s.version ~ ', expected ' ~ secrets_encryption_supported_k3s_version] -%}
+      {%- endif -%}
+      {%- if not s.readyz_ok | bool -%}{%- set ns.out = ns.out + [name ~ ': local /readyz not ok'] -%}{%- endif -%}
+      {%- if not s.etcd_ready | bool -%}{%- set ns.out = ns.out + [name ~ ': local /readyz/etcd not ok'] -%}{%- endif -%}
+      {%- if not s.status.parsed | bool -%}
+      {%- set ns.out = ns.out + [name ~ ': secrets-encrypt status not parsed (' ~ (s.status.problems | join(',')) ~ ')'] -%}
+      {%- elif s.status.stage not in secrets_encryption_settled_stages and s.status.encryption != 'disabled-no-config' -%}
+      {%- set ns.out = ns.out + [name ~ ': rotation stage ' ~ s.status.stage ~ ' is not settled'] -%}
+      {%- endif -%}
+      {%- if secrets_encryption_require_chrony | bool -%}
+      {%- if not s.chrony_synchronized | bool -%}{%- set ns.out = ns.out + [name ~ ': Chrony not synchronized or unreadable'] -%}
+      {%- elif s.chrony_offset_s | float >= secrets_encryption_max_offset_seconds | float -%}
+      {%- set ns.out = ns.out + [name ~ ': Chrony offset at or above ' ~ secrets_encryption_max_offset_seconds ~ ' s'] -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- if s.swap_bytes | int < 0 -%}{%- set ns.out = ns.out + [name ~ ': swap state unreadable'] -%}
+      {%- elif st.baseline is mapping and st.baseline.swap_bytes is defined and st.baseline.swap_bytes | int != s.swap_bytes | int -%}
+      {%- set ns.out = ns.out + [name ~ ': swap changed since the baseline'] -%}
+      {%- endif -%}
+      {%- if s.free_mb | int < secrets_encryption_min_free_mb | int -%}
+      {%- set ns.out = ns.out + [name ~ ': free space in the database directory below ' ~ secrets_encryption_min_free_mb ~ ' MiB or unreadable'] -%}
+      {%- endif -%}
+      {%- if not st.snapshots_read | bool or not st.db_read | bool -%}
+      {%- set ns.out = ns.out + [name ~ ': snapshot or database directory unreadable'] -%}
+      {%- endif -%}
+      {%- if not s.state_safe | bool -%}
+      {%- set ns.out = ns.out + [name ~ ': state directory or a state file is not a root-owned regular path'] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {#- Nodes: exactly the three servers, each once, Ready, no pressure -#}
+      {%- if se_node_names | sort != se_servers | sort -%}
+      {%- set ns.out = ns.out + ['nodes: expected exactly ' ~ (se_servers | join(',')) ~ ', found ' ~ (se_node_names | length)] -%}
+      {%- endif -%}
+      {%- for line in se_node_lines -%}
+      {%- set f = line.split('|') -%}
+      {%- if f | length != 5 or f[1] != 'True' -%}{%- set ns.out = ns.out + ['node not Ready: ' ~ f[0]] -%}
+      {%- elif f[2:] != ['False', 'False', 'False'] -%}{%- set ns.out = ns.out + ['node under pressure or unreported: ' ~ f[0]] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if se_etcd_nodes | sort != se_servers | sort -%}
+      {%- set ns.out = ns.out + ['etcd member nodes: expected exactly ' ~ (se_servers | join(',')) ~ ', found ' ~ (se_etcd_nodes | length)] -%}
+      {%- endif -%}
+      {%- if secrets_encryption_marker.malformed | bool -%}{%- set ns.out = ns.out + ['state marker malformed'] -%}{%- endif -%}
+      {%- if secrets_encryption_now_epoch | int <= 0 -%}{%- set ns.out = ns.out + ['time unreadable'] -%}{%- endif -%}
+      {#- Flux and Helm -#}
+      {%- if secrets_encryption_expected_kustomizations | length > 0 -%}
+      {%- if (secrets_encryption_flux_probe.rc | default(1)) != 0 -%}{%- set ns.out = ns.out + ['Flux Kustomizations: read failed'] -%}{%- endif -%}
+      {%- for k in secrets_encryption_expected_kustomizations -%}
+      {%- if se_flux_names | select('equalto', k) | list | length != 1 -%}
+      {%- set ns.out = ns.out + ['Kustomization ' ~ k ~ ': present ' ~ (se_flux_names | select('equalto', k) | list | length) ~ ' times'] -%}
+      {%- elif k not in se_flux_ready -%}{%- set ns.out = ns.out + ['Kustomization ' ~ k ~ ': not Ready'] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- for line in se_flux_lines | reject('match', '^[^=]+=True$') -%}
+      {%- set ns.out = ns.out + ['Kustomization not Ready: ' ~ (line | regex_replace('=.*$', ''))] -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- if secrets_encryption_min_helmreleases | int > 0 -%}
+      {%- if (secrets_encryption_helm_probe.rc | default(1)) != 0 -%}{%- set ns.out = ns.out + ['HelmReleases: read failed'] -%}{%- endif -%}
+      {%- if se_helm_lines | length < secrets_encryption_min_helmreleases | int -%}
+      {%- set ns.out = ns.out + ['HelmReleases: ' ~ (se_helm_lines | length) ~ ' found, ' ~ secrets_encryption_min_helmreleases ~ ' required'] -%}
+      {%- endif -%}
+      {%- if se_helm_lines | map('regex_replace', '=.*$', '') | unique | list | length != se_helm_lines | length -%}
+      {%- set ns.out = ns.out + ['HelmReleases: duplicated'] -%}
+      {%- endif -%}
+      {%- for line in se_helm_lines | reject('match', '^[^=]+=True$') -%}
+      {%- set ns.out = ns.out + ['HelmRelease not Ready: ' ~ (line | regex_replace('=.*$', ''))] -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {#- Workloads -#}
+      {%- for kind, probe, lines in [('Deployments', secrets_encryption_deployments_probe, se_deploy_lines),
+                                     ('StatefulSets', secrets_encryption_statefulsets_probe, se_sts_lines),
+                                     ('DaemonSets', secrets_encryption_daemonsets_probe, se_ds_lines)] -%}
+      {%- if (probe.rc | default(1)) != 0 -%}{%- set ns.out = ns.out + [kind ~ ': read failed'] -%}{%- endif -%}
+      {%- for line in lines | reject('match', se_full_re) | reject('match', se_zero_re) -%}
+      {%- set ns.out = ns.out + [kind ~ ' not fully ready: ' ~ line] -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- if secrets_encryption_canary_deployment != '' -%}
+      {%- set c = se_deploy_lines | select('match', '^' ~ (secrets_encryption_canary_deployment | regex_escape) ~ '=') | list -%}
+      {%- if c | length != 1 or c[0] is not match(se_available_re) -%}
+      {%- set ns.out = ns.out + ['canary Deployment ' ~ secrets_encryption_canary_deployment ~ ': missing or not fully available'] -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- for nsname in secrets_encryption_monitoring_namespaces -%}
+      {%- set sts = se_sts_lines | select('match', '^' ~ (nsname | regex_escape) ~ '/') | list -%}
+      {%- set dss = se_ds_lines | select('match', '^' ~ (nsname | regex_escape) ~ '/') | list -%}
+      {%- if sts | length + dss | length == 0 -%}{%- set ns.out = ns.out + [nsname ~ ': no StatefulSets or DaemonSets'] -%}{%- endif -%}
+      {%- endfor -%}
+      {%- if secrets_encryption_monitoring_namespaces | length > 0 -%}
+      {%- set msts = se_sts_lines | select('match', '^(' ~ (secrets_encryption_monitoring_namespaces | map('regex_escape') | join('|')) ~ ')/') | list -%}
+      {%- set mds = se_ds_lines | select('match', '^(' ~ (secrets_encryption_monitoring_namespaces | map('regex_escape') | join('|')) ~ ')/') | list -%}
+      {%- if msts | length < secrets_encryption_min_monitoring_statefulsets | int -%}
+      {%- set ns.out = ns.out + ['monitoring StatefulSets: ' ~ (msts | length) ~ ' found, ' ~ secrets_encryption_min_monitoring_statefulsets ~ ' required'] -%}
+      {%- endif -%}
+      {%- if mds | length < secrets_encryption_min_monitoring_daemonsets | int -%}
+      {%- set ns.out = ns.out + ['monitoring DaemonSets: ' ~ (mds | length) ~ ' found, ' ~ secrets_encryption_min_monitoring_daemonsets ~ ' required'] -%}
+      {%- endif -%}
+      {%- endif -%}
+      {{ ns.out | join(';;') }}
+
+# Metadata only: no addresses, peer IDs, hashes, Secret names or paths of
+# protected artifacts.
+- name: Build the safe state report
+  ansible.builtin.set_fact:
+    secrets_encryption_report:
+      environment: "{{ secrets_encryption_environment | default('undeclared') }}"
+      provider: "{{ secrets_encryption_provider }}"
+      marker: "{{ secrets_encryption_marker }}"
+      servers: >-
+        {{ dict(groups['servers'] | zip(groups['servers'] | map('extract', secrets_encryption_servers)
+        | map('dict2items') | map('rejectattr', 'key', 'equalto', 'status') | map('items2dict') | list)) }}
+      encryption: >-
+        {{ dict(groups['servers'] | zip(groups['servers'] | map('extract', secrets_encryption_servers) | map(attribute='status')
+        | map('dict2items') | map('selectattr', 'key', 'in',
+        ['parsed', 'problems', 'encryption', 'stage', 'hashes_match', 'key_count', 'active_key_type', 'active_key_name'])
+        | map('items2dict') | list)) }}
+      stage3_snapshots_first_server: >-
+        {{ secrets_encryption_storage[groups['servers'][0]].stage3_snapshots | map(attribute='path') | map('basename') | list }}
+      protected_artifacts_checked: >-
+        {{ dict(groups['servers'] | zip(groups['servers'] | map('extract', secrets_encryption_storage)
+        | map(attribute='protected') | map('length'))) }}
+      health_problems: "{{ secrets_encryption_health_problems.split(';;') | reject('equalto', '') | list }}"
+
+- name: Show the state report
+  ansible.builtin.debug:
+    var: secrets_encryption_report

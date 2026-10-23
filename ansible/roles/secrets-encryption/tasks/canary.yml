@@ -1,0 +1,354 @@
+---
+# Canary lifecycle on the first server. secrets_encryption_canary_action:
+#   create-control  before encryption is active: a disposable Secret and an
+#                   unencrypted ConfigMap, the positive controls.
+#   verify          after the enabling rotation and restarts: a new disposable
+#                   Secret, readback comparisons and (rehearsal only) raw prefix
+#                   checks of the canary records; then cleanup, always.
+#   cleanup         delete every canary and the local value directory.
+#
+# Canary values are random bytes generated on the server into a root-only tmpfs
+# directory. They are never printed, passed on a command line or returned to
+# Ansible. No existing Secret is read.
+- name: Require a canary action
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_canary_action in ['create-control', 'verify', 'cleanup']
+    quiet: true
+
+- name: Decide the canary preconditions
+  vars:
+    se_all: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | list }}"
+    se_encryptions: "{{ se_all | map(attribute='status') | map(attribute='encryption') | unique | list }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_canary_allowed: >-
+      {{ secrets_encryption_canary_action == 'cleanup'
+      or (secrets_encryption_canary_action == 'create-control'
+          and se_encryptions | reject('in', ['disabled-no-config', 'disabled']) | list | length == 0
+          and secrets_encryption_marker.phase in ['none', 'enable'])
+      or (secrets_encryption_canary_action == 'verify'
+          and se_encryptions == ['enabled']
+          and se_all | map(attribute='status') | map(attribute='stage') | unique | list == ['reencrypt_finished']
+          and se_all | map(attribute='status') | selectattr('hashes_match', 'equalto', false) | list | length == 0
+          and se_all | selectattr('checkpoint_reached', 'equalto', false) | list | length == 0
+          and secrets_encryption_marker.phase == 'rotate-keys') }}
+
+- name: Enforce the canary preconditions
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_canary_allowed | bool
+    fail_msg: >-
+      create-control runs only before encryption is active (before rotate-keys); verify runs only
+      after rotate-keys, with every server Enabled at reencrypt_finished, restarted since, and
+      reporting matching hashes. State: {{ secrets_encryption_report.encryption }};
+      last change {{ secrets_encryption_marker.phase }}.
+    quiet: true
+
+- name: Clean up the canaries
+  ansible.builtin.include_tasks: canary_cleanup.yml
+  when: secrets_encryption_canary_action == 'cleanup'
+
+- name: Check the raw verification tools
+  when:
+    - secrets_encryption_canary_action != 'cleanup'
+    - secrets_encryption_raw_verification | bool
+  block:
+    - name: Read the pinned etcdctl version
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_etcdctl_path }}", version]
+      register: secrets_encryption_etcdctl_version_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Inspect the local verifier
+      ansible.builtin.stat:
+        path: "{{ secrets_encryption_verifier_path }}"
+      register: secrets_encryption_verifier_stat
+
+    - name: Require the pinned etcdctl and the verifier
+      ansible.builtin.assert:
+        that:
+          - secrets_encryption_etcdctl_version_probe.rc == 0
+          - >-
+            secrets_encryption_etcdctl_version_probe.stdout_lines | map('trim')
+            | select('equalto', 'etcdctl version: ' ~ secrets_encryption_etcdctl_version) | list | length == 1
+          - secrets_encryption_verifier_stat.stat.exists
+          - secrets_encryption_verifier_stat.stat.isreg
+          - secrets_encryption_verifier_stat.stat.pw_name == secrets_encryption_tools_owner
+        fail_msg: Run install-etcdctl-rehearsal.yml first (rehearsal environments only).
+        quiet: true
+
+- name: Reset the canary results
+  ansible.builtin.set_fact:
+    secrets_encryption_canary_results: {}
+  when: secrets_encryption_canary_action != 'cleanup'
+
+- name: Read which canary objects exist
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - get
+      - "{{ item.kind }}"
+      - "{{ item.name }}"
+      - --namespace={{ secrets_encryption_canary_namespace }}
+      - --ignore-not-found=true
+      - -o
+      - name
+  loop:
+    - {kind: secret, name: "{{ secrets_encryption_canary_pre_secret }}"}
+    - {kind: secret, name: "{{ secrets_encryption_canary_post_secret }}"}
+    - {kind: configmap, name: "{{ secrets_encryption_canary_control_configmap }}"}
+  register: secrets_encryption_canary_exists_probe
+  changed_when: false
+  when: secrets_encryption_canary_action != 'cleanup'
+
+- name: Summarize which canary objects exist
+  ansible.builtin.set_fact:
+    secrets_encryption_canary_exists:
+      pre: "{{ secrets_encryption_canary_exists_probe.results[0].stdout | trim | length > 0 }}"
+      post: "{{ secrets_encryption_canary_exists_probe.results[1].stdout | trim | length > 0 }}"
+      control: "{{ secrets_encryption_canary_exists_probe.results[2].stdout | trim | length > 0 }}"
+  when: secrets_encryption_canary_action != 'cleanup'
+
+- name: Ensure the canary value directory exists
+  ansible.builtin.file:
+    path: "{{ secrets_encryption_canary_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  when: secrets_encryption_canary_action != 'cleanup'
+
+- name: Inspect the pre-encryption canary value file
+  ansible.builtin.stat:
+    path: "{{ secrets_encryption_canary_dir }}/pre.value"
+    get_checksum: false
+  register: secrets_encryption_pre_value_stat
+  when: secrets_encryption_canary_action != 'cleanup'
+
+# ---------------------------------------------------------------------------
+# create-control
+# ---------------------------------------------------------------------------
+- name: Create the positive controls
+  when: secrets_encryption_canary_action == 'create-control'
+  block:
+    - name: Refuse a pre-encryption canary whose value file is gone
+      ansible.builtin.assert:
+        that:
+          - not (secrets_encryption_canary_exists.pre | bool) or secrets_encryption_pre_value_stat.stat.exists
+        fail_msg: >-
+          The pre-encryption canary exists but its local value file does not (for example after a
+          reboot). Run the cleanup action, then create the controls again.
+        quiet: true
+
+    - name: Generate the pre-encryption canary value
+      ansible.builtin.shell:
+        cmd: umask 077 && head -c 32 /dev/urandom | base64 -w0 > {{ (secrets_encryption_canary_dir ~ '/pre.value') | quote }}
+        creates: "{{ secrets_encryption_canary_dir }}/pre.value"
+      no_log: true
+
+    - name: Create the pre-encryption canary Secret
+      ansible.builtin.command:
+        argv:
+          - "{{ secrets_encryption_k3s_bin }}"
+          - kubectl
+          - create
+          - secret
+          - generic
+          - "{{ secrets_encryption_canary_pre_secret }}"
+          - --namespace={{ secrets_encryption_canary_namespace }}
+          - --from-file=value={{ secrets_encryption_canary_dir }}/pre.value
+          - -o
+          - name
+      when: not secrets_encryption_canary_exists.pre | bool
+      no_log: true
+
+    - name: Create the plaintext control ConfigMap
+      ansible.builtin.command:
+        argv:
+          - "{{ secrets_encryption_k3s_bin }}"
+          - kubectl
+          - create
+          - configmap
+          - "{{ secrets_encryption_canary_control_configmap }}"
+          - --namespace={{ secrets_encryption_canary_namespace }}
+          - --from-literal=control=homelab-stage3-plaintext-control
+          - -o
+          - name
+      when: not secrets_encryption_canary_exists.control | bool
+
+    - name: Label the canary objects
+      ansible.builtin.command:
+        argv:
+          - "{{ secrets_encryption_k3s_bin }}"
+          - kubectl
+          - label
+          - --overwrite
+          - --namespace={{ secrets_encryption_canary_namespace }}
+          - "{{ item }}"
+          - "{{ secrets_encryption_canary_label }}=true"
+      loop:
+        - secret/{{ secrets_encryption_canary_pre_secret }}
+        - configmap/{{ secrets_encryption_canary_control_configmap }}
+      changed_when: false
+
+    - name: Compare the pre-encryption canary readback
+      ansible.builtin.include_tasks: canary_readback.yml
+      vars:
+        se_rb_name: "{{ secrets_encryption_canary_pre_secret }}"
+        se_rb_file: "{{ secrets_encryption_canary_dir }}/pre.value"
+        se_rb_label: pre
+
+    - name: Check that the pre-encryption canary is stored in plaintext
+      ansible.builtin.include_tasks: raw_verify.yml
+      vars:
+        se_raw_key: /registry/secrets/{{ secrets_encryption_canary_namespace }}/{{ secrets_encryption_canary_pre_secret }}
+        se_raw_mode: plaintext
+        se_raw_label: pre_plaintext_control
+      when: secrets_encryption_raw_verification | bool
+
+    - name: Check that the control ConfigMap is stored in plaintext
+      ansible.builtin.include_tasks: raw_verify.yml
+      vars:
+        se_raw_key: /registry/configmaps/{{ secrets_encryption_canary_namespace }}/{{ secrets_encryption_canary_control_configmap }}
+        se_raw_mode: plaintext
+        se_raw_label: configmap_plaintext_control
+      when: secrets_encryption_raw_verification | bool
+
+  rescue:
+    - name: Clean up after a failed control creation
+      ansible.builtin.include_tasks: canary_cleanup.yml
+
+    - name: Fail after cleanup
+      ansible.builtin.fail:
+        msg: Creating the canary controls failed; the canaries were removed.
+
+# ---------------------------------------------------------------------------
+# verify
+# ---------------------------------------------------------------------------
+- name: Verify encryption with the canaries
+  when: secrets_encryption_canary_action == 'verify'
+  block:
+    - name: Remove a post-encryption canary left by an interrupted run
+      ansible.builtin.command:
+        argv:
+          - "{{ secrets_encryption_k3s_bin }}"
+          - kubectl
+          - delete
+          - secret
+          - "{{ secrets_encryption_canary_post_secret }}"
+          - --namespace={{ secrets_encryption_canary_namespace }}
+          - --ignore-not-found=true
+          - --wait=true
+      when: secrets_encryption_canary_exists.post | bool
+
+    - name: Remove a stale post-encryption canary value
+      ansible.builtin.file:
+        path: "{{ secrets_encryption_canary_dir }}/post.value"
+        state: absent
+
+    - name: Generate the post-encryption canary value
+      ansible.builtin.shell:
+        cmd: umask 077 && head -c 32 /dev/urandom | base64 -w0 > {{ (secrets_encryption_canary_dir ~ '/post.value') | quote }}
+        creates: "{{ secrets_encryption_canary_dir }}/post.value"
+      no_log: true
+
+    - name: Create the post-encryption canary Secret
+      ansible.builtin.command:
+        argv:
+          - "{{ secrets_encryption_k3s_bin }}"
+          - kubectl
+          - create
+          - secret
+          - generic
+          - "{{ secrets_encryption_canary_post_secret }}"
+          - --namespace={{ secrets_encryption_canary_namespace }}
+          - --from-file=value={{ secrets_encryption_canary_dir }}/post.value
+          - -o
+          - name
+      no_log: true
+
+    - name: Create the plaintext control ConfigMap if it is missing
+      ansible.builtin.command:
+        argv:
+          - "{{ secrets_encryption_k3s_bin }}"
+          - kubectl
+          - create
+          - configmap
+          - "{{ secrets_encryption_canary_control_configmap }}"
+          - --namespace={{ secrets_encryption_canary_namespace }}
+          - --from-literal=control=homelab-stage3-plaintext-control
+          - -o
+          - name
+      when: not secrets_encryption_canary_exists.control | bool
+
+    - name: Compare the post-encryption canary readback
+      ansible.builtin.include_tasks: canary_readback.yml
+      vars:
+        se_rb_name: "{{ secrets_encryption_canary_post_secret }}"
+        se_rb_file: "{{ secrets_encryption_canary_dir }}/post.value"
+        se_rb_label: post
+
+    - name: Compare the pre-encryption canary readback
+      ansible.builtin.include_tasks: canary_readback.yml
+      vars:
+        se_rb_name: "{{ secrets_encryption_canary_pre_secret }}"
+        se_rb_file: "{{ secrets_encryption_canary_dir }}/pre.value"
+        se_rb_label: pre
+      when: secrets_encryption_canary_exists.pre | bool
+
+    - name: Check that the post-encryption canary is stored encrypted
+      ansible.builtin.include_tasks: raw_verify.yml
+      vars:
+        se_raw_key: /registry/secrets/{{ secrets_encryption_canary_namespace }}/{{ secrets_encryption_canary_post_secret }}
+        se_raw_mode: encrypted
+        se_raw_label: post_encrypted
+      when: secrets_encryption_raw_verification | bool
+
+    - name: Check that the pre-encryption canary was rewritten encrypted
+      ansible.builtin.include_tasks: raw_verify.yml
+      vars:
+        se_raw_key: /registry/secrets/{{ secrets_encryption_canary_namespace }}/{{ secrets_encryption_canary_pre_secret }}
+        se_raw_mode: encrypted
+        se_raw_label: pre_rewritten_encrypted
+      when:
+        - secrets_encryption_raw_verification | bool
+        - secrets_encryption_canary_exists.pre | bool
+
+    - name: Check that the control ConfigMap is still stored in plaintext
+      ansible.builtin.include_tasks: raw_verify.yml
+      vars:
+        se_raw_key: /registry/configmaps/{{ secrets_encryption_canary_namespace }}/{{ secrets_encryption_canary_control_configmap }}
+        se_raw_mode: plaintext
+        se_raw_label: configmap_plaintext_control
+      when: secrets_encryption_raw_verification | bool
+
+  always:
+    - name: Clean up the canaries after verification
+      ansible.builtin.include_tasks: canary_cleanup.yml
+
+# ---------------------------------------------------------------------------
+# result
+# ---------------------------------------------------------------------------
+- name: Show the canary results
+  ansible.builtin.debug:
+    msg:
+      action: "{{ secrets_encryption_canary_action }}"
+      raw_verification: "{{ 'performed' if secrets_encryption_raw_verification | bool else 'not performed (not approved for this environment)' }}"
+      results: "{{ secrets_encryption_canary_results }}"
+  when: secrets_encryption_canary_action != 'cleanup'
+
+- name: Require every canary check to pass
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_canary_results | length > 0
+      - secrets_encryption_canary_results.values() | reject('equalto', 'PASS') | list | length == 0
+      - secrets_encryption_canary_action != 'verify' or secrets_encryption_canary_results.readback_post is defined
+      - >-
+        not (secrets_encryption_raw_verification | bool) or secrets_encryption_canary_action != 'verify'
+        or (secrets_encryption_canary_results.raw_post_encrypted is defined
+            and secrets_encryption_canary_results.raw_configmap_plaintext_control is defined)
+    fail_msg: "Canary checks failed: {{ secrets_encryption_canary_results }}"
+    quiet: true
+  when: secrets_encryption_canary_action != 'cleanup'

@@ -1,0 +1,167 @@
+---
+# Guard for every mutating phase. The phase playbooks import it as their first
+# pre-task, with fact gathering off and privilege escalation off, so a refused
+# invocation stops before facts, privilege escalation, downloads or any other
+# task. Every check here runs on the controller.
+#
+# Each phase playbook sets secrets_encryption_phase and secrets_encryption_target
+# ("first" or "single") in its play vars.
+
+# The limit must be exactly one inventory host name: an omitted limit, a
+# pattern, a group, a list, a regex or an exclusion is refused, even when it
+# would resolve to the right host alone.
+- name: Require an exact single-host limit
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_phase in secrets_encryption_mutating_phases
+      - secrets_encryption_target in ['first', 'single']
+      - ansible_limit is defined
+      - ansible_limit is string
+      - ansible_limit in groups['servers']
+      - ansible_play_hosts_all | length == 1
+      - ansible_play_hosts_all[0] == ansible_limit
+      - secrets_encryption_target != 'first' or ansible_limit == groups['servers'][0]
+    fail_msg: >-
+      Phase {{ secrets_encryption_phase | default('unset') }} runs only with --limit set to exactly one
+      server name{{ ' (the first server)' if secrets_encryption_target | default('') == 'first' else '' }}:
+      no pattern, group, list, regex or exclusion. See docs/secrets-encryption.md.
+    quiet: true
+  run_once: true
+
+# A confirmation names the phase, the target host and the current UTC time.
+# It cannot be reused across phases or hosts, and goes stale after
+# secrets_encryption_confirm_max_age_minutes; gate.yml also refuses any value
+# already recorded on the first server.
+- name: Evaluate the phase confirmation
+  vars:
+    se_parts: "{{ (secrets_encryption_confirm | default('') | string).split(':') }}"
+    se_id: "{{ se_parts[2] if se_parts | length == 3 else '' }}"
+    se_id_ok: "{{ se_id is match('^[0-9]{8}T[0-9]{6}Z$') }}"
+    se_age: >-
+      {{ ((now(utc=true) - (se_id | to_datetime('%Y%m%dT%H%M%SZ'))).total_seconds() | int)
+      if se_id_ok | bool else -999999 }}
+  ansible.builtin.set_fact:
+    secrets_encryption_confirm_id: "{{ se_id }}"
+    secrets_encryption_confirm_check:
+      matches: >-
+        {{ se_parts | length == 3 and se_parts[0] == secrets_encryption_phase
+        and se_parts[1] == ansible_limit and se_id_ok | bool }}
+      fresh: >-
+        {{ se_id_ok | bool and se_age | int >= -60
+        and se_age | int <= (secrets_encryption_confirm_max_age_minutes | int) * 60 }}
+  run_once: true
+
+- name: Require a fresh confirmation for this phase and host
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_confirm is defined
+      - secrets_encryption_confirm is string
+      - secrets_encryption_confirm_check.matches | bool
+      - secrets_encryption_confirm_check.fresh | bool
+    fail_msg: >-
+      Phase {{ secrets_encryption_phase }} requires
+      -e secrets_encryption_confirm={{ secrets_encryption_phase }}:{{ ansible_limit }}:<current UTC time,
+      for example $(date -u +%Y%m%dT%H%M%SZ)>, at most {{ secrets_encryption_confirm_max_age_minutes }}
+      minutes old and never used before.
+    quiet: true
+  run_once: true
+
+# "live" must be the exact live inventory; "rehearsal" must share no host name
+# with it, so a rehearsal setting cannot be pointed at the live cluster.
+- name: Require a declared environment that matches the inventory
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_environment is defined
+      - secrets_encryption_environment in ['live', 'rehearsal']
+      - groups['servers'] | length == 3
+      - >-
+        (secrets_encryption_environment == 'live' and groups['servers'] == secrets_encryption_live_hosts)
+        or (secrets_encryption_environment == 'rehearsal'
+        and groups['all'] | intersect(secrets_encryption_live_hosts) | length == 0)
+    fail_msg: >-
+      Set -e secrets_encryption_environment=live for the live inventory
+      ({{ secrets_encryption_live_hosts | join(', ') }}, in that order) or =rehearsal for a
+      three-server rehearsal inventory that contains none of those names.
+    quiet: true
+  run_once: true
+
+# Independent of the declared environment: rehearsal-only work is refused for
+# any inventory or target that contains a live host name.
+- name: Refuse rehearsal-only work near the live cluster
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (secrets_encryption_phase in secrets_encryption_rehearsal_only_phases
+             or secrets_encryption_raw_verification | bool)
+        or (secrets_encryption_environment == 'rehearsal'
+            and groups['all'] | intersect(secrets_encryption_live_hosts) | length == 0
+            and ansible_play_hosts_all | intersect(secrets_encryption_live_hosts) | length == 0
+            and inventory_hostname not in secrets_encryption_live_hosts)
+    fail_msg: >-
+      etcdctl installation and raw etcd verification are approved for a disposable rehearsal
+      environment only. They are refused for any inventory that contains
+      {{ secrets_encryption_live_hosts | join(', ') }}, whatever environment is declared.
+    quiet: true
+  run_once: true
+
+# Role vars hold the pins and fixed paths. Extra vars outrank role vars, so the
+# committed file is read and every value compared.
+- name: Require the committed fixed values
+  vars:
+    se_committed: "{{ lookup('ansible.builtin.file', role_path ~ '/vars/main.yml') | from_yaml }}"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item.key) == item.value
+    fail_msg: "{{ item.key }} differs from the committed role value; overriding it is not allowed."
+    quiet: true
+  loop: "{{ se_committed | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  run_once: true
+
+- name: Require the committed gate values in a live environment
+  vars:
+    se_defaults: "{{ lookup('ansible.builtin.file', role_path ~ '/defaults/main.yml') | from_yaml }}"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item) == se_defaults[item]
+    fail_msg: "{{ item }} may not be relaxed in a live environment."
+    quiet: true
+  loop: "{{ secrets_encryption_live_fixed_defaults }}"
+  run_once: true
+  when: secrets_encryption_environment == 'live'
+
+- name: Require the protected Stage 2 artifacts in a live environment
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_protected_paths is mapping
+      - secrets_encryption_protected_paths.keys() | difference(groups['servers']) | length == 0
+      - secrets_encryption_protected_paths.values() | map('length') | sum > 0
+      - >-
+        secrets_encryption_protected_paths.values() | flatten | reject('match', '^/.*[^/]$') | list | length == 0
+    fail_msg: >-
+      Set secrets_encryption_protected_paths in local, uncommitted inventory: a mapping of server
+      name to the absolute paths of the preserved Stage 2 artifacts on that server.
+    quiet: true
+  run_once: true
+  when: secrets_encryption_environment == 'live'
+
+# Paths that still depend on rehearsal answers fail closed in a live
+# environment until a reviewed change lists them as rehearsal-approved.
+- name: Refuse procedure paths that are not yet rehearsal-approved
+  vars:
+    se_path: >-
+      {{ 'flag-removal' if (secrets_encryption_phase == 'restart' and secrets_encryption_flag_state != 'present')
+      else secrets_encryption_phase if secrets_encryption_phase in ['disable', 'reencrypt-after-disable']
+      else '' }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        se_path == '' or secrets_encryption_environment == 'rehearsal'
+        or se_path in secrets_encryption_rehearsal_approved_paths
+    fail_msg: >-
+      {{ se_path }} is not yet rehearsal-approved for the live cluster. It runs live only after
+      the rehearsal record approves it and a reviewed change lists it in
+      secrets_encryption_rehearsal_approved_paths.
+    quiet: true
+  run_once: true

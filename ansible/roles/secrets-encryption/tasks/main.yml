@@ -1,0 +1,9 @@
+---
+# The role has no default entry point. Each Stage 3 phase includes the task file
+# it needs from its own playbook, so that applying the role by name can never
+# change a server.
+- name: Refuse to apply the secrets-encryption role without a phase
+  ansible.builtin.fail:
+    msg: >-
+      The secrets-encryption role is applied only through its phase playbooks.
+      See docs/secrets-encryption.md.

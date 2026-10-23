@@ -1,0 +1,320 @@
+---
+# Read-only collection of every fact the Stage 3 gates use. Every task reads
+# state; nothing is written, started or stopped. Per-server reads are delegated
+# to each server and use its own local API (127.0.0.1), not only the VIP.
+#
+# Never read here: Secret objects, the server token, the encryption
+# configuration, node annotations (which carry encryption hashes), addresses,
+# or snapshot contents. Only `k3s secrets-encrypt status` touches encryption
+# state, and its raw output is hidden and reduced by parse_status.yml.
+- name: Read the K3s service state on every server
+  ansible.builtin.command:
+    argv: [systemctl, show, k3s.service, --timestamp=unix, --property=ActiveState,ActiveEnterTimestamp,NRestarts]
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_service_probe
+  changed_when: false
+  failed_when: false
+
+- name: Read the K3s version on every server
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_k3s_bin }}", --version]
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_version_probe
+  changed_when: false
+  failed_when: false
+
+- name: Read local API readiness on every server
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_k3s_bin }}", kubectl, get, --raw, /readyz]
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_readyz_probe
+  changed_when: false
+  failed_when: false
+
+- name: Read local etcd readiness on every server
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_k3s_bin }}", kubectl, get, --raw, /readyz/etcd]
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_etcd_probe
+  changed_when: false
+  failed_when: false
+
+- name: Read Chrony tracking on every server
+  ansible.builtin.command:
+    argv: [chronyc, -c, tracking]
+  environment:
+    LC_ALL: C
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_chrony_probe
+  changed_when: false
+  failed_when: false
+
+# Sizes only; device names are not read.
+- name: Read active swap sizes on every server
+  ansible.builtin.command:
+    argv: [swapon, --show=SIZE, --bytes, --noheadings, --raw]
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_swap_probe
+  changed_when: false
+  failed_when: false
+
+- name: Inspect the secrets-encryption drop-in on every server
+  ansible.builtin.stat:
+    path: "{{ secrets_encryption_dropin_path }}"
+    get_checksum: false
+    follow: false
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_dropin_probe
+
+# The state directory and its files must be root-owned regular files (not
+# symbolic links) before anything is read from or written to them.
+- name: Inspect the Stage 3 state directory on every server
+  ansible.builtin.stat:
+    path: "{{ secrets_encryption_state_dir }}"
+    get_checksum: false
+    follow: false
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_statedir_probe
+
+- name: Inspect the Stage 3 state files on every server
+  ansible.builtin.stat:
+    path: "{{ secrets_encryption_state_dir }}/{{ item[1] }}"
+    get_checksum: false
+    follow: false
+  delegate_to: "{{ item[0] }}"
+  loop: "{{ groups['servers'] | product(secrets_encryption_state_files) | list }}"
+  loop_control:
+    label: "{{ item[0] }}:{{ item[1] }}"
+  register: secrets_encryption_statefile_probe
+
+- name: Read the drop-in change time on every server
+  ansible.builtin.slurp:
+    src: "{{ secrets_encryption_state_dir }}/dropin-change"
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_dropin_change_probe
+  failed_when: false
+
+- name: Read the restart verification time on every server
+  ansible.builtin.slurp:
+    src: "{{ secrets_encryption_state_dir }}/restart-verified"
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_verified_probe
+  failed_when: false
+
+- name: Read the last procedure change on the first server
+  ansible.builtin.slurp:
+    src: "{{ secrets_encryption_state_dir }}/last-change"
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_marker_probe
+  failed_when: false
+  run_once: true
+
+- name: Read the used confirmations on the first server
+  ansible.builtin.slurp:
+    src: "{{ secrets_encryption_state_dir }}/confirmations"
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_ledger_probe
+  failed_when: false
+  run_once: true
+
+- name: Read the time on the first server
+  ansible.builtin.command:
+    argv: [date, +%s]
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_now_probe
+  changed_when: false
+  run_once: true
+
+# The output can name nodes when encryption hashes differ; it is never shown.
+- name: Read the secrets-encryption status on every server
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, status]
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_status_probe
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Reset the parsed status
+  ansible.builtin.set_fact:
+    secrets_encryption_status_by_server: {}
+
+- name: Parse the status of each server
+  ansible.builtin.include_tasks: parse_status.yml
+  loop: "{{ secrets_encryption_status_probe.results }}"
+  loop_control:
+    loop_var: secrets_encryption_status_input
+    label: "{{ secrets_encryption_status_input.item }}"
+
+- name: Read node readiness and pressure through the first server
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - get
+      - nodes
+      - -o
+      - >-
+        jsonpath={range .items[*]}{.metadata.name}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.status.conditions[?(@.type=="MemoryPressure")].status}{"|"}{.status.conditions[?(@.type=="DiskPressure")].status}{"|"}{.status.conditions[?(@.type=="PIDPressure")].status}{"\n"}{end}
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_nodes_probe
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Read etcd member nodes through the first server
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_k3s_bin }}", kubectl, get, nodes, -l, node-role.kubernetes.io/etcd=true, -o, name]
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_etcd_nodes_probe
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Read Flux Kustomization readiness through the first server
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - get
+      - kustomizations.kustomize.toolkit.fluxcd.io
+      - --all-namespaces
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"="}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_flux_probe
+  changed_when: false
+  failed_when: false
+  run_once: true
+  when: secrets_encryption_expected_kustomizations | length > 0
+
+- name: Read HelmRelease readiness through the first server
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - get
+      - helmreleases.helm.toolkit.fluxcd.io
+      - --all-namespaces
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"="}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_helm_probe
+  changed_when: false
+  failed_when: false
+  run_once: true
+  when: secrets_encryption_min_helmreleases | int > 0
+
+- name: Read Deployment availability through the first server
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - get
+      - deployments
+      - --all-namespaces
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"="}{.status.availableReplicas}{"/"}{.spec.replicas}{"\n"}{end}'
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_deployments_probe
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Read StatefulSet readiness through the first server
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - get
+      - statefulsets
+      - --all-namespaces
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"="}{.status.readyReplicas}{"/"}{.spec.replicas}{"\n"}{end}'
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_statefulsets_probe
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Read DaemonSet readiness through the first server
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - get
+      - daemonsets
+      - --all-namespaces
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"="}{.status.numberReady}{"/"}{.status.desiredNumberScheduled}{"\n"}{end}'
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_daemonsets_probe
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Read free space in the K3s database directory on every server
+  ansible.builtin.command:
+    argv: [df, --output=avail, -BM, "{{ secrets_encryption_db_dir }}"]
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_df_probe
+  changed_when: false
+  failed_when: false
+
+# Names, sizes and times only. Snapshot contents are never read here.
+- name: List local snapshot files on every server
+  ansible.builtin.find:
+    paths: "{{ secrets_encryption_snapshot_dir }}"
+    file_type: file
+    recurse: false
+    hidden: true
+    get_checksum: false
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_snapshots_probe
+
+- name: List the K3s database directory entries on every server
+  ansible.builtin.find:
+    paths: "{{ secrets_encryption_db_dir }}"
+    file_type: directory
+    recurse: false
+    hidden: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_db_probe
+
+# Existence, type, size and time of each protected Stage 2 artifact. Contents
+# are never read and no checksum is computed.
+- name: Inspect the protected Stage 2 artifacts
+  ansible.builtin.stat:
+    path: "{{ item[1] }}"
+    get_checksum: false
+    follow: false
+  delegate_to: "{{ item[0].key }}"
+  loop: "{{ secrets_encryption_protected_paths | default({}, true) | dict2items | subelements('value') }}"
+  loop_control:
+    label: "{{ item[0].key }}"
+  register: secrets_encryption_protected_probe
+
+- name: Read the preservation baseline on every server
+  ansible.builtin.slurp:
+    src: "{{ secrets_encryption_state_dir }}/preservation-baseline"
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_baseline_probe
+  failed_when: false
+
+- name: Summarize the gathered state
+  ansible.builtin.include_tasks: summarize.yml

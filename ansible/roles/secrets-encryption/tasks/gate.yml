@@ -1,0 +1,124 @@
+---
+# Common gate for every mutating phase, after the guard: current health,
+# preservation, a fresh Stage 3 snapshot (unless the phase is the snapshot
+# itself), a safe state directory, and a confirmation that has never been used.
+# Callers may set:
+#   secrets_encryption_require_snapshot (default true)
+#   secrets_encryption_snapshot_after_change (default false): the snapshot must
+#     also be newer than the last recorded procedure change.
+# Nothing is written until every check has passed; then only the baseline and
+# the confirmation ledger are written.
+- name: Gather the cluster state
+  ansible.builtin.include_tasks: gather.yml
+
+- name: Evaluate preservation and snapshot freshness
+  ansible.builtin.include_tasks: checks.yml
+
+- name: Enforce the common health gate
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_report.health_problems | length == 0
+    fail_msg: "Health gate failed: {{ secrets_encryption_report.health_problems }}"
+    quiet: true
+
+- name: Enforce snapshot and database preservation
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_preservation_problems | length == 0
+    fail_msg: "Preservation gate failed: {{ secrets_encryption_preservation_problems.split(';;') }}"
+    quiet: true
+
+- name: Enforce snapshot freshness
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_snapshot_gate.fresh | bool
+    fail_msg: >-
+      No sufficiently fresh Stage 3 snapshot on {{ groups['servers'][0] }}: run snapshot-etcd.yml first.
+      Newest is {{ secrets_encryption_snapshot_gate.age_seconds }} s old (limit
+      {{ (secrets_encryption_snapshot_max_age_minutes | int) * 60 }} s{{
+      ', and it must be newer than the last change' if secrets_encryption_snapshot_after_change | default(false) | bool else '' }}).
+    quiet: true
+  when: secrets_encryption_require_snapshot | default(true) | bool
+
+- name: Refuse a confirmation that was already used
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_confirm_id is defined
+      - secrets_encryption_confirm_id is match('^[0-9]{8}T[0-9]{6}Z$')
+      - secrets_encryption_confirm_id not in secrets_encryption_used_confirmations
+    fail_msg: >-
+      This confirmation was already used. Every invocation needs a new
+      secrets_encryption_confirm with the current UTC time.
+    quiet: true
+
+# Metadata only. The directory is created root-only; gather.yml has already
+# refused a directory or file that is a symbolic link or not root-owned, and
+# every write below uses follow: false.
+- name: Ensure the Stage 3 state directory exists on every server
+  ansible.builtin.file:
+    path: "{{ secrets_encryption_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+    follow: false
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+
+- name: Re-inspect the Stage 3 state directory on every server
+  ansible.builtin.stat:
+    path: "{{ secrets_encryption_state_dir }}"
+    get_checksum: false
+    follow: false
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+  register: secrets_encryption_statedir_recheck
+
+- name: Require a root-only state directory on every server
+  ansible.builtin.assert:
+    that:
+      - item.stat.isdir | default(false)
+      - not item.stat.islnk | default(true)
+      - item.stat.uid | default(-1) == secrets_encryption_state_owner_uid | int
+      - item.stat.mode | default('') == '0700'
+    fail_msg: "{{ item.item }}: the Stage 3 state directory is not a root-only directory."
+    quiet: true
+  loop: "{{ secrets_encryption_statedir_recheck.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# The baseline only grows: earlier entries (including the first metadata of
+# each protected artifact and the first swap size) are kept.
+- name: Record the preservation baseline on every server
+  vars:
+    se_st: "{{ secrets_encryption_storage[item] }}"
+    se_old: "{{ se_st.baseline if se_st.baseline is mapping else {} }}"
+    se_now_protected: "{{ se_st.protected }}"
+  ansible.builtin.copy:
+    dest: "{{ secrets_encryption_state_dir }}/preservation-baseline"
+    content: >-
+      {{ {'snapshots': ((se_old.snapshots | default([])) + (se_st.snapshot_names
+                        | reject('match', secrets_encryption_scheduled_snapshot_pattern) | list)) | unique | sort,
+          'db_dirs': ((se_old.db_dirs | default([])) + se_st.db_dirs) | unique | sort,
+          'protected': se_now_protected | combine(se_old.protected | default({})),
+          'swap_bytes': se_old.swap_bytes | default(secrets_encryption_servers[item].swap_bytes)} | to_json }}
+    owner: root
+    group: root
+    mode: '0600'
+    follow: false
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['servers'] }}"
+
+# Consumed before the phase acts, whatever its outcome. lineinfile writes
+# through a symbolic link, so it is reached only after gather.yml found the
+# ledger absent or a root-owned regular file, inside a directory only root can
+# write to.
+- name: Record the confirmation as used
+  ansible.builtin.lineinfile:
+    path: "{{ secrets_encryption_state_dir }}/confirmations"
+    line: "{{ secrets_encryption_confirm_id }} {{ secrets_encryption_phase }} {{ inventory_hostname }}"
+    create: true
+    owner: root
+    group: root
+    mode: '0600'
+  delegate_to: "{{ groups['servers'][0] }}"

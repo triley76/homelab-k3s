@@ -1,0 +1,49 @@
+---
+# Stage 3: on-demand etcd snapshot on the first server, as the recovery point
+# before each change. See docs/secrets-encryption.md.
+#
+#   ansible-playbook snapshot-etcd.yml --limit k3s01 \
+#     -e secrets_encryption_environment=live \
+#     -e secrets_encryption_confirm=snapshot:k3s01:$(date -u +%Y%m%dT%H%M%SZ) \
+#     -e secrets_encryption_snapshot_checkpoint=p0-pre-enable
+#
+# Creates one uniquely named snapshot and records its name, size, time and
+# SHA-256. Deletes, prunes or moves nothing; refuses to finish if any existing
+# snapshot disappeared.
+- name: Take a Stage 3 on-demand etcd snapshot
+  hosts: servers
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  max_fail_percentage: 0
+
+  vars:
+    secrets_encryption_phase: snapshot
+    secrets_encryption_target: first
+
+  pre_tasks:
+    # Runs on the controller, before facts, privilege escalation or any other task.
+    - name: Guard the phase
+      ansible.builtin.import_role:
+        name: secrets-encryption
+        tasks_from: guard.yml
+      become: false
+
+    - name: Gather minimal facts after the guard
+      ansible.builtin.setup:
+        gather_subset:
+          - min
+
+  tasks:
+    - name: Gate on health and preservation
+      ansible.builtin.include_role:
+        name: secrets-encryption
+        tasks_from: gate.yml
+      vars:
+        secrets_encryption_require_snapshot: false
+
+    - name: Take the snapshot
+      ansible.builtin.include_role:
+        name: secrets-encryption
+        tasks_from: snapshot.yml

@@ -1,0 +1,74 @@
+---
+# Parse one `k3s secrets-encrypt status` result (text output, K3s v1.36,
+# pkg/cli/secretsencrypt) into allowlisted fields. Input:
+# secrets_encryption_status_input (a registered command result). Output:
+# secrets_encryption_parsed.
+#
+# The raw output is never copied into a fact. In particular the hash line, which
+# names nodes when hashes differ, is reduced to a boolean, and nothing else of it
+# is kept. Every line must be recognized; any other line, a missing or repeated
+# field, or an unknown value marks the result unparsed (fail closed).
+- name: Parse the secrets-encryption status
+  vars:
+    se_rc: "{{ secrets_encryption_status_input.rc | default(-1) }}"
+    se_lines: "{{ secrets_encryption_status_input.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+    se_enc: "{{ se_lines | select('match', '^Encryption Status: ') | map('regex_replace', '^Encryption Status: ', '') | list }}"
+    se_stage: "{{ se_lines | select('match', '^Current Rotation Stage: ') | map('regex_replace', '^Current Rotation Stage: ', '') | list }}"
+    se_hash: "{{ se_lines | select('match', '^Server Encryption Hashes: ') | map('regex_replace', '^Server Encryption Hashes: ', '') | list }}"
+    se_header_re: '^Active\s+Key Type\s+Name$'
+    se_dash_re: '^-{6}\s+-{8}\s+-{4}$'
+    se_row_re: '^(\*\s+)?(AES-CBC|XSalsa20-POLY1305)\s+[A-Za-z0-9._:+-]{1,128}$'
+    se_headers: "{{ se_lines | select('match', se_header_re) | list | length }}"
+    se_dashes: "{{ se_lines | select('match', se_dash_re) | list | length }}"
+    se_rows: "{{ se_lines | select('match', se_row_re) | list }}"
+    se_active_rows: "{{ se_rows | select('match', '^\\*') | list }}"
+    se_unknown: >-
+      {{ se_lines | reject('match', '^(Encryption Status|Current Rotation Stage|Server Encryption Hashes): ')
+      | reject('match', se_header_re) | reject('match', se_dash_re) | reject('match', se_row_re) | list | length }}
+    se_enc_map:
+      Enabled: enabled
+      Disabled: disabled
+      "Disabled, no configuration file found": disabled-no-config
+    se_encryption: "{{ se_enc_map[se_enc[0]] if (se_enc | length == 1 and se_enc[0] in se_enc_map) else 'unknown' }}"
+    se_no_config: "{{ se_encryption == 'disabled-no-config' }}"
+    se_hash_value: "{{ se_hash[0] if se_hash | length == 1 else '' }}"
+    se_hash_state: >-
+      {{ 'match' if se_hash_value == 'All hashes match'
+      else 'mismatch' if se_hash_value is match('^hash does not match between \S+ and \S+$')
+      else 'absent' if se_hash | length == 0 else 'unknown' }}
+    se_problems: >-
+      {{ [
+        {'p': 'status-command-failed', 'f': se_rc | int != 0},
+        {'p': 'empty-output', 'f': se_lines | length == 0},
+        {'p': 'unrecognized-lines', 'f': se_unknown | int > 0},
+        {'p': 'encryption-status', 'f': se_encryption == 'unknown'},
+        {'p': 'stage-line', 'f': se_stage | length > 1 or (se_stage | length == 0 and not se_no_config | bool)},
+        {'p': 'stage-value', 'f': se_stage | length == 1 and se_stage[0] not in secrets_encryption_known_stages},
+        {'p': 'hash-line', 'f': se_hash | length > 1 or (se_hash | length == 0 and not se_no_config | bool)},
+        {'p': 'hash-value', 'f': se_hash_state == 'unknown'},
+        {'p': 'key-table', 'f': (se_rows | length > 0 and (se_headers | int != 1 or se_dashes | int != 1))
+                                or (se_rows | length == 0 and (se_headers | int > 0 or se_dashes | int > 0))
+                                or se_active_rows | length > 1},
+        {'p': 'enabled-without-active-key', 'f': se_encryption == 'enabled' and se_active_rows | length != 1},
+        {'p': 'no-config-with-keys', 'f': se_no_config | bool and se_rows | length > 0},
+      ] | selectattr('f') | map(attribute='p') | list }}
+  ansible.builtin.set_fact:
+    secrets_encryption_parsed:
+      parsed: "{{ se_problems | length == 0 }}"
+      problems: "{{ se_problems }}"
+      encryption: "{{ se_encryption }}"
+      stage: "{{ se_stage[0] if se_stage | length == 1 else 'none' }}"
+      hashes_match: "{{ se_hash_state == 'match' }}"
+      hash_state: "{{ se_hash_state if se_hash_state in ['match', 'mismatch', 'absent'] else 'unknown' }}"
+      key_count: "{{ se_rows | length }}"
+      active_key_type: >-
+        {{ (se_active_rows[0] | regex_replace('^\*\s+', '') | split)[0] if se_active_rows | length == 1 else 'none' }}
+      active_key_name: >-
+        {{ (se_active_rows[0] | regex_replace('^\*\s+', '') | split)[1] if se_active_rows | length == 1 else 'none' }}
+
+- name: Record the parsed status by server
+  ansible.builtin.set_fact:
+    secrets_encryption_status_by_server: >-
+      {{ secrets_encryption_status_by_server | default({})
+      | combine({secrets_encryption_status_input.item: secrets_encryption_parsed}) }}
+  when: secrets_encryption_status_input.item is defined

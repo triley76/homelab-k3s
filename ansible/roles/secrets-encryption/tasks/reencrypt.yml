@@ -1,0 +1,95 @@
+---
+# Rollback, final step of the K3s "Disable/Re-enable" HA procedure:
+# `k3s secrets-encrypt reencrypt --force --skip` on S1, after disable and the
+# restarts. It rewrites every Secret, which with encryption disabled stores them
+# in plaintext again. The command starts the work in the background; the stage
+# is polled until reencrypt_finished.
+#
+# Not yet rehearsal-approved: guard.yml refuses this phase in a live environment
+# until secrets_encryption_rehearsal_approved_paths lists it. The disable and the
+# plaintext re-encryption are separate phases with separate confirmations.
+- name: Decide whether the rollback re-encryption is required
+  vars:
+    se_all: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | list }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_reencrypt_decision: >-
+      {{ 'run' if (secrets_encryption_marker.phase == 'disable'
+                   and se_all | map(attribute='status') | map(attribute='encryption') | unique | list == ['disabled'])
+      else 'done' if secrets_encryption_marker.phase == 'reencrypt-after-disable'
+      else 'refuse' }}
+
+- name: Enforce the rollback re-encryption preconditions
+  vars:
+    se_all: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | list }}"
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_reencrypt_decision in ['run', 'done']
+      - >-
+        secrets_encryption_reencrypt_decision == 'done'
+        or (se_all | selectattr('checkpoint_reached', 'equalto', false) | list | length == 0
+            and se_all | map(attribute='status') | selectattr('hashes_match', 'equalto', false) | list | length == 0)
+    fail_msg: >-
+      reencrypt --force --skip runs only after disable, with every server restarted since the
+      disable, reporting Disabled and matching hashes. State: {{ secrets_encryption_report.encryption }};
+      last change {{ secrets_encryption_marker.phase }}.
+    quiet: true
+
+- name: Rewrite every Secret after disable
+  when: secrets_encryption_reencrypt_decision == 'run'
+  block:
+    - name: Run secrets-encrypt reencrypt --force --skip on the first server
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, reencrypt, --force, --skip]
+      register: secrets_encryption_reencrypt_result
+      changed_when: true
+
+    - name: Require the documented reencrypt result
+      ansible.builtin.assert:
+        that:
+          - secrets_encryption_reencrypt_result.rc == 0
+          - secrets_encryption_reencrypt_result.stdout | trim == 'reencryption started'
+        quiet: true
+
+    - name: Wait for the rollback re-encryption to finish
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, status]
+      register: secrets_encryption_reencrypt_wait
+      until: >-
+        secrets_encryption_reencrypt_wait.rc == 0
+        and secrets_encryption_reencrypt_wait.stdout_lines | map('trim') | select('equalto', 'Current Rotation Stage: reencrypt_finished') | list | length == 1
+      retries: "{{ ((secrets_encryption_reencrypt_timeout_seconds | int) / (secrets_encryption_poll_delay_seconds | int)) | round(0, 'ceil') | int }}"
+      delay: "{{ secrets_encryption_poll_delay_seconds }}"
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Parse the status after the rollback re-encryption
+      ansible.builtin.include_tasks: parse_status.yml
+      vars:
+        secrets_encryption_status_input: "{{ secrets_encryption_reencrypt_wait }}"
+
+    - name: Require a finished rollback with encryption disabled
+      ansible.builtin.assert:
+        that:
+          - secrets_encryption_parsed.parsed | bool
+          - secrets_encryption_parsed.encryption == 'disabled'
+          - secrets_encryption_parsed.stage == 'reencrypt_finished'
+        fail_msg: >-
+          Rollback re-encryption did not finish (now {{ secrets_encryption_parsed.encryption }} /
+          {{ secrets_encryption_parsed.stage }}). Stop and investigate.
+        quiet: true
+
+    - name: Read the time after the rollback re-encryption
+      ansible.builtin.command:
+        argv: [date, +%s]
+      register: secrets_encryption_change_time
+      changed_when: false
+
+    - name: Record the rollback re-encryption change
+      ansible.builtin.copy:
+        dest: "{{ secrets_encryption_state_dir }}/last-change"
+        content: "{{ secrets_encryption_change_time.stdout | trim }} reencrypt-after-disable\n"
+        owner: root
+        group: root
+        mode: '0600'
+        follow: false

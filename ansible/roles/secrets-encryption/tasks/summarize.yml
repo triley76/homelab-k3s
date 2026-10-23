@@ -1,0 +1,134 @@
+---
+# Reduce the probes from gather.yml to allowlisted metadata, then evaluate the
+# common health gate. Pure evaluation: no task here contacts a host. Missing,
+# null or unparsable values become sentinel values (-1, 'unknown', false) that
+# the gate treats as failures.
+- name: Reset the per-server summary
+  ansible.builtin.set_fact:
+    secrets_encryption_servers: {}
+
+- name: Summarize each server
+  vars:
+    se_svc: "{{ secrets_encryption_service_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_ver: "{{ secrets_encryption_version_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_ready: "{{ secrets_encryption_readyz_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_etcd: "{{ secrets_encryption_etcd_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_chrony: "{{ secrets_encryption_chrony_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_swap: "{{ secrets_encryption_swap_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_dropin: "{{ secrets_encryption_dropin_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_change: "{{ secrets_encryption_dropin_change_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_verified: "{{ secrets_encryption_verified_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_df: "{{ secrets_encryption_df_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_sdir: "{{ secrets_encryption_statedir_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_sfiles: "{{ secrets_encryption_statefile_probe.results | selectattr('item.0', 'equalto', item) | list }}"
+    se_svc_out: "{{ se_svc.stdout | default('') if se_svc.rc | default(1) == 0 else '' }}"
+    se_start_raw: "{{ se_svc_out | regex_search('(?m)^ActiveEnterTimestamp=@([0-9]+)$', '\\1') | default([], true) }}"
+    se_restarts_raw: "{{ se_svc_out | regex_search('(?m)^NRestarts=([0-9]+)$', '\\1') | default([], true) }}"
+    se_version_line: "{{ (se_ver.stdout_lines | default([''], true))[0] if se_ver.rc | default(1) == 0 else '' }}"
+    se_change_text: "{{ (se_change.content | b64decode | trim) if (se_change.content is defined) else '' }}"
+    se_verified_text: "{{ (se_verified.content | b64decode | trim) if (se_verified.content is defined) else '' }}"
+    se_df_lines: "{{ se_df.stdout_lines | default([]) if se_df.rc | default(1) == 0 else [] }}"
+    se_chrony_fields: "{{ (se_chrony.stdout | default('') | trim).split(',') if se_chrony.rc | default(1) == 0 else [] }}"
+    se_chrony_ok: >-
+      {{ se_chrony_fields | length >= 14 and se_chrony_fields[4] is match('^-?[0-9.]+(e-?[0-9]+)?$')
+      and se_chrony_fields[13] != 'Not synchronised' }}
+    se_swap_lines: "{{ se_swap.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+    se_swap_ok: "{{ se_swap.rc | default(1) == 0 and se_swap_lines | reject('match', '^[0-9]+$') | list | length == 0 }}"
+    se_status: >-
+      {{ secrets_encryption_status_by_server[item] | default({'parsed': false, 'problems': ['missing'], 'encryption': 'unknown',
+      'stage': 'none', 'hashes_match': false, 'key_count': 0, 'active_key_type': 'none', 'active_key_name': 'none'}) }}
+  ansible.builtin.set_fact:
+    secrets_encryption_servers: >-
+      {{ secrets_encryption_servers | combine({item: {
+        'active': se_svc_out is search('(?m)^ActiveState=active$'),
+        'start_epoch': (se_start_raw[0] | int) if se_start_raw | length == 1 else -1,
+        'nrestarts': (se_restarts_raw[0] | int) if se_restarts_raw | length == 1 else -1,
+        'version': (se_version_line.split(' ')[2] if se_version_line is match('^k3s version \S+') else 'unknown'),
+        'readyz_ok': se_ready.rc | default(1) == 0 and se_ready.stdout | default('') | trim == 'ok',
+        'etcd_ready': se_etcd.rc | default(1) == 0 and se_etcd.stdout | default('') | trim == 'ok',
+        'chrony_synchronized': se_chrony_ok | bool,
+        'chrony_offset_s': (se_chrony_fields[4] | float | abs) if se_chrony_ok | bool else -1,
+        'swap_bytes': (se_swap_lines | map('int') | sum) if se_swap_ok | bool else -1,
+        'dropin_present': (se_dropin.stat.exists | default(false)) and (se_dropin.stat.isreg | default(false))
+                          and not (se_dropin.stat.islnk | default(false)),
+        'dropin_change_epoch': (se_change_text | int) if se_change_text is match('^[0-9]+$') else 0,
+        'verified_epoch': (se_verified_text | int) if se_verified_text is match('^[0-9]+$') else 0,
+        'free_mb': (se_df_lines[1] | trim | regex_replace('M$', '') | int) if (se_df_lines | length == 2 and se_df_lines[1] | trim is match('^[0-9]+M$')) else -1,
+        'state_safe': (not (se_sdir.stat.exists | default(false))
+                       or (se_sdir.stat.isdir | default(false) and not se_sdir.stat.islnk | default(true)
+                           and se_sdir.stat.uid | default(-1) == secrets_encryption_state_owner_uid | int
+                           and se_sdir.stat.mode | default('') == '0700'))
+                      and (se_sfiles | selectattr('stat.exists') | rejectattr('stat.isreg') | list | length == 0)
+                      and (se_sfiles | selectattr('stat.exists') | selectattr('stat.islnk') | list | length == 0)
+                      and (se_sfiles | selectattr('stat.exists') | rejectattr('stat.uid', 'equalto', secrets_encryption_state_owner_uid | int) | list | length == 0)
+                      and se_sfiles | length == secrets_encryption_state_files | length,
+        'status': se_status,
+      }}) }}
+  loop: "{{ groups['servers'] }}"
+
+- name: Summarize the last procedure change and the time
+  vars:
+    se_marker_text: >-
+      {{ (secrets_encryption_marker_probe.content | b64decode | trim)
+      if secrets_encryption_marker_probe.content is defined else '' }}
+    se_marker_ok: "{{ se_marker_text is match('^[0-9]+ (' ~ (secrets_encryption_change_phases | join('|')) ~ ')$') }}"
+    se_ledger_text: >-
+      {{ (secrets_encryption_ledger_probe.content | b64decode)
+      if secrets_encryption_ledger_probe.content is defined else '' }}
+  ansible.builtin.set_fact:
+    secrets_encryption_marker:
+      present: "{{ se_marker_ok }}"
+      malformed: "{{ se_marker_text != '' and not se_marker_ok | bool }}"
+      epoch: "{{ se_marker_text.split(' ')[0] | int if se_marker_ok | bool else 0 }}"
+      phase: "{{ se_marker_text.split(' ')[1] if se_marker_ok | bool else 'none' }}"
+    secrets_encryption_used_confirmations: "{{ se_ledger_text.splitlines() | map('split', ' ') | map('first') | list }}"
+    secrets_encryption_now_epoch: "{{ secrets_encryption_now_probe.stdout | default('0') | trim | int }}"
+
+# A server reaches the checkpoint of the last change when its K3s became
+# active after that change (and after its own last drop-in change), and the
+# post-restart gate then passed and recorded restart-verified.
+- name: Mark which servers have reached the restart checkpoint
+  vars:
+    se_server: "{{ secrets_encryption_servers[item] }}"
+    se_change_epoch: "{{ [secrets_encryption_marker.epoch | int, se_server.dropin_change_epoch | int] | max }}"
+    se_restarted: "{{ se_server.start_epoch | int > se_change_epoch | int }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_servers: >-
+      {{ secrets_encryption_servers | combine({item: {
+        'restarted_since_change': se_restarted | bool,
+        'checkpoint_reached': se_restarted | bool and se_server.verified_epoch | int >= se_server.start_epoch | int
+                              and se_server.verified_epoch | int > se_change_epoch | int,
+      }}, recursive=true) }}
+  loop: "{{ groups['servers'] }}"
+
+- name: Reset the storage summary
+  ansible.builtin.set_fact:
+    secrets_encryption_storage: {}
+
+- name: Summarize snapshots, database directories and protected artifacts
+  vars:
+    se_snap: "{{ secrets_encryption_snapshots_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_db: "{{ secrets_encryption_db_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_base: "{{ secrets_encryption_baseline_probe.results | selectattr('item', 'equalto', item) | first }}"
+    se_prot: "{{ (secrets_encryption_protected_probe.results | default([])) | selectattr('item.0.key', 'equalto', item) | list }}"
+    se_snap_files: "{{ se_snap.files | default([]) }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_storage: >-
+      {{ secrets_encryption_storage | combine({item: {
+        'snapshots_read': se_snap.failed is not defined or not se_snap.failed,
+        'db_read': se_db.failed is not defined or not se_db.failed,
+        'snapshot_names': se_snap_files | map(attribute='path') | map('basename') | list | sort,
+        'snapshot_meta': dict(se_snap_files | map(attribute='path') | map('basename')
+                         | zip(se_snap_files | map('dict2items') | map('selectattr', 'key', 'in', ['size', 'mtime']) | map('items2dict'))),
+        'stage3_snapshots': se_snap_files | selectattr('path', 'search', '/stage3-[^/]*$')
+                            | map('dict2items') | map('selectattr', 'key', 'in', ['path', 'mtime', 'size'])
+                            | map('items2dict') | list,
+        'db_dirs': se_db.files | default([]) | map(attribute='path') | map('basename') | reject('equalto', 'etcd') | list | sort,
+        'protected': dict(se_prot | map(attribute='item.1') | zip(se_prot | map(attribute='stat') | map('dict2items')
+                     | map('selectattr', 'key', 'in', ['exists', 'isdir', 'isreg', 'islnk', 'size', 'mtime']) | map('items2dict'))),
+        'baseline': (se_base.content | b64decode | from_json) if se_base.content is defined else none,
+      }}) }}
+  loop: "{{ groups['servers'] }}"
+
+- name: Evaluate the common health gate
+  ansible.builtin.include_tasks: evaluate.yml

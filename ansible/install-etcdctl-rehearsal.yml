@@ -1,0 +1,44 @@
+---
+# Stage 3 rehearsal only: install the pinned, checksum-verified etcdctl
+# (v3.6.14, the etcd release embedded in K3s v1.36.4+k3s1) and the local
+# verifier on the first rehearsal server, for raw canary checks. Refused for any
+# inventory containing k3s01, k3s02 or k3s03, whatever environment is declared.
+#
+#   ansible-playbook -i <rehearsal inventory> install-etcdctl-rehearsal.yml --limit <first server> \
+#     -e secrets_encryption_environment=rehearsal \
+#     -e secrets_encryption_confirm=install-etcdctl:<first server>:$(date -u +%Y%m%dT%H%M%SZ)
+- name: Install the pinned etcdctl for a Stage 3 rehearsal
+  hosts: servers
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  max_fail_percentage: 0
+
+  vars:
+    secrets_encryption_phase: install-etcdctl
+    secrets_encryption_target: first
+
+  pre_tasks:
+    # Runs on the controller, before facts, privilege escalation or any other task.
+    - name: Guard the phase
+      ansible.builtin.import_role:
+        name: secrets-encryption
+        tasks_from: guard.yml
+      become: false
+
+    - name: Gather minimal facts after the guard
+      ansible.builtin.setup:
+        gather_subset:
+          - min
+
+  tasks:
+    - name: Gate on health, preservation and a fresh snapshot
+      ansible.builtin.include_role:
+        name: secrets-encryption
+        tasks_from: gate.yml
+
+    - name: Install etcdctl and the verifier
+      ansible.builtin.include_role:
+        name: secrets-encryption
+        tasks_from: etcdctl.yml

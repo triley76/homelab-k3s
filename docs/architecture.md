@@ -344,6 +344,8 @@ The design intentionally uses an odd number of server nodes to support etcd quor
 
 The validation performed for this project includes a controlled failure of one server. It should not be interpreted as validation of arbitrary multi-node failure scenarios.
 
+Kubernetes Secrets are currently stored in etcd without encryption at rest. The `secrets-encryption` role encodes the K3s procedure that enables secretbox encryption on the existing servers one step and one server at a time. It is statically tested but not yet rehearsed or applied; see [Secrets Encryption at Rest](secrets-encryption.md).
+
 ## Kubernetes API High Availability
 
 Clients interact with the Kubernetes API through a virtual address rather than the address of a specific server.

@@ -1,0 +1,39 @@
+---
+# Remove every canary object and the local value directory. Safe to repeat, and
+# safe after an interrupted run: deletion ignores objects that do not exist.
+# Only the fixed canary names are ever deleted; no selector or other object.
+- name: Delete the canary Secrets
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - delete
+      - secret
+      - "{{ item }}"
+      - --namespace={{ secrets_encryption_canary_namespace }}
+      - --ignore-not-found=true
+      - --wait=true
+  loop:
+    - "{{ secrets_encryption_canary_pre_secret }}"
+    - "{{ secrets_encryption_canary_post_secret }}"
+  register: secrets_encryption_cleanup_secrets
+  changed_when: secrets_encryption_cleanup_secrets.stdout | trim | length > 0
+
+- name: Delete the plaintext control ConfigMap
+  ansible.builtin.command:
+    argv:
+      - "{{ secrets_encryption_k3s_bin }}"
+      - kubectl
+      - delete
+      - configmap
+      - "{{ secrets_encryption_canary_control_configmap }}"
+      - --namespace={{ secrets_encryption_canary_namespace }}
+      - --ignore-not-found=true
+      - --wait=true
+  register: secrets_encryption_cleanup_configmap
+  changed_when: secrets_encryption_cleanup_configmap.stdout | trim | length > 0
+
+- name: Remove the canary value directory
+  ansible.builtin.file:
+    path: "{{ secrets_encryption_canary_dir }}"
+    state: absent
