@@ -4,6 +4,14 @@
 # encryption configuration K3s writes an identity-only configuration: nothing is
 # encrypted and no Secret is rewritten. Restarts follow, one server at a time,
 # through secrets-encryption-restart.yml.
+#
+# Observed in the k3d rehearsal on v1.36.4+k3s1: after enable, and before any
+# restart, `k3s secrets-encrypt status` fails on every server (the server
+# reports a missing encryption-hash annotation). Status is therefore not a
+# postcondition of this phase. The only accepted result is the command's exit
+# status 0 with exactly "secrets-encryption enabled"; the change is recorded
+# only after that. Status is required again, and must show Disabled, start and
+# matching hashes, once the first restart round has completed (restart.yml).
 - name: Decide whether enable is required
   vars:
     se_states: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | map(attribute='status') | list }}"
@@ -37,18 +45,24 @@
 - name: Enable secrets encryption with an identity configuration
   when: secrets_encryption_enable_decision == 'run'
   block:
+    # Failures are decided by the next task, so that any exit status or output
+    # other than the documented one stops before the change is recorded.
     - name: Run secrets-encrypt enable on the first server
       ansible.builtin.command:
         argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, enable]
       register: secrets_encryption_enable_result
       changed_when: true
+      failed_when: false
 
     - name: Require the documented enable result
       ansible.builtin.assert:
         that:
+          - secrets_encryption_enable_result.rc is defined
           - secrets_encryption_enable_result.rc == 0
-          - secrets_encryption_enable_result.stdout | trim == 'secrets-encryption enabled'
-        fail_msg: "secrets-encrypt enable did not report success. Stop and investigate; do not restart any server."
+          - secrets_encryption_enable_result.stdout_lines | default([]) == ['secrets-encryption enabled']
+        fail_msg: >-
+          secrets-encrypt enable did not exit 0 with exactly "secrets-encryption enabled". No change
+          was recorded. Stop and investigate; do not restart any server.
         quiet: true
 
     - name: Read the time after enable
@@ -66,33 +80,11 @@
         mode: '0600'
         follow: false
 
-    - name: Read the first server's status after enable
-      ansible.builtin.command:
-        argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, status]
-      register: secrets_encryption_after_enable
-      changed_when: false
-      failed_when: false
-      no_log: true
-
-    - name: Parse the status after enable
-      ansible.builtin.include_tasks: parse_status.yml
-      vars:
-        secrets_encryption_status_input: "{{ secrets_encryption_after_enable }}"
-
-    - name: Require an identity configuration without encryption
-      ansible.builtin.assert:
-        that:
-          - secrets_encryption_parsed.parsed | bool
-          - secrets_encryption_parsed.encryption == 'disabled'
-        fail_msg: >-
-          After enable the first server should report a configuration with encryption Disabled.
-          It reports {{ secrets_encryption_parsed.encryption }}, stage {{ secrets_encryption_parsed.stage }}.
-          Stop; do not restart any server.
-        quiet: true
-
-    - name: Show the status after enable
+    - name: Show the next step after enable
       ansible.builtin.debug:
         msg:
-          encryption: "{{ secrets_encryption_parsed.encryption }}"
-          stage: "{{ secrets_encryption_parsed.stage }}"
+          enable: secrets-encryption enabled
+          status: >-
+            Not read. Before the first restart round, secrets-encrypt status is expected to fail on
+            every server; it is required again after the round.
           next: Restart each server with the drop-in, k3s01 first, using secrets-encryption-restart.yml.

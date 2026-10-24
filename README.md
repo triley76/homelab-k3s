@@ -81,7 +81,7 @@ The addresses above use the RFC 5737 documentation range and are examples rather
 | Flux Git source reconciliation | Validated |
 | Flux Kustomization reconciliation | Validated |
 | Serial Chrony rollout and enforced one-hour stability window | Validated |
-| Kubernetes Secrets encryption at rest (secretbox) | Implemented and statically tested; not yet rehearsed or applied |
+| Kubernetes Secrets encryption at rest (secretbox) | Implemented and statically tested; k3d rehearsal stopped at step 1 and the procedure was corrected; not yet passed a rehearsal or applied |
 | GitOps platform-service expansion | In progress |
 
 The current Kubernetes baseline is pinned to **K3s v1.36.4+k3s1**. Flux **2.9.5** has been bootstrapped and validated against the V2 cluster.
@@ -155,7 +155,7 @@ The `secrets-encryption` role and its phase playbooks encode the K3s `v1.36.4+k3
 - `enable`, a restart of each server, `rotate-keys` (which activates encryption and rewrites every existing Secret) and a second restart of each server;
 - each step a separate, single-server, confirmed invocation behind health, preservation and snapshot gates.
 
-It is statically tested only. It has not been rehearsed or run against the cluster, and `site.yml` does not use it; see [docs/secrets-encryption.md](docs/secrets-encryption.md).
+It is statically tested only. The k3d rehearsal stopped at step 1, because `secrets-encrypt status` is unavailable between `enable` and the first restart round. The procedure was corrected for that, but has not yet passed a rehearsal or been run against the cluster, and `site.yml` does not use it; see [docs/secrets-encryption.md](docs/secrets-encryption.md).
 
 ## GitOps Boundary
 

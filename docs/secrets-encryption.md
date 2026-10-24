@@ -4,12 +4,12 @@
 
 The automation for enabling Kubernetes Secrets encryption at rest is **implemented and statically tested only**:
 
-- It has **not** been rehearsed. Neither the required three-server k3d rehearsal nor the three-VM rehearsal has run.
+- It has **not** passed a rehearsal. The required three-server k3d rehearsal was attempted on 2026-10-23 and **stopped at step 1** (see [k3d rehearsal record](#k3d-rehearsal-record-2026-10-23)). The encoded procedure has been corrected for what it showed, but the corrected procedure has not been rehearsed. The three-VM rehearsal has not run.
 - It has **not** been run against the live cluster.
 - Nothing in this repository has changed the live cluster's encryption state, which remains disabled.
 - [`site.yml`](../ansible/site.yml) does not run any of it.
 
-Until the rehearsals pass, every statement below about K3s behavior is the documented or source-code behavior of K3s `v1.36.4+k3s1`, not observed behavior.
+Until the rehearsals pass, every statement below about K3s behavior is the documented or source-code behavior of K3s `v1.36.4+k3s1`, not observed behavior, except where it is marked as observed in the k3d rehearsal record.
 
 Stage 3 is the prerequisite stage of the backup and disaster-recovery design in the companion `home-cluster` repository: no etcd snapshot may leave the cluster until Secrets are encrypted at rest. That design also fixes the rehearsal requirement, the single key rotation and the recovery-material question answered below.
 
@@ -36,7 +36,7 @@ These operations are separate in K3s, in this automation and in every claim made
 
 | Operation | What does it | Restarts | Effect on stored data |
 | --- | --- | --- | --- |
-| **1. Configuration enablement** | `k3s secrets-encrypt enable` on S1 (on a cluster without encryption configuration), then the `secrets-encryption: true` drop-in on every server | Every server, S1 first | K3s writes an **identity-only** configuration. Nothing is encrypted, and no Secret is rewritten. Status: `Disabled`, stage `start`. |
+| **1. Configuration enablement** | `k3s secrets-encrypt enable` on S1 (on a cluster without encryption configuration), then the `secrets-encryption: true` drop-in on every server | Every server, S1 first | K3s writes an **identity-only** configuration. Nothing is encrypted, and no Secret is rewritten. Status is unavailable until the first restart round has completed (observed); afterwards it is expected to be `Disabled`, stage `start`. |
 | **2. Activation for new writes** | `k3s secrets-encrypt rotate-keys` on S1 | Every server afterwards, S1 first | Generates a secretbox key and puts it first. From then on, every Secret written is stored encrypted. |
 | **3. Rewriting existing Secrets** | Part of the same `rotate-keys` call: K3s re-encrypts every Secret, about 5 per second, before reporting `reencrypt_finished` | — | Every existing Secret is written again, so its **current** etcd record becomes encrypted. Resource versions change and watches fire. |
 | **4. Key rotation** | A later `rotate-keys` | Every server afterwards, S1 first | New key; every Secret rewritten; the retired key removed. **The approved procedure performs no rotation beyond step 2** (see [Exactly One Rotation](#exactly-one-rotation)). |
@@ -75,8 +75,8 @@ The backup design calls for one key rotation, so that the key in use did not coe
 | Step | K3s procedure | Playbook | Expected status afterwards |
 | --- | --- | --- | --- |
 | 0 | Recovery point | `snapshot-etcd.yml --limit k3s01` | Unchanged |
-| 1 | Verify encryption is disabled; `k3s secrets-encrypt enable` on S1 | `secrets-encryption-enable.yml --limit k3s01` | S1: `Disabled` |
-| 2 | Restart all servers with `--secrets-encryption` | `secrets-encryption-restart.yml`, once per server: `k3s01`, `k3s02`, `k3s03` | All: `Disabled`, `start`, all hashes match |
+| 1 | Verify encryption is disabled; `k3s secrets-encrypt enable` on S1 | `secrets-encryption-enable.yml --limit k3s01` | Not readable: status fails on every server until step 2 completes (observed). The only accepted result of step 1 is exit status 0 with exactly `secrets-encryption enabled`. |
+| 2 | Restart all servers with `--secrets-encryption` | `secrets-encryption-restart.yml`, once per server: `k3s01`, `k3s02`, `k3s03` | All: `Disabled`, `start`, all hashes match. Required, in the run that restarts `k3s03`, before that server's restart is recorded as verified; until then neither checkpoint p1 nor rotation can run. |
 | 3 | `k3s secrets-encrypt rotate-keys` on S1 | `secrets-encryption-rotate.yml --limit k3s01` | S1: `Enabled`, `reencrypt_finished`, active key `XSalsa20-POLY1305` |
 | 4 | Restart all servers with the same arguments | `secrets-encryption-restart.yml`, once per server: `k3s01`, `k3s02`, `k3s03` | All: `Enabled`, `reencrypt_finished`, all hashes match |
 
@@ -96,11 +96,25 @@ Rollback (disable):
 
 A rehearsal environment may run them, to produce the rehearsal record. Each becomes available live only through a reviewed change that adds it to `secrets_encryption_rehearsal_approved_paths` in the role's vars, citing that record. An extra-vars override of that list is refused, like every other committed value.
 
-The documented disable procedure keeps the server arguments. Drop-in removal is not part of the K3s procedure. The automation permits it only when every server reports `Disabled`, after step 1 or after R3.
+The documented disable procedure keeps the server arguments. Drop-in removal is not part of the K3s procedure. The automation permits it only when every server reports `Disabled`: after step 2 (status is unreadable between step 1 and the end of step 2) or after R3.
 
 The disable (R1) and the plaintext re-encryption (R3) are separate phases, each with its own confirmation.
 
 **Restart order.** The documentation's HA tabs say "restart all servers" for steps 2 and 4 without an order, and "S1 first, then S2 and S3" for key rotation and disable. The automation uses one fixed order for every restart round, `k3s01`, `k3s02`, `k3s03`, which is the inventory order the live guard requires. Each server is refused until every server before it has restarted after the last change and passed its post-restart gate.
+
+### Between enable and the first restart round
+
+The k3d rehearsal showed that `k3s secrets-encrypt status` fails on every server after `enable` and before any restart (see [k3d rehearsal record](#k3d-rehearsal-record-2026-10-23)). Status is therefore no postcondition of step 1. Every gate still fails closed on an unparsed status, with one narrowly defined exception, the **enable restart round**:
+
+- **Step 1 accepts one result only.** `enable` must exit 0 and print exactly `secrets-encryption enabled` (one line on standard output). The `enable` marker in `last-change` is written only after that check passes. Any other result stops without recording a change. Step 1 never reads status afterwards.
+- **What the round is.** The first restart round after the `enable` marker, until all three servers have reached the checkpoint. Only `secrets-encryption-restart.yml` with the drop-in requested (`flag_state=present`) can use it, and only while all of the following hold:
+  - the marker is `enable`, and the confirmation ledger on the first server records an `enable` for the first server, preceded by a `snapshot` for the first server, and no `rotate-keys`, `disable` or `reencrypt-after-disable`, which would make the marker stale;
+  - a Stage 3 snapshot older than the `enable` marker (checkpoint p0) exists on the first server, in addition to the usual freshness and preservation gates;
+  - the servers that reached the checkpoint are exactly a prefix of the order `k3s01`, `k3s02`, `k3s03`, and no later server shows a restart, a drop-in, a drop-in change or a verified restart since `enable`;
+  - the target is the next server in that order. A server that already passed is refused (no replayed restart), and so is any server after the next one (no skipped or out-of-order restart).
+- **What it tolerates.** Only a status result that failed, printed nothing on standard output and reported exactly the observed server error (`Internal error occurred: secret-encrypt error ID <n>`). That result is recorded as `unavailable`. It is never parsed, and it is never treated as evidence of health or of the encryption state. Every other part of the gate is unchanged: service, version, local `/readyz` and `/readyz/etcd`, node readiness and pressure, etcd members, workloads, Chrony, swap, free space, state-directory safety, preservation and snapshot freshness. A status that does parse must still be settled, and may not report `Enabled`.
+- **How it ends.** In the run that restarts `k3s03`, after its post-restart gate, status must become readable on every server and parse as `Disabled`, stage `start`, with matching hashes. It is polled for up to `secrets_encryption_ready_retries` × `secrets_encryption_ready_delay_seconds`. Only then is `k3s03` recorded as verified. If that check fails, the round stays incomplete: `k3s03` can be re-run, and checkpoint p1, rotation and every other phase stay refused, because outside the round an unparsed status fails the gate.
+- **No option.** The exception is computed from recorded state. There is no variable that turns it on, and the guard refuses any attempt to inject the round, the parsed status or the gathered server state as extra variables.
 
 ## Implementation
 
@@ -148,6 +162,7 @@ Each mutating playbook is one play on `servers` with `serial: 1`, `any_errors_fa
    - **Committed values:** every role var (pins, paths, live host list, approvals) equals the committed `vars/main.yml`; extra vars cannot override them. In a live environment, the gate defaults (Flux, HelmRelease, monitoring, canary, Chrony, freshness and free-space settings, raw verification off) must also equal the committed `defaults/main.yml`.
    - **Protected artifacts:** in a live environment, `secrets_encryption_protected_paths` names the preserved Stage 2 artifacts as absolute paths on known servers. Set it in local, uncommitted inventory.
    - **Rehearsal approval:** paths not yet rehearsal-approved are refused live (see [Encoded Procedure](#encoded-procedure)).
+   - **Gathered state:** none of the facts that the gate builds from the servers (`secrets_encryption_gathered_facts` in the role's vars, including the enable restart round and the parsed status) may already be defined. Extra vars outrank facts, so an injected value would otherwise replace what the gate reads.
 2. **Facts:** minimal fact gathering, only after the guard.
 3. **Gate.** Read-only until every check has passed:
    - **Each server, through its own local API:** `k3s.service` is active at exactly `v1.36.4+k3s1`; local `/readyz` and `/readyz/etcd` are `ok`; `secrets-encrypt status` parses and is in a settled stage (`start` or `reencrypt_finished`), never during re-encryption or in a legacy stage; Chrony is synchronized with an offset below 100 ms; swap is unchanged since the baseline; free space is sufficient; the state directory and its files are root-owned regular paths, not symbolic links.
@@ -184,7 +199,8 @@ A server reaches the checkpoint of the last change when both hold:
 
 - refuses while any server is re-encrypting or in an unsettled stage;
 - enforces the fixed order `k3s01`, `k3s02`, `k3s03`. A server is refused until every server before it has reached the checkpoint with the requested drop-in state;
-- restarts nothing if the target already runs with the current configuration (a no-op that only repeats the post-restart gate and its record);
+- restarts nothing if the target already runs with the current configuration (a no-op that only repeats the post-restart gate and its record). In the [enable restart round](#between-enable-and-the-first-restart-round) only the next server in the order is accepted, so a server that has already passed is refused instead;
+- in the enable restart round, requires every server to report `Disabled`, `start` and matching hashes in the `k3s03` run before recording it as verified;
 - contains the role's only K3s restart, an explicit `systemd_service` task. No handler restarts K3s.
 
 After the restart it waits for:
@@ -206,7 +222,7 @@ It then re-runs the full gate and fails if any server's automatic restart counte
 - `active_key_type`
 - `active_key_name`
 
-Every line must be recognized, and every field must appear exactly once where required, or the result is "not parsed" and every gate fails closed. The hash line names nodes when hashes differ; only the boolean is kept. No encryption hash, raw status, node annotation (which carries the encryption hash), Secret, token or encryption configuration is read into or printed by Ansible.
+Every line must be recognized, and every field must appear exactly once where required, or the result is "not parsed" and every gate fails closed. One unparsed result is also marked `unavailable` (a boolean): the observed failure between `enable` and the end of the first restart round. Only the [enable restart round](#between-enable-and-the-first-restart-round) tolerates it. The hash line names nodes when hashes differ; only the boolean is kept. No encryption hash, raw status, node annotation (which carries the encryption hash), Secret, token or encryption configuration is read into or printed by Ansible.
 
 ### Snapshots and preservation
 
@@ -302,6 +318,8 @@ Every command needs a new confirmation naming its phase, its host and the curren
 - run `validate-secrets-encryption.yml` and `validate-time-sync.yml -e time_sync_enforce_acceptance=true`;
 - keep the LAN canary monitor running throughout.
 
+During the enable restart round (after `k3s01` and `k3s02` in step 2), `validate-secrets-encryption.yml` reports every server's status as not parsed, with `unavailable: true`. That is the expected state, not a pass. Do not run it with `secrets_encryption_enforce=true` until the `k3s03` restart has completed.
+
 ```bash
 E="-e secrets_encryption_environment=live"
 c() { echo "secrets_encryption_confirm=$1:$2:$(date -u +%Y%m%dT%H%M%SZ)"; }
@@ -312,7 +330,8 @@ ansible-playbook snapshot-etcd.yml --limit k3s01 $E -e "$(c snapshot k3s01)" -e 
 ansible-playbook secrets-encryption-canary.yml --limit k3s01 $E -e secrets_encryption_canary_action=create-control \
   -e "$(c canary-create-control k3s01)"
 
-# 1. Configuration enablement
+# 1. Configuration enablement. Status stays unreadable until k3s03 has restarted;
+#    the k3s03 run requires Disabled/start/matching hashes before it completes.
 ansible-playbook secrets-encryption-enable.yml --limit k3s01 $E -e "$(c enable k3s01)"
 ansible-playbook secrets-encryption-restart.yml --limit k3s01 $E -e "$(c restart k3s01)"
 ansible-playbook secrets-encryption-restart.yml --limit k3s02 $E -e "$(c restart k3s02)"
@@ -348,7 +367,7 @@ Stop immediately, and do not run another step, if:
 - quorum is lost, or etcd readiness fails on any server;
 - a node is not Ready, or a local API is not ready;
 - a K3s service fails to start or restarts unexpectedly;
-- a status is not parsed, a stage is unexpected, or hashes do not match where the table above expects them to;
+- a status is not parsed (other than the `unavailable` result that the [enable restart round](#between-enable-and-the-first-restart-round) tolerates), a stage is unexpected, or hashes do not match where the table above expects them to;
 - re-encryption does not finish within its timeout;
 - any API error reads a Secret;
 - a Flux Kustomization or HelmRelease is not Ready;
@@ -408,6 +427,34 @@ A disposable three-server k3d cluster at `rancher/k3s:v1.36.4-k3s1`. k3d nodes a
 - it covers the rollback (R1–R3);
 - it restores pre- and post-rotation snapshots with the matching token.
 
+The k3d rehearsal has **not** passed.
+
+### k3d rehearsal record (2026-10-23)
+
+A disposable three-server k3d cluster (k3d v5.9.0, Docker 29.1.3 under WSL2, image `rancher/k3s:v1.36.4-k3s1`, every server reporting `v1.36.4+k3s1`), driven from the pushed commit `cd4bbd1` with `docker exec`. The run **stopped at step 1** on a failed gate, as the stop conditions require. No drop-in was written and no server was restarted by the procedure. No rotation, re-encryption, encrypted canary check, rollback or snapshot restore ran. The cluster was deleted afterwards. The evidence was metadata only.
+
+**Observed:**
+
+- **Baseline:** `k3s secrets-encrypt status` printed `Encryption Status: Disabled, no configuration file found` on all three servers, and the parser accepted it. Local `/readyz`, `/readyz/etcd`, node readiness and etcd membership were healthy.
+- **Checkpoint p0:** `k3s etcd-snapshot save --name stage3-p0-pre-enable-<time>` on S1 created exactly one new file, on S1 only. No other snapshot file existed, so pruning could not be observed.
+- **Canary controls:** the API readback of `stage3-canary-pre-encryption` matched. The raw records of that Secret and of `stage3-canary-plaintext-control`, read with the pinned etcdctl 3.6.14 (`get --write-out=json -- <key>`), passed the verifier in `plaintext` mode, and the canary value was present in the Secret's raw record.
+- **Step 1:** `k3s secrets-encrypt enable` on S1 exited 0 and printed exactly `secrets-encryption enabled`. A K3s CLI warning about the cluster CA appeared on standard error only.
+- **After step 1, before any restart:** `k3s secrets-encrypt status` failed on **all three** servers: `level=fatal msg="Error: see server log for details: Internal error occurred: secret-encrypt error ID <n>"`. The S1 server log reported `missing annotation on node <S1>` for each request. Local `/readyz` and `/readyz/etcd` stayed `ok`, and no server restarted.
+- **Consequence:** the committed `enable.yml` asserted that status parses as `Disabled` right after `enable`, so it would have failed at the same point. The common health gate would also have refused the first restart, because it treated any unparsed status as a failure. The encoded procedure could not have reached step 2.
+
+**Corrected in the encoded procedure** (statically tested only, not yet rehearsed):
+
+- Step 1 accepts only exit status 0 with exactly `secrets-encryption enabled`, records the marker only afterwards, and reads no status.
+- The [enable restart round](#between-enable-and-the-first-restart-round) tolerates exactly the observed unavailable status, only in the restart phase, only in strict order, and only with a consistent marker, ledger and pre-enable checkpoint.
+- The `k3s03` run requires every server to report `Disabled`, `start` and matching hashes before the round is complete. Until then, p1 and rotation are refused.
+
+**Rehearsal-harness findings (k3d only):**
+
+- In the `rancher/k3s` image, `k3s kubectl …` fails (`unknown command "kubectl" for "kubectl"`). The image's `kubectl` works. This does not apply to the VM rehearsal or the live servers, where the playbooks call `k3s kubectl`.
+- A WSL2 host stops the distribution, Docker and every k3d server when no WSL session is open, and clears `/tmp`. A first attempt on 2026-10-23 was discarded before step 1 for that reason. The rehearsal host needs a session kept open for the whole run.
+
+**Still unanswered, because the run stopped at step 1:** whether status becomes readable after the first restart round (and after which server), and what it shows then (rehearsal questions 1 and 3); questions 2 and 4 to 12, apart from the partial observations above on 9 (the no-configuration status text), 10 (the plaintext controls) and 11 (one CLI save on S1 created one file on S1 only).
+
 ### Three-VM Ubuntu (after k3d)
 
 Three disposable VMs built with this repository's Packer image and playbooks, with an inventory that uses none of the live host names. This rehearsal exercises the real playbooks end to end:
@@ -419,7 +466,7 @@ Three disposable VMs built with this repository's Packer image and playbooks, wi
 
 ### Rehearsal questions
 
-1. Does `k3s secrets-encrypt enable` work on an existing `v1.36.4+k3s1` cluster without encryption configuration? What does `status` show after it, and after the first restart of each server?
+1. Does `k3s secrets-encrypt enable` work on an existing `v1.36.4+k3s1` cluster without encryption configuration? What does `status` show after it, and after the first restart of each server? *Partly observed:* `enable` exits 0 with the exact documented output, and `status` then fails on every server until restarts. What status shows after each restart is still open.
 2. Does `secretbox` as the configured provider work with the existing-cluster path (does `rotate-keys` generate an `XSalsa20-POLY1305` key)?
 3. Does the order of the "restart all servers" steps matter, and does a peer report matching hashes only after its own restart?
 4. Does `rotate-keys` finish within the CLI's 90-second timeout for this cluster's Secret count? If not, does the server finish on its own, as the polling assumes?
@@ -438,7 +485,7 @@ Three disposable VMs built with this repository's Packer image and playbooks, wi
 python3 ansible/tests/secrets_encryption_expressions.py
 ```
 
-The test contacts no node, API, etcd or AWS, and downloads nothing. It runs in five parts.
+The test contacts no node, API, etcd or AWS, and downloads nothing. It runs in six parts.
 
 **1. Structure checks:**
 
@@ -447,7 +494,10 @@ The test contacts no node, API, etcd or AWS, and downloads nothing. It runs in f
 - guard-then-gate order;
 - no handlers, and a single explicit K3s restart;
 - the fixed restart order and the verified checkpoint;
-- each `secrets-encrypt` subcommand only in its own phase;
+- each `secrets-encrypt` subcommand only in its own phase, and no status read in `enable.yml`;
+- the exact `enable` result checked before the marker is written;
+- the post-round status validation before the `k3s03` restart is recorded as verified;
+- the `unavailable` status tolerated only inside the enable restart round, with no variable that enables it;
 - the exact single-key, local-only, time-bounded etcdctl query piped only into the verifier;
 - the installer's check-before-install order;
 - no cluster reset, restore, rejoin, snapshot deletion or prune, `ignore_errors`, file removal outside the drop-in and canary values, or reads of Secrets, tokens, the encryption configuration, addresses or JSON/YAML object dumps;
@@ -469,16 +519,20 @@ The test contacts no node, API, etcd or AWS, and downloads nothing. It runs in f
   - overridden pins and approvals;
   - relaxed live gates;
   - missing protected artifacts;
-  - not-yet-approved rollback paths.
+  - not-yet-approved rollback paths;
+  - injected round, status or server-state facts.
 - **Allowed invocations** run the real header and guard.
 
 **5. Role scenarios on localhost, against mocked results and local stand-ins.** Every expected failure must fail at the named task.
 
-- status parsing, including fail-closed cases;
+- status parsing, including fail-closed cases and the narrow `unavailable` result;
 - the health gate, with every failure class;
+- the enable restart round: tolerated only in order, in the restart phase, with the marker, ledger and pre-enable checkpoint consistent; refused for a stale marker, a missing ledger entry or checkpoint, a skipped, out-of-order, partial or replayed restart, another phase, any other status failure, and after the round has completed;
+- `enable` with a stub k3s: the exact result is mandatory, a failed or unexpected result writes no marker, and no status is read afterwards;
+- the post-round validation with a stub k3s: `Disabled`, `start` and matching hashes pass; an unavailable status, a mismatch, `Enabled` or no configuration fail, and the restart is not recorded as verified;
 - preservation of protected artifacts and freshness;
 - snapshot metadata comparison;
-- every phase decision;
+- every phase decision, including rotation refused before the post-round validation;
 - the restart order;
 - confirmation replay;
 - state-directory and ledger link safety, with real `lstat`;
@@ -488,6 +542,8 @@ The test contacts no node, API, etcd or AWS, and downloads nothing. It runs in f
 - the raw verification pipeline, with a stub etcdctl;
 - the canary lifecycle, with a stub k3s: success, failure and interruption.
 
+**6. Mutation tests.** Each mutant is a copy of the role's task files with one change that reintroduces a defect: the post-enable status assertion, a relaxed or removed enable-result check, the marker written before the check, the tolerance without the round, the round without its order, ledger or checkpoint conditions, the target check removed, or the post-round validation removed. Each mutant is run against the same scenario as the regression test it targets, and must change the outcome; a surviving mutant fails the suite. The structure checks are also re-applied to mutated copies and must detect them.
+
 Finally, the complete output is scanned for every canary value, raw etcd record, hash-mismatch node name and protected path.
 
-Static tests do not show K3s behavior. Everything in [Rehearsal questions](#rehearsal-questions) remains to be shown.
+Static tests do not show K3s behavior. Everything in [Rehearsal questions](#rehearsal-questions) remains to be shown, apart from the partial observations in the [k3d rehearsal record](#k3d-rehearsal-record-2026-10-23).

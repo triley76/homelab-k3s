@@ -5,6 +5,7 @@
 - name: Evaluate the common health gate
   vars:
     se_servers: "{{ groups['servers'] }}"
+    se_round: "{{ secrets_encryption_enable_round }}"
     se_node_lines: "{{ secrets_encryption_nodes_probe.stdout_lines | default([]) if secrets_encryption_nodes_probe.rc | default(1) == 0 else [] }}"
     se_node_names: "{{ se_node_lines | map('regex_replace', '\\|.*$', '') | list }}"
     se_etcd_nodes: >-
@@ -38,10 +39,15 @@
       {%- endif -%}
       {%- if not s.readyz_ok | bool -%}{%- set ns.out = ns.out + [name ~ ': local /readyz not ok'] -%}{%- endif -%}
       {%- if not s.etcd_ready | bool -%}{%- set ns.out = ns.out + [name ~ ': local /readyz/etcd not ok'] -%}{%- endif -%}
+      {#- Status fails closed. The only exception: the observed unavailable result during the enable restart round (summarize.yml), which proves nothing and is never parsed -#}
       {%- if not s.status.parsed | bool -%}
+      {%- if not (se_round.tolerate_unavailable_status | bool and s.status.unavailable | default(false) | bool) -%}
       {%- set ns.out = ns.out + [name ~ ': secrets-encrypt status not parsed (' ~ (s.status.problems | join(',')) ~ ')'] -%}
+      {%- endif -%}
       {%- elif s.status.stage not in secrets_encryption_settled_stages and s.status.encryption != 'disabled-no-config' -%}
       {%- set ns.out = ns.out + [name ~ ': rotation stage ' ~ s.status.stage ~ ' is not settled'] -%}
+      {%- elif se_round.tolerate_unavailable_status | bool and s.status.encryption == 'enabled' -%}
+      {%- set ns.out = ns.out + [name ~ ': encryption Enabled during the enable restart round'] -%}
       {%- endif -%}
       {%- if secrets_encryption_require_chrony | bool -%}
       {%- if not s.chrony_synchronized | bool -%}{%- set ns.out = ns.out + [name ~ ': Chrony not synchronized or unreadable'] -%}
@@ -149,8 +155,9 @@
       encryption: >-
         {{ dict(groups['servers'] | zip(groups['servers'] | map('extract', secrets_encryption_servers) | map(attribute='status')
         | map('dict2items') | map('selectattr', 'key', 'in',
-        ['parsed', 'problems', 'encryption', 'stage', 'hashes_match', 'key_count', 'active_key_type', 'active_key_name'])
+        ['parsed', 'problems', 'unavailable', 'encryption', 'stage', 'hashes_match', 'key_count', 'active_key_type', 'active_key_name'])
         | map('items2dict') | list)) }}
+      enable_restart_round: "{{ secrets_encryption_enable_round }}"
       stage3_snapshots_first_server: >-
         {{ secrets_encryption_storage[groups['servers'][0]].stage3_snapshots | map(attribute='path') | map('basename') | list }}
       protected_artifacts_checked: >-

@@ -21,8 +21,15 @@ Contacts no cluster node, Kubernetes API, etcd or AWS, and downloads nothing.
    servers; the etcdctl installer's extracted-binary checks and cleanup; the
    raw verification pipeline with a stub etcdctl; and the canary lifecycle with
    a stub k3s, including cleanup after success, failure and interruption.
+   Also the corrected step 1 and the enable restart round (k3d rehearsal,
+   2026-10-23): the exact enable result before the marker and no status read
+   afterwards, the round's order, ledger and checkpoint conditions, and the
+   post-round Disabled/start/matching-hashes validation, with a stub k3s.
    Every expected failure names the task that must fail.
-6. A scan of the complete ansible-playbook output for every sentinel: canary
+6. Mutation tests: structure predicates re-applied to mutated copies, and
+   role scenarios re-run against mutated copies of the task files with the
+   expected outcome inverted. A surviving mutant fails the suite.
+7. A scan of the complete ansible-playbook output for every sentinel: canary
    values, raw etcd values, node names from a hash-mismatch status, and
    protected artifact paths.
 
@@ -36,6 +43,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -88,12 +96,12 @@ def module_of(t):
     return keys[0] if keys else ("block" if "block" in t else None)
 
 
-def absolutize(tasks):
-    """Point include_tasks at the role's own files, wherever the test play lives."""
+def absolutize(tasks, base=None):
+    """Point include_tasks at the role's own files (or a mutant copy), wherever the test play lives."""
     for t in walk(tasks):
         inc = t.get("ansible.builtin.include_tasks")
         if inc and not inc.startswith("/"):
-            t["ansible.builtin.include_tasks"] = str(role / "tasks" / inc)
+            t["ansible.builtin.include_tasks"] = str((base or role / "tasks") / inc)
     return tasks
 
 
@@ -107,15 +115,16 @@ def unroot(tasks):
     return tasks
 
 
-def pick(file, name, tasks=None):
-    t = next(t for t in walk(tasks if tasks is not None else task_files[file]) if t.get("name") == name)
+def pick(file, name, tasks=None, base=None):
+    source = tasks if tasks is not None else (task_files[file] if base is None else load(base / f"{file}.yml"))
+    t = next(t for t in walk(source) if t.get("name") == name)
     t = copy.deepcopy(t)
     t.pop("run_once", None)
-    return absolutize([t])[0]
+    return absolutize([t], base)[0]
 
 
-def picks(file, *names):
-    return [pick(file, n) for n in names]
+def picks(file, *names, base=None):
+    return [pick(file, n, base=base) for n in names]
 
 
 # ====================================================================== structure
@@ -276,7 +285,7 @@ for f, a in argvs:
     if a[:2] == [k3s, "secrets-encrypt"]:
         se_sub.setdefault(" ".join(a[2:]), set()).add(f)
 require("role: secrets-encrypt subcommands only where documented",
-        se_sub == {"status": {"gather", "enable", "rotate", "reencrypt"}, "enable": {"enable"}, "rotate-keys": {"rotate"},
+        se_sub == {"status": {"gather", "restart", "rotate", "reencrypt"}, "enable": {"enable"}, "rotate-keys": {"rotate"},
                    "disable": {"disable"}, "reencrypt --force --skip": {"reencrypt"}})
 require("role: etcd-snapshot only as 'save --name', only in snapshot.yml",
         [(f, a[2:4]) for f, a in argvs if a[:2] == [k3s, "etcd-snapshot"]] == [("snapshot", ["save", "--name"])])
@@ -390,18 +399,19 @@ def needs_no_log(t):
 
 require("no_log: every status read, canary value, readback and raw etcd query hides its output",
         len([1 for _, t in all_role_tasks if needs_no_log(t)]) >= 10 and all(t.get("no_log") is True for _, t in all_role_tasks if needs_no_log(t)))
-RAW_REGISTERS = ["secrets_encryption_status_probe", "secrets_encryption_after_enable", "secrets_encryption_rotate_wait",
+RAW_REGISTERS = ["secrets_encryption_status_probe", "secrets_encryption_round_status", "secrets_encryption_rotate_wait",
                  "secrets_encryption_reencrypt_wait", "secrets_encryption_raw_probe", "secrets_encryption_readback_probe",
                  "secrets_encryption_status_input", "secrets_encryption_protected_probe"]
 shown = [(f, t.get("name")) for f, t in all_role_tasks
          if module_of(t) in ("ansible.builtin.debug", "ansible.builtin.assert", "ansible.builtin.fail")
          and any(r in json.dumps({k: v for k, v in t.items() if k != "name"}) for r in RAW_REGISTERS)]
 require("no raw status, raw record, readback result or protected path is ever shown in a message", shown == [])
-require("parse_status.yml: the parsed fact keeps no raw line, hash text or node name",
-        not re.search(r"se_hash_value\s*}}|se_lines\s*}}|stdout", json.dumps(next(
+require("parse_status.yml: the parsed fact keeps no raw line, error text, hash text or node name",
+        not re.search(r"se_hash_value\s*}}|se_lines\s*}}|se_err_lines\s*}}|stdout|stderr", json.dumps(next(
             t for t in task_files["parse_status"] if t["name"] == "Parse the secrets-encryption status")["ansible.builtin.set_fact"])))
 require("evaluate.yml: the report keeps allowlisted status fields, snapshot basenames and protected-artifact counts only",
-        "['parsed', 'problems', 'encryption', 'stage', 'hashes_match', 'key_count', 'active_key_type', 'active_key_name']" in task_text["evaluate"]
+        "['parsed', 'problems', 'unavailable', 'encryption', 'stage', 'hashes_match', 'key_count', 'active_key_type', 'active_key_name']"
+        in task_text["evaluate"]
         and "map(attribute='protected') | map('length')" in task_text["evaluate"] and "map('basename')" in task_text["evaluate"])
 require("checks.yml: protected artifacts are reported by number, never by path",
         "protected artifact #' ~ loop.index" in task_text["checks"] and "~ p ~" not in task_text["checks"].replace(" ", " "))
@@ -421,11 +431,14 @@ require("rotate.yml: purpose, preconditions, rotate, wait, verify, record the ch
 require("rotate.yml: an additional rotation needs a reason and an approval naming this confirmation",
         "secrets_encryption_additional_rotation_reason" in task_text["rotate"]
         and "'additional-rotation:' ~ secrets_encryption_confirm_id" in task_text["rotate"])
-require("restart.yml: preconditions, order, drop-in, decision, restart, waits, post-gate, then the verified record",
-        order_ok("restart", ["Enforce the restart preconditions", "Enforce the restart order", "Apply the requested drop-in state",
-                             "Record the drop-in change", "Decide the restart", "Restart K3s on the target server",
-                             "Require the restarted server to be ready", "Gather the cluster state after the restart",
-                             "Require a healthy cluster and no unplanned restarts", "Record the passed post-restart gate"]))
+require("restart.yml: preconditions, order, enable round, drop-in, decision, restart, waits, post-gate, round validation, then the verified record",
+        order_ok("restart", ["Enforce the restart preconditions", "Enforce the restart order", "Enforce the enable restart round",
+                             "Apply the requested drop-in state", "Record the drop-in change", "Decide the restart",
+                             "Restart K3s on the target server", "Require the restarted server to be ready",
+                             "Gather the cluster state after the restart", "Require a healthy cluster and no unplanned restarts",
+                             "Wait for a readable status on every server after the enable restart round",
+                             "Require Disabled, start and matching hashes on every server after the enable restart round",
+                             "Record the passed post-restart gate"]))
 require("disable.yml and reencrypt.yml: preconditions before the command; marked not yet rehearsal-approved",
         order_ok("disable", ["Enforce the disable preconditions", "Run secrets-encrypt disable on the first server", "Record the disable change"])
         and order_ok("reencrypt", ["Enforce the rollback re-encryption preconditions",
@@ -461,6 +474,222 @@ require("k3s-server: the role never removes the drop-in and never restarts K3s",
         not any(t.get("vars", {}).get("secrets_encryption_dropin_state") == "absent" or "ansible.builtin.systemd_service" in t
                 for t in k3s_server_tasks))
 require("site.yml: Stage 3 is not activated", "secrets-encryption" not in site_text and "secrets_encryption" not in site_text)
+
+# The corrected step 1 and the enable restart round (k3d rehearsal, 2026-10-23:
+# status is unavailable between enable and the first restart round). Each
+# predicate is applied to the real files here and to mutated copies below.
+ENABLE_BLOCK = "Enable secrets encryption with an identity configuration"
+ROUND_CHECK = "Validate the status after the enable restart round"
+ROUND_ENFORCE = "Enforce the enable restart round"
+ROUND_INNER = ["Wait for a readable status on every server after the enable restart round",
+               "Reset the status parsed after the enable restart round", "Parse the status after the enable restart round",
+               "Require Disabled, start and matching hashes on every server after the enable restart round"]
+
+
+def status_reads(tasks):
+    return [t.get("name") for t in walk(tasks)
+            if t.get("ansible.builtin.command", {}).get("argv", [None])[1:3] == ["secrets-encrypt", "status"]
+            or "parse_status.yml" in str(t.get("ansible.builtin.include_tasks", ""))]
+
+
+def enable_reads_no_status(tasks):
+    return status_reads(tasks) == [] and "secrets_encryption_parsed" not in json.dumps(tasks)
+
+
+def enable_result_exact(tasks):
+    block = next((t for t in walk(tasks) if t.get("name") == ENABLE_BLOCK), {}).get("block", [])
+    if [t.get("name") for t in block][:4] != ["Run secrets-encrypt enable on the first server", "Require the documented enable result",
+                                               "Read the time after enable", "Record the enable change"]:
+        return False
+    run, req, _, rec = block[:4]
+    that = req.get("ansible.builtin.assert", {}).get("that", [])
+    marker_writes = [t for t in walk(tasks) if "/last-change" in str(t.get("ansible.builtin.copy", {}).get("dest", ""))]
+    return (run.get("failed_when") is False and "secrets_encryption_enable_result.rc == 0" in that
+            and "secrets_encryption_enable_result.stdout_lines | default([]) == ['secrets-encryption enabled']" in that
+            and marker_writes == [rec] and rec["ansible.builtin.copy"]["content"].endswith(" enable\n"))
+
+
+def restart_validates_round(tasks):
+    names = [t.get("name") for t in tasks]
+    if ROUND_CHECK not in names or "Read the time of the passed post-restart gate" not in names:
+        return False
+    v = tasks[names.index(ROUND_CHECK)]
+    inner = v.get("block", [])
+    req = json.dumps(inner[-1]) if inner else ""
+    return (names.index("Require a healthy cluster and no unplanned restarts") < names.index(ROUND_CHECK)
+            < names.index("Read the time of the passed post-restart gate") < names.index("Record the passed post-restart gate")
+            and v.get("when") == ["secrets_encryption_marker.phase == 'enable'", "secrets_encryption_flag_state == 'present'",
+                                  "inventory_hostname == groups['servers'][-1]"]
+            and [t.get("name") for t in inner] == ROUND_INNER and inner[0].get("no_log") is True
+            and all(s in req for s in ("p.parsed | default(false) | bool", "p.encryption | default('') == 'disabled'",
+                                       "p.stage | default('') == 'start'", "p.hashes_match | default(false) | bool", "se_not_ready == ''")))
+
+
+def restart_enforces_round(tasks):
+    names = [t.get("name") for t in tasks]
+    if ROUND_ENFORCE not in names:
+        return False
+    t = tasks[names.index(ROUND_ENFORCE)]
+    return (names.index("Enforce the restart order") < names.index(ROUND_ENFORCE) < names.index("Apply the requested drop-in state")
+            and t["ansible.builtin.assert"]["that"] == ["se_round.ledger_ok | bool", "se_round.checkpoint_ok | bool", "se_round.out_of_order == ''",
+                                                        "not (se_round.complete | bool)", "inventory_hostname == se_round.next"]
+            and t.get("when") == ["secrets_encryption_marker.phase == 'enable'", "secrets_encryption_flag_state == 'present'"])
+
+
+def tolerance_scoped(evaluate_text, restart_text, summarize_text):
+    ev = [line for line in evaluate_text.splitlines() if "status.unavailable" in line]
+    rs = [line for line in restart_text.splitlines() if "st.unavailable" in line]
+    return (len(ev) == 1 and "not (se_round.tolerate_unavailable_status | bool and s.status.unavailable" in ev[0]
+            and 'se_round: "{{ secrets_encryption_enable_round }}"' in evaluate_text
+            and len(rs) == 1 and "se_tolerate | bool and (st.unavailable" in rs[0]
+            and 'se_tolerate: "{{ secrets_encryption_enable_round.tolerate_unavailable_status | bool }}"' in restart_text
+            and all(s in summarize_text for s in (
+                "se_active | bool and not se_complete | bool and se_out_of_order == ''",
+                "and se_ledger_ok | bool and se_checkpoint_ok | bool",
+                "and (secrets_encryption_phase | default('')) == 'restart'",
+                "and secrets_encryption_flag_state == 'present' }}",
+                'se_complete: "{{ se_prefix | int == se_servers | length }}"')))
+
+
+def no_status_option(defaults, vars_, guard_tasks):
+    pattern = re.compile(r"ignore|tolerat|unavailable|skip|allow_unparsed|status_optional|lenient")
+    gathered = vars_.get("secrets_encryption_gathered_facts", [])
+    refuse = next((t for t in guard_tasks if t.get("name") == "Refuse injected gathered state"), {})
+    return (not any(pattern.search(k) for k in list(defaults) + list(vars_))
+            and {"secrets_encryption_enable_round", "secrets_encryption_servers", "secrets_encryption_status_by_server",
+                 "secrets_encryption_marker", "secrets_encryption_ledger_events", "secrets_encryption_storage"} <= set(gathered)
+            and refuse.get("loop") == "{{ secrets_encryption_gathered_facts }}"
+            and refuse.get("ansible.builtin.assert", {}).get("that")
+            == ["lookup('ansible.builtin.vars', item, default='__not-defined__') == '__not-defined__'"])
+
+
+def unavailable_is_narrow(parse_text):
+    return ('level=fatal msg="Error: see server log for details: Internal error occurred: secret-encrypt error ID [0-9]{1,8}"$' in parse_text
+            and "se_rc | int not in [0, -1] and se_lines | length == 0" in parse_text
+            and "and se_err_lines | select('search', se_unavailable_re) | list | length == 1" in parse_text
+            and "and se_err_lines | select('search', 'level=fatal') | list | length == 1" in parse_text
+            and "parsed: \"{{ se_problems | length == 0 }}\"" in parse_text)
+
+
+require("enable.yml: no secrets-encrypt status is read after enable (status is unavailable before the first restart round)",
+        enable_reads_no_status(task_files["enable"]))
+require("enable.yml: the exact result (exit 0, exactly 'secrets-encryption enabled') is checked before the only marker write",
+        enable_result_exact(task_files["enable"]))
+require("restart.yml: the last server's run requires Disabled/start/matching hashes on every server before the verified record",
+        restart_validates_round(task_files["restart"]))
+require("restart.yml: the enable round requires ledger, checkpoint, no out-of-order evidence, an incomplete round and the next server",
+        restart_enforces_round(task_files["restart"]))
+require("evaluate.yml, restart.yml, summarize.yml: an unavailable status is tolerated only inside the computed enable restart round",
+        tolerance_scoped(task_text["evaluate"], task_text["restart"], task_text["summarize"]))
+require("role: no variable relaxes status handling, and the guard refuses injected gathered state",
+        no_status_option(role_defaults, role_vars, task_files["guard"]))
+require("parse_status.yml: 'unavailable' is only the observed failure, and never makes a result parsed",
+        unavailable_is_narrow(task_text["parse_status"]))
+require("role: 'unavailable' appears only in parse_status, summarize, evaluate and restart",
+        sorted(f for f, text in task_text.items() if "unavailable" in text) == ["evaluate", "parse_status", "restart", "summarize"])
+require("rotate.yml: the enabling rotation still requires every server Disabled at start, verified, with the drop-in and matching hashes",
+        all(s in task_text["rotate"] for s in ("se_encryptions == ['disabled'] and se_stages == ['start']",
+                                                "selectattr('checkpoint_reached', 'equalto', false)", "selectattr('dropin_present', 'equalto', false)",
+                                                "selectattr('hashes_match', 'equalto', false)")))
+
+# Structural mutations: each reintroduces a defect and must be detected.
+OLD_POST_ENABLE = [
+    {"name": "Read the first server's status after enable",
+     "ansible.builtin.command": {"argv": ["{{ secrets_encryption_k3s_bin }}", "secrets-encrypt", "status"]},
+     "register": "secrets_encryption_after_enable", "changed_when": False, "failed_when": False, "no_log": True},
+    {"name": "Parse the status after enable", "ansible.builtin.include_tasks": "parse_status.yml",
+     "vars": {"secrets_encryption_status_input": "{{ secrets_encryption_after_enable }}"}},
+    {"name": "Require an identity configuration without encryption",
+     "ansible.builtin.assert": {"that": ["secrets_encryption_parsed.parsed | bool", "secrets_encryption_parsed.encryption == 'disabled'"],
+                                "quiet": True}}]
+
+
+def mutate(tasks, fn):
+    out = copy.deepcopy(tasks)
+    fn(out)
+    return out
+
+
+def enable_block_of(tasks):
+    return next(t for t in walk(tasks) if t.get("name") == ENABLE_BLOCK)["block"]
+
+
+def insert_old_status(tasks):
+    b = enable_block_of(tasks)
+    i = [t["name"] for t in b].index("Show the next step after enable")
+    b[i:i] = copy.deepcopy(OLD_POST_ENABLE)
+
+
+def drop_that(task_name, item):
+    def fn(tasks):
+        t = next(t for t in walk(tasks) if t.get("name") == task_name)
+        t["ansible.builtin.assert"]["that"].remove(item)
+    return fn
+
+
+def marker_first(tasks):
+    b = enable_block_of(tasks)
+    b.insert(1, b.pop(3))
+
+
+def remove_named(name):
+    def fn(tasks):
+        tasks[:] = [t for t in tasks if t.get("name") != name]
+    return fn
+
+
+def validation_after_record(tasks):
+    names = [t.get("name") for t in tasks]
+    v = tasks.pop(names.index(ROUND_CHECK))
+    tasks.append(v)
+
+
+def validation_everywhere(tasks):
+    next(t for t in tasks if t.get("name") == ROUND_CHECK)["when"] = ["secrets_encryption_marker.phase == 'enable'"]
+
+
+def validation_ignores_hashes(tasks):
+    req = next(t for t in tasks if t.get("name") == ROUND_CHECK)["block"][-1]
+    req["vars"]["se_not_ready"] = req["vars"]["se_not_ready"].replace(" and p.hashes_match | default(false) | bool", "")
+
+
+EV, RS, SM = task_text["evaluate"], task_text["restart"], task_text["summarize"]
+structural_mutants = [
+    ("the old post-enable status assertion", lambda: enable_reads_no_status(mutate(task_files["enable"], insert_old_status))),
+    ("the enable result checked by exit status only", lambda: enable_result_exact(mutate(task_files["enable"], drop_that(
+        "Require the documented enable result", "secrets_encryption_enable_result.stdout_lines | default([]) == ['secrets-encryption enabled']")))),
+    ("the enable result checked by output only", lambda: enable_result_exact(mutate(task_files["enable"], drop_that(
+        "Require the documented enable result", "secrets_encryption_enable_result.rc == 0")))),
+    ("the enable marker written before the result check", lambda: enable_result_exact(mutate(task_files["enable"], marker_first))),
+    ("the post-round validation removed", lambda: restart_validates_round(mutate(task_files["restart"], remove_named(ROUND_CHECK)))),
+    ("the post-round validation after the verified record", lambda: restart_validates_round(mutate(task_files["restart"], validation_after_record))),
+    ("the post-round validation on every server's run", lambda: restart_validates_round(mutate(task_files["restart"], validation_everywhere))),
+    ("the post-round validation ignoring hashes", lambda: restart_validates_round(mutate(task_files["restart"], validation_ignores_hashes))),
+    ("the round enforcement removed", lambda: restart_enforces_round(mutate(task_files["restart"], remove_named(ROUND_ENFORCE)))),
+    ("the round without the next-server check", lambda: restart_enforces_round(mutate(task_files["restart"], drop_that(
+        ROUND_ENFORCE, "inventory_hostname == se_round.next")))),
+    ("the round without the out-of-order check", lambda: restart_enforces_round(mutate(task_files["restart"], drop_that(
+        ROUND_ENFORCE, "se_round.out_of_order == ''")))),
+    ("the tolerance without the round in evaluate.yml", lambda: tolerance_scoped(
+        EV.replace("se_round.tolerate_unavailable_status | bool and s.status.unavailable", "s.status.unavailable"), RS, SM)),
+    ("the tolerance without the round in restart.yml", lambda: tolerance_scoped(EV, RS.replace("se_tolerate | bool and (st.unavailable", "(st.unavailable"), SM)),
+    ("the round tolerating out-of-order evidence", lambda: tolerance_scoped(EV, RS, SM.replace(
+        "not se_complete | bool and se_out_of_order == ''", "not se_complete | bool"))),
+    ("the round without ledger and checkpoint", lambda: tolerance_scoped(EV, RS, SM.replace("and se_ledger_ok | bool and se_checkpoint_ok | bool", ""))),
+    ("the round in any phase", lambda: tolerance_scoped(EV, RS, SM.replace("and (secrets_encryption_phase | default('')) == 'restart'", ""))),
+    ("a status-ignore default", lambda: no_status_option(dict(role_defaults, secrets_encryption_ignore_status_errors=False), role_vars,
+                                                         task_files["guard"])),
+    ("the round no longer refused as an injected fact", lambda: no_status_option(role_defaults, dict(role_vars, secrets_encryption_gathered_facts=[
+        f for f in role_vars["secrets_encryption_gathered_facts"] if f != "secrets_encryption_enable_round"]), task_files["guard"])),
+    ("the injection guard removed", lambda: no_status_option(role_defaults, role_vars, mutate(task_files["guard"],
+                                                                                              remove_named("Refuse injected gathered state")))),
+    ("any status failure marked unavailable", lambda: unavailable_is_narrow(task_text["parse_status"].replace(
+        "and se_err_lines | select('search', se_unavailable_re) | list | length == 1", ""))),
+    ("an unavailable status counted as parsed", lambda: unavailable_is_narrow(task_text["parse_status"].replace(
+        "parsed: \"{{ se_problems | length == 0 }}\"", "parsed: \"{{ se_problems | length == 0 or se_rc | int != 0 }}\""))),
+]
+for label, check in structural_mutants:
+    require(f"mutation (structure): {label} is detected", check() is False)
 
 if structure_failures:
     print(f"structure checks failed: {structure_failures}", flush=True)
@@ -547,8 +776,8 @@ SERVERS = ["k3s01", "k3s02", "k3s03"]
 UID = os.getuid()
 
 
-def play(name, mocks, tasks, expect_fail, checks=(), extra_vars=None, host="k3s01", setup=()):
-    """expect_fail is False, or the name of the task that must fail."""
+def play(name, mocks, tasks, expect_fail, checks=(), extra_vars=None, host="k3s01", setup=(), invert=False):
+    """expect_fail is False, or the name of the task that must fail. invert: the expected outcome must NOT occur (a killed mutant)."""
     pre = [{"name": f"mock {k}", "ansible.builtin.set_fact": {k: v}} for k, v in mocks.items()]
     body = [{"name": "reset outcome", "ansible.builtin.set_fact": {"harness_failed": False, "harness_failed_task": ""}},
             {"block": copy.deepcopy(tasks), "rescue": [{"name": "record failure", "ansible.builtin.set_fact": {
@@ -556,7 +785,10 @@ def play(name, mocks, tasks, expect_fail, checks=(), extra_vars=None, host="k3s0
     expect = [f"harness_failed | bool == {bool(expect_fail)}"]
     if expect_fail:
         expect.append(f"harness_failed_task == {json.dumps(expect_fail)}")
-    post = [{"name": f"check: {name}", "ansible.builtin.assert": {"that": expect + list(checks), "quiet": True}}]
+    that = expect + list(checks)
+    if invert:
+        that = ["not (" + " and ".join(f"({c})" for c in that) + ")"]
+    post = [{"name": f"check: {name}", "ansible.builtin.assert": {"that": that, "quiet": True}}]
     vars_ = dict(role_defaults)
     vars_.update(role_vars)
     vars_.update({"secrets_encryption_environment": "live"})
@@ -624,7 +856,33 @@ for label, lines, rc, problem in parse_bad:
     plays.append(play(f"parse fails closed: {label}", status(lines, rc), parse, False,
                       [f"not ({P}.parsed | bool)", f"'{problem}' in {P}.problems"]))
 plays.append(play("parse fails closed: missing result", {"secrets_encryption_status_input": {}}, parse, False,
-                  [f"not ({P}.parsed | bool)", f"'status-command-failed' in {P}.problems"]))
+                  [f"not ({P}.parsed | bool)", f"'status-command-failed' in {P}.problems", f"not ({P}.unavailable | bool)"]))
+
+# The result observed between enable and the first restart round (k3d, 2026-10-23).
+CA_WARNING = ('time="2026-10-23T16:09:01Z" level=warning msg="Cluster CA certificate is not trusted by the host CA bundle, '
+              'but the token does not include a CA hash."')
+FATAL_INTERNAL = 'time="2026-10-23T16:09:01Z" level=fatal msg="Error: see server log for details: Internal error occurred: secret-encrypt error ID 00459"'
+
+
+def unavailable(rc=1, err=(CA_WARNING, FATAL_INTERNAL), out=()):
+    return {"rc": rc, "stdout_lines": list(out), "stderr_lines": list(err)}
+
+
+plays.append(play("parse: the observed post-enable failure is unparsed and marked unavailable",
+                  {"secrets_encryption_status_input": unavailable()}, parse, False,
+                  [f"not ({P}.parsed | bool)", f"{P}.unavailable | bool", f"'status-command-failed' in {P}.problems",
+                   f"{P}.encryption == 'unknown'", f"{P} | to_json is not search('00459|CA hash')"]))
+for label, result in (
+        ("another server error", unavailable(err=['level=fatal msg="Error: Get \\"https://127.0.0.1:6443\\": connection refused"'])),
+        ("exit status 0 with no output", unavailable(rc=0)),
+        ("standard output present", unavailable(out=["Encryption Status: Disabled"])),
+        ("no error output", unavailable(err=())),
+        ("two fatal lines", unavailable(err=(FATAL_INTERNAL, FATAL_INTERNAL))),
+        ("a non-numeric error ID", unavailable(err=(FATAL_INTERNAL.replace("00459", "x"),))),
+        ("text after the error", unavailable(err=(FATAL_INTERNAL + " retry",))),
+        ("missing exit status", {"stdout_lines": [], "stderr_lines": [FATAL_INTERNAL]})):
+    plays.append(play(f"parse: not unavailable with {label}", {"secrets_encryption_status_input": result}, parse, False,
+                      [f"not ({P}.parsed | bool)", f"not ({P}.unavailable | bool)"]))
 
 # ---------------------------------------------------------------- gather summary and health gate
 NOW = 100000
@@ -654,7 +912,8 @@ def statefiles(overrides=None):
 
 def probes(svc=None, ver=None, readyz=None, etcd=None, chrony=None, swap=None, dropin=None, change=None, verified=None,
            statedir=None, sfiles=None, status_lines=None, nodes=None, etcd_nodes=None, flux=None, flux_rc=0, helm=None, helm_rc=0,
-           deploy=None, sts=None, ds=None, df=None, snaps=None, dbs=None, baseline=None, marker=None, ledger=None, protected=None):
+           deploy=None, sts=None, ds=None, df=None, snaps=None, dbs=None, baseline=None, marker=None, ledger=None, protected=None,
+           status_results=None):
     six = ["flux-system/flux-system", "flux-system/infrastructure-controllers", "flux-system/infrastructure-configs",
            "flux-system/monitoring", "flux-system/monitoring-configs", "flux-system/apps"]
     return {
@@ -669,7 +928,7 @@ def probes(svc=None, ver=None, readyz=None, etcd=None, chrony=None, swap=None, d
         "secrets_encryption_verified_probe": results(verified or [absent()] * 3),
         "secrets_encryption_statedir_probe": results(statedir or [{"stat": {"exists": False}}] * 3),
         "secrets_encryption_statefile_probe": sfiles or statefiles(),
-        "secrets_encryption_status_probe": results([{"rc": 0, "stdout_lines": s} for s in (status_lines or [NOCONF_LINES] * 3)]),
+        "secrets_encryption_status_probe": results(status_results or [{"rc": 0, "stdout_lines": s} for s in (status_lines or [NOCONF_LINES] * 3)]),
         "secrets_encryption_nodes_probe": {"rc": 0, "stdout_lines": nodes if nodes is not None else [f"{h}|True|False|False|False" for h in SERVERS]},
         "secrets_encryption_etcd_nodes_probe": {"rc": 0, "stdout_lines": etcd_nodes if etcd_nodes is not None else [f"node/{h}" for h in SERVERS]},
         "secrets_encryption_flux_probe": {"rc": flux_rc, "stdout_lines": flux if flux is not None else [f"{k}=True" for k in six]},
@@ -787,6 +1046,71 @@ health("snapshot directory unreadable", probes(snaps=[{"failed": True, "msg": "p
 health("malformed state marker", probes(marker="soon enable"), "state marker malformed")
 health("rehearsal without Flux, Helm or monitoring passes", probes(flux=[], flux_rc=1, helm=[], helm_rc=1, deploy=[], sts=[], ds=[]),
        extra_vars=REHEARSAL_GATE)
+
+# ---------------------------------------------------------------- the enable restart round (gathered state)
+# Marker at 40000 (enable); a pre-enable Stage 3 snapshot at 39000 on k3s01;
+# servers that have not restarted since enable started at 30000.
+LEDGER_OK = "20261023T160800Z snapshot k3s01\n20261023T160830Z enable k3s01\n"
+PRE_SNAP = [{"files": [{"path": "/s/stage3-p0-pre-enable-20261023t160817z-k3s01-1", "mtime": 39000, "size": 10},
+                       {"path": "/s/etcd-snapshot-x-1", "mtime": 1, "size": 1}]}] + [{"files": [{"path": "/s/etcd-snapshot-x-1", "mtime": 1, "size": 1}]}] * 2
+UNAV3 = [unavailable()] * 3
+NOT_PARSED = "secrets-encrypt status not parsed"
+
+
+def round_probes(started=(30000, 30000, 30000), verified=(None, None, None), dropin=(False, False, False), status=None,
+                 ledger=LEDGER_OK, snaps=None, marker="40000 enable", change=None):
+    return probes(svc=[{"rc": 0, "stdout": f"NRestarts=0\nActiveState=active\nActiveEnterTimestamp=@{s}"} for s in started],
+                  verified=[{"content": b64(str(v))} if v else absent() for v in verified],
+                  dropin=[{"stat": {"exists": d, "isreg": d, "islnk": False}} for d in dropin],
+                  change=change, status_results=status or UNAV3, ledger=ledger, snaps=snaps or PRE_SNAP, marker=marker)
+
+
+RESTART = {"secrets_encryption_phase": "restart"}
+ROUND = "secrets_encryption_enable_round"
+health("enable round: an unavailable status on every server is tolerated before k3s01 restarts", round_probes(), extra_vars=RESTART,
+       checks=[f"{ROUND}.tolerate_unavailable_status | bool", f"{ROUND}.next == 'k3s01'", f"not ({ROUND}.complete | bool)",
+               f"{ROUND}.out_of_order == ''", "secrets_encryption_servers.k3s02.status.unavailable | bool",
+               "secrets_encryption_report.encryption.k3s01.unavailable | bool"])
+health("enable round: tolerated for k3s02 after k3s01 passed", round_probes(started=(50000, 30000, 30000), verified=(55000, None, None),
+       dropin=(True, False, False), change=[{"content": b64("45000")}, absent(), absent()]), extra_vars=RESTART,
+       checks=[f"{ROUND}.next == 'k3s02'", f"{ROUND}.verified | int == 1", f"{ROUND}.tolerate_unavailable_status | bool"])
+health("enable round: tolerated for k3s03's own restart before it is verified",
+       round_probes(started=(50000, 50000, 50000), verified=(55000, 55000, None), dropin=(True, True, True)), extra_vars=RESTART,
+       checks=[f"{ROUND}.next == 'k3s03'", f"{ROUND}.tolerate_unavailable_status | bool"])
+health("enable round: a readable Disabled status is accepted during the round",
+       round_probes(status=[{"rc": 0, "stdout_lines": IDENTITY}] + [unavailable()] * 2), extra_vars=RESTART)
+health("enable round: a readable Enabled status during the round fails",
+       round_probes(status=[{"rc": 0, "stdout_lines": ENABLED}] + [unavailable()] * 2), "encryption Enabled during the enable restart round",
+       extra_vars=RESTART)
+for label, mocks, extra, checks in (
+        ("in the snapshot phase (checkpoint p1)", round_probes(), {"secrets_encryption_phase": "snapshot"}, []),
+        ("in the rotate-keys phase", round_probes(), {"secrets_encryption_phase": "rotate-keys"}, []),
+        ("in the read-only validation (no phase)", round_probes(), {}, []),
+        ("with the drop-in removal requested", round_probes(), dict(RESTART, secrets_encryption_flag_state="absent"), []),
+        ("without an enable marker", round_probes(marker=None), RESTART, [f"not ({ROUND}.active | bool)"]),
+        ("after a later recorded change (rotate-keys marker)", round_probes(marker="40000 rotate-keys"), RESTART, []),
+        ("when the ledger lacks enable", round_probes(ledger="20261023T160800Z snapshot k3s01\n"), RESTART, [f"not ({ROUND}.ledger_ok | bool)"]),
+        ("when the ledger has no snapshot before enable", round_probes(ledger="20261023T160830Z enable k3s01\n20261023T160900Z snapshot k3s01\n"),
+         RESTART, [f"not ({ROUND}.ledger_ok | bool)"]),
+        ("when the marker is stale (ledger records rotate-keys)", round_probes(ledger=LEDGER_OK + "20261023T170000Z rotate-keys k3s01\n"), RESTART,
+         [f"not ({ROUND}.ledger_ok | bool)"]),
+        ("when the marker is stale (ledger records disable)", round_probes(ledger=LEDGER_OK + "20261023T170000Z disable k3s01\n"), RESTART,
+         [f"not ({ROUND}.ledger_ok | bool)"]),
+        ("with a malformed ledger line", round_probes(ledger=LEDGER_OK + "garbage\n"), RESTART, [f"not ({ROUND}.ledger_ok | bool)"]),
+        ("without a snapshot older than enable", round_probes(snaps=[{"files": [{"path": "/s/stage3-p1-late-k3s01-1", "mtime": 45000, "size": 10}]}]
+                                                              + PRE_SNAP[1:]), RESTART, [f"not ({ROUND}.checkpoint_ok | bool)"]),
+        ("when k3s03 restarted before k3s02 (out of order)", round_probes(started=(50000, 30000, 50000), verified=(55000, None, None),
+                                                                          dropin=(True, False, False)), RESTART, [f"{ROUND}.out_of_order == 'k3s03'"]),
+        ("when k3s03 carries a drop-in before k3s01 passed (partial round)", round_probes(dropin=(False, False, True)), RESTART,
+         [f"{ROUND}.out_of_order == 'k3s03'"]),
+        ("when k3s02 recorded a verified restart before k3s01 (skipped node)", round_probes(verified=(None, 45000, None)), RESTART,
+         [f"{ROUND}.out_of_order == 'k3s02'"]),
+        ("after the round completed", round_probes(started=(50000, 50000, 50000), verified=(55000, 55000, 55000), dropin=(True, True, True)),
+         RESTART, [f"{ROUND}.complete | bool", f"{ROUND}.next == ''"]),
+        ("for any other status failure", round_probes(status=[unavailable(err=['level=fatal msg="connection refused"'])] + UNAV3[1:]),
+         RESTART, [f"{ROUND}.tolerate_unavailable_status | bool"])):
+    health(f"enable round: an unavailable status fails {label}", mocks, NOT_PARSED, extra_vars=extra,
+           checks=checks + ([] if label == "for any other status failure" else [f"not ({ROUND}.tolerate_unavailable_status | bool)"]))
 
 # Real stat tasks against a local state directory with a symbolic-link ledger.
 tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="secrets-encryption-test."))
@@ -937,20 +1261,25 @@ for label, files, fail, checks in (
 # ---------------------------------------------------------------- phase decisions
 
 
-def srv(enc="disabled-no-config", stage="none", hashes=True, restarted=True, dropin=False, key_type="none", parsed=True, nrestarts=0, verified=None):
+def srv(enc="disabled-no-config", stage="none", hashes=True, restarted=True, dropin=False, key_type="none", parsed=True, nrestarts=0, verified=None,
+        unavailable=False):
     return {"active": True, "start_epoch": 95000, "nrestarts": nrestarts, "version": "v1.36.4+k3s1", "readyz_ok": True, "etcd_ready": True,
-            "dropin_present": dropin, "dropin_change_epoch": 0, "free_mb": 50000, "restarted_since_change": restarted,
+            "dropin_present": dropin, "dropin_change_epoch": 0, "verified_epoch": 0, "free_mb": 50000, "restarted_since_change": restarted,
             "checkpoint_reached": restarted if verified is None else verified,
-            "status": {"parsed": parsed, "problems": [], "encryption": enc, "stage": stage, "hashes_match": hashes,
+            "status": {"parsed": parsed, "problems": [], "unavailable": unavailable, "encryption": enc, "stage": stage, "hashes_match": hashes,
                        "hash_state": "match" if hashes else "mismatch", "key_count": 1 if key_type != "none" else 0,
                        "active_key_type": key_type, "active_key_name": "none"}}
 
 
-def cl(s1, s2=None, s3=None, phase=None, epoch=90000, confirm_id="20261020T080000Z"):
+def cl(s1, s2=None, s3=None, phase=None, epoch=90000, confirm_id="20261020T080000Z", events=("snapshot k3s01", "enable k3s01"),
+       ledger_malformed=False, pre_enable_snapshot=True):
+    first = storage(stage3=[("stage3-p0-pre-enable-x", 89000)] if pre_enable_snapshot else [("stage3-p1-x", 95000)])
     return {"secrets_encryption_servers": {"k3s01": s1, "k3s02": s2 or s1, "k3s03": s3 or s1},
             "secrets_encryption_marker": {"present": phase is not None, "malformed": False, "epoch": epoch if phase else 0, "phase": phase or "none"},
             "secrets_encryption_report": {"encryption": "mocked"}, "secrets_encryption_now_epoch": NOW,
-            "secrets_encryption_confirm_id": confirm_id}
+            "secrets_encryption_confirm_id": confirm_id, "secrets_encryption_ledger_events": list(events),
+            "secrets_encryption_ledger_malformed": ledger_malformed,
+            "secrets_encryption_storage": {"k3s01": first, "k3s02": storage(), "k3s03": storage()}}
 
 
 NOCONF = srv()
@@ -971,11 +1300,13 @@ plays.append(play("enable: refused with a drop-in already present", cl(srv(dropi
 plays.append(play("enable: refused with an unexplained identity configuration", cl(IDENT_NODROP, NOCONF, NOCONF), enable_dec, EE))
 plays.append(play("enable: refused after a recorded disable", cl(DISAB, phase="disable"), enable_dec, EE))
 
-restart_pre = picks("restart", "Enforce the restart preconditions", "Enforce the restart order")
+round_task = picks("summarize", "Summarize the enable restart round")
+restart_pre = round_task + picks("restart", "Enforce the restart preconditions", "Enforce the restart order", "Enforce the enable restart round")
 RP_ = "Enforce the restart preconditions"
 RO = "Enforce the restart order"
+RE = "Enforce the enable restart round"
 NOT_YET = srv("disabled", "start", restarted=False, verified=False)
-plays.append(play("restart: k3s01 first after enable", cl(IDENT_NODROP, phase="enable"), restart_pre, False))
+plays.append(play("restart: k3s01 first after enable", cl(NOT_YET, phase="enable"), restart_pre, False))
 plays.append(play("restart: refused without a recorded change", cl(NOCONF), restart_pre, RP_))
 for st in ("reencrypt_active", "reencrypt_request", "rotate_keys", "prepare", "rotate"):
     plays.append(play(f"restart: impossible while a server is in stage {st}",
@@ -1003,6 +1334,39 @@ plays.append(play("restart: flag removal refused after disable until the rollbac
                   extra_vars={"secrets_encryption_flag_state": "absent"}))
 plays.append(play("restart: unknown flag state refused", cl(IDENT, phase="enable"), restart_pre, RP_,
                   extra_vars={"secrets_encryption_flag_state": "maybe"}))
+# The enable restart round: status is unavailable until the round completes.
+UNAV = srv("unknown", "none", hashes=False, restarted=False, verified=False, parsed=False, unavailable=True)
+UNAV_DONE = srv("unknown", "none", hashes=False, restarted=True, verified=True, parsed=False, unavailable=True, dropin=True)
+UNAV_RESTARTED = srv("unknown", "none", hashes=False, restarted=True, verified=False, parsed=False, unavailable=True, dropin=True)
+STALE = ("snapshot k3s01", "enable k3s01", "rotate-keys k3s01")
+for label, mocks, host, fail in (
+        ("k3s01 restarts while status is unavailable on every server", cl(UNAV, phase="enable"), "k3s01", False),
+        ("k3s02 restarts after k3s01 passed, status still unavailable", cl(UNAV_DONE, UNAV, UNAV, phase="enable"), "k3s02", False),
+        ("k3s03 restarts after k3s01 and k3s02, status still unavailable", cl(UNAV_DONE, UNAV_DONE, UNAV, phase="enable"), "k3s03", False),
+        ("k3s03 may repeat its own restart that was not yet verified", cl(UNAV_DONE, UNAV_DONE, UNAV_RESTARTED, phase="enable"), "k3s03", False),
+        ("refused without the enable marker", cl(UNAV), "k3s01", RP_),
+        ("unavailable status refused when the ledger lacks enable", cl(UNAV, phase="enable", events=("snapshot k3s01",)), "k3s01", RP_),
+        ("unavailable status refused without a pre-enable checkpoint", cl(UNAV, phase="enable", pre_enable_snapshot=False), "k3s01", RP_),
+        ("unavailable status refused for a stale marker", cl(UNAV, phase="enable", events=STALE), "k3s01", RP_),
+        ("refused without a pre-enable checkpoint (readable status)", cl(NOT_YET, phase="enable", pre_enable_snapshot=False), "k3s01", RE),
+        ("refused when the ledger has no snapshot before enable", cl(NOT_YET, phase="enable", events=("enable k3s01", "snapshot k3s01")), "k3s01", RE),
+        ("refused for a stale marker (readable status)", cl(NOT_YET, phase="enable", events=STALE), "k3s01", RE),
+        ("refused with a malformed ledger", cl(NOT_YET, phase="enable", ledger_malformed=True), "k3s01", RE),
+        ("k3s01 replayed after it passed is refused", cl(IDENT, NOT_YET, NOT_YET, phase="enable"), "k3s01", RE),
+        ("k3s01 replayed after the round completed is refused", cl(IDENT, phase="enable"), "k3s01", RE),
+        ("k3s03 replayed after the round completed is refused", cl(IDENT, phase="enable"), "k3s03", RE),
+        ("k3s01 refused while k3s03 already restarted (out of order)",
+         cl(NOT_YET, NOT_YET, srv("disabled", "start", dropin=True, restarted=True, verified=False), phase="enable"), "k3s01", RE),
+        ("k3s02 refused while k3s03 carries a drop-in (partial round)",
+         cl(IDENT, NOT_YET, srv("disabled", "start", dropin=True, restarted=False, verified=False), phase="enable"), "k3s02", RE),
+        ("k3s02 refused before k3s01 restarted (skipped node)", cl(UNAV, phase="enable"), "k3s02", RO),
+        ("k3s03 refused before k3s02 restarted (skipped node)", cl(UNAV_DONE, UNAV, UNAV, phase="enable"), "k3s03", RO),
+        ("k3s03 refused while k3s02 restarted but is unverified", cl(UNAV_DONE, UNAV_RESTARTED, UNAV, phase="enable"), "k3s03", RO)):
+    plays.append(play(f"enable round: {label}", mocks, restart_pre, fail, host=host, extra_vars=RESTART))
+plays.append(play("enable round: an unavailable status is not tolerated by the restart after rotate-keys",
+                  cl(srv("enabled", "reencrypt_finished", dropin=True, key_type="XSalsa20-POLY1305"), UNAV, UNAV, phase="rotate-keys"),
+                  restart_pre, RP_, extra_vars=RESTART))
+
 decide = picks("restart", "Decide the restart")
 R = "secrets_encryption_restart_required | bool"
 plays.append(play("restart decision: idempotent when already restarted and the drop-in is unchanged",
@@ -1024,6 +1388,9 @@ plays.append(play("rotation: refused before every server restarted", cl(IDENT, I
 plays.append(play("rotation: refused while the last post-restart gate is unrecorded",
                   cl(IDENT, IDENT, srv("disabled", "start", dropin=True, verified=False), phase="enable"), rot_pre, ER))
 plays.append(play("rotation: refused while a server lacks the drop-in", cl(IDENT, IDENT, srv("disabled", "start"), phase="enable"), rot_pre, ER))
+plays.append(play("rotation: refused before the post-round validation (k3s03 restarted, status still unavailable, not verified)",
+                  cl(IDENT, IDENT, UNAV_RESTARTED, phase="enable"), rot_pre, ER))
+plays.append(play("rotation: refused while every status is unavailable after the round", cl(UNAV_DONE, phase="enable"), rot_pre, ER))
 plays.append(play("rotation: refused with mismatched hashes", cl(IDENT, srv("disabled", "start", dropin=True, hashes=False), phase="enable"),
                   rot_pre, ER))
 plays.append(play("rotation: refused without enable", cl(NOCONF), rot_pre, ER))
@@ -1083,6 +1450,30 @@ with (state / "log").open("a") as f:
     f.write(" ".join(x for x in a if not x.startswith("--from-file")) + "\n")
 def opt(prefix):
     return next((x.split("=", 1)[1] for x in a if x.startswith(prefix)), None)
+def mode(name, default):
+    p = state / name
+    return p.read_text().strip() if p.exists() else default
+if a[:1] == ["secrets-encrypt"]:
+    sys.stderr.write('level=warning msg="Cluster CA certificate is not trusted by the host CA bundle"\n')
+    if a[1:] == ["enable"]:
+        out, rc = {"ok": ("secrets-encryption enabled\n", 0), "wrong": ("secrets-encryption already enabled\n", 0),
+                   "extra": ("secrets-encryption enabled\nreencryption started\n", 0), "empty": ("", 0),
+                   "rc1": ("secrets-encryption enabled\n", 1), "fail": ("", 1)}[mode("enable-mode", "ok")]
+        sys.stdout.write(out); sys.exit(rc)
+    if a[1:] == ["status"]:
+        ident = "Encryption Status: Disabled\nCurrent Rotation Stage: start\n"
+        m = mode("status-mode", "unavailable")
+        if m == "unavailable":
+            sys.stderr.write('level=fatal msg="Error: see server log for details: Internal error occurred: secret-encrypt error ID 00459"\n')
+            sys.exit(1)
+        sys.stdout.write({"identity": ident + "Server Encryption Hashes: All hashes match\n",
+                          "identity-extra": ident + "Server Encryption Hashes: All hashes match\nSomething new: value\n",
+                          "mismatch": ident + "Server Encryption Hashes: hash does not match between node-sentinel-a and node-sentinel-b\n",
+                          "enabled": "Encryption Status: Enabled\nCurrent Rotation Stage: start\nServer Encryption Hashes: All hashes match\n\n"
+                                     "Active  Key Type           Name\n------  --------           ----\n *      XSalsa20-POLY1305  k1\n",
+                          "noconf": "Encryption Status: Disabled, no configuration file found\n"}[m])
+        sys.exit(0)
+    sys.exit(2)
 if a[:1] != ["kubectl"]:
     sys.exit(2)
 verb = a[1]
@@ -1293,6 +1684,193 @@ plays.append(play("canary: raw verification refuses a missing etcdctl before cre
                   dict(notools, secrets_encryption_raw_verification=True, secrets_encryption_environment="rehearsal",
                        secrets_encryption_etcdctl_path=str(tmp_root / "no-tools/missing-etcdctl"),
                        secrets_encryption_canary_action="create-control")))
+
+# ---------------------------------------------------------------- step 1 and the post-round validation, with a stub k3s
+# Scenario builders take the task directory (None: the role's own; otherwise a
+# mutant copy) so that the same scenario serves as regression test and, with
+# the outcome inverted, as the test that kills a mutant.
+REQ_ENABLE = "Require the documented enable result"
+REQ_ROUND = "Require Disabled, start and matching hashes on every server after the enable restart round"
+
+
+def stub_file(name, content):
+    return {"name": f"stub {name}={content}", "ansible.builtin.copy": {"dest": "{{ stub_state }}/" + name, "content": content}}
+
+
+def stub_log(sv):
+    return f"lookup('ansible.builtin.file', '{sv['stub_state']}/log')"
+
+
+def enable_scenario(base, label, enable_mode, fail, status_mode="unavailable"):
+    sv = stubs(f"enable-{len(plays)}")
+    sd = pathlib.Path(sv["stub_state"]).parent / "statedir"
+    sd.mkdir()
+    tasks = unroot(absolutize(load(base / "enable.yml") if base else copy.deepcopy(task_files["enable"]), base))
+    checks = [f"('{sd}/last-change' is exists) == {not fail}", f"{stub_log(sv)} is search('secrets-encrypt enable')",
+              f"{stub_log(sv)} is not search('secrets-encrypt status')"]
+    if not fail:
+        checks.append(f"lookup('ansible.builtin.file', '{sd}/last-change') is match('^[0-9]+ enable$')")
+    return dict(name=f"step 1: {label}", mocks=cl(NOCONF), tasks=tasks, expect_fail=fail, checks=checks,
+                extra_vars=dict(sv, secrets_encryption_state_dir=str(sd)),
+                setup=[stub_file("enable-mode", enable_mode), stub_file("status-mode", status_mode)])
+
+
+def round_scenario(base, label, status_mode, fail, host="k3s03", phase="enable", reads_status=True):
+    sv = stubs(f"round-{len(plays)}")
+    sd = pathlib.Path(sv["stub_state"]).parent / "statedir"
+    sd.mkdir()
+    tasks = unroot([pick("restart", ROUND_CHECK, base=base)]
+                   + picks("restart", "Read the time of the passed post-restart gate", "Record the passed post-restart gate", base=base))
+    checks = [f"('{sd}/restart-verified' is exists) == {not fail}"]
+    checks.append(f"{stub_log(sv)} is search('secrets-encrypt status')" if reads_status else f"not ('{sv['stub_state']}/log' is exists)")
+    return dict(name=f"post-round validation: {label}", mocks=cl(IDENT, phase=phase), tasks=tasks, expect_fail=fail, checks=checks, host=host,
+                extra_vars=dict(sv, secrets_encryption_state_dir=str(sd), secrets_encryption_ready_retries=2,
+                                secrets_encryption_ready_delay_seconds=0), setup=[stub_file("status-mode", status_mode)])
+
+
+def health_scenario(base, label, mocks, problem, extra_vars):
+    tasks = picks("gather", "Reset the parsed status", "Parse the status of each server", "Summarize the gathered state", base=base)
+    checks = [f"{HP} | length == 0"] if problem is None else [f"{HP} | select('search', {json.dumps(problem)}) | list | length > 0"]
+    return dict(name=f"health: {label}", mocks=mocks, tasks=tasks, expect_fail=False, checks=checks, extra_vars=extra_vars)
+
+
+def restart_scenario(base, label, mocks, host, fail):
+    tasks = (picks("summarize", "Summarize the enable restart round", base=base)
+             + picks("restart", "Enforce the restart preconditions", "Enforce the restart order", ROUND_ENFORCE, base=base))
+    return dict(name=f"enable round: {label}", mocks=mocks, tasks=tasks, expect_fail=fail, checks=[], extra_vars=RESTART, host=host)
+
+
+def parse_scenario(base, label, result, unavailable_expected):
+    return dict(name=f"parse: {label}", mocks={"secrets_encryption_status_input": result},
+                tasks=picks("parse_status", "Parse the secrets-encryption status", base=base), expect_fail=False,
+                checks=[f"({P}.unavailable | bool) == {unavailable_expected}", f"not ({P}.parsed | bool)"])
+
+
+def add(sc, invert=False, prefix=""):
+    plays.append(play(prefix + sc["name"], sc["mocks"], sc["tasks"], sc["expect_fail"], sc["checks"], sc.get("extra_vars"),
+                      sc.get("host", "k3s01"), sc.get("setup", ()), invert=invert))
+
+
+for label, mode, fail in (("exit 0 with exactly the documented line records the marker and reads no status", "ok", False),
+                          ("an unexpected line is refused and records nothing", "wrong", REQ_ENABLE),
+                          ("an extra output line is refused and records nothing", "extra", REQ_ENABLE),
+                          ("empty output is refused and records nothing", "empty", REQ_ENABLE),
+                          ("the documented line with a non-zero exit is refused and records nothing", "rc1", REQ_ENABLE),
+                          ("a failed command is refused and records nothing", "fail", REQ_ENABLE)):
+    add(enable_scenario(None, label, mode, fail))
+add(enable_scenario(None, "a readable status afterwards is still not read", "ok", False, status_mode="identity"))
+for label, mode, fail in (("Disabled, start and matching hashes on every server complete the round", "identity", False),
+                          ("an unavailable status fails and k3s03 is not recorded as verified", "unavailable", REQ_ROUND),
+                          ("mismatched hashes fail", "mismatch", REQ_ROUND),
+                          ("Enabled fails", "enabled", REQ_ROUND),
+                          ("no configuration fails", "noconf", REQ_ROUND),
+                          ("an unrecognized line fails (status must parse)", "identity-extra", REQ_ROUND)):
+    add(round_scenario(None, label, mode, fail))
+add(round_scenario(None, "k3s01's run does not read status and is recorded", "unavailable", False, host="k3s01", reads_status=False))
+add(round_scenario(None, "k3s02's run does not read status and is recorded", "unavailable", False, host="k3s02", reads_status=False))
+add(round_scenario(None, "a round after rotate-keys is not validated as the enable round", "unavailable", False, phase="rotate-keys",
+                   reads_status=False))
+
+# ---------------------------------------------------------------- mutants
+OLD_POST_ENABLE_TEXT = """    - name: Read the first server's status after enable
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, status]
+      register: secrets_encryption_after_enable
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Parse the status after enable
+      ansible.builtin.include_tasks: parse_status.yml
+      vars:
+        secrets_encryption_status_input: "{{ secrets_encryption_after_enable }}"
+
+    - name: Require an identity configuration without encryption
+      ansible.builtin.assert:
+        that:
+          - secrets_encryption_parsed.parsed | bool
+          - secrets_encryption_parsed.encryption == 'disabled'
+        quiet: true
+
+"""
+
+
+def marker_before_check(d):
+    p = d / "enable.yml"
+    ts = yaml.safe_load(p.read_text())
+    b = enable_block_of(ts)
+    b[1:4] = [b[2], b[3], b[1]]
+    p.write_text(yaml.safe_dump(ts, sort_keys=False, width=200))
+
+
+def mutant_dir(edits):
+    d = tmp_root / f"mutant-{len(plays)}" / "tasks"
+    shutil.copytree(role / "tasks", d)
+    for edit in edits:
+        if callable(edit):
+            edit(d)
+            continue
+        file, old, new = edit
+        p = d / f"{file}.yml"
+        text = p.read_text()
+        assert text.count(old) == 1, (file, old)
+        p.write_text(text.replace(old, new))
+    return d
+
+
+SHOW = "    - name: Show the next step after enable\n"
+mutants = [
+    ("the old post-enable status assertion", [("enable", SHOW, OLD_POST_ENABLE_TEXT + SHOW)],
+     lambda b: enable_scenario(b, "exact result, status unavailable", "ok", False)),
+    ("the exact enable output no longer required",
+     [("enable", "          - secrets_encryption_enable_result.stdout_lines | default([]) == ['secrets-encryption enabled']\n", "")],
+     lambda b: enable_scenario(b, "unexpected line", "wrong", REQ_ENABLE)),
+    ("the enable exit status no longer required", [("enable", "          - secrets_encryption_enable_result.rc == 0\n", "")],
+     lambda b: enable_scenario(b, "non-zero exit", "rc1", REQ_ENABLE)),
+    ("the enable marker written before the result check", [marker_before_check],
+     lambda b: enable_scenario(b, "failed command", "fail", REQ_ENABLE)),
+    ("the tolerance without the round (evaluate.yml)",
+     [("evaluate", "se_round.tolerate_unavailable_status | bool and s.status.unavailable", "s.status.unavailable")],
+     lambda b: health_scenario(b, "snapshot phase during the round", round_probes(), NOT_PARSED, {"secrets_encryption_phase": "snapshot"})),
+    ("the round in any phase", [("summarize", "\n        and (secrets_encryption_phase | default('')) == 'restart'", "")],
+     lambda b: health_scenario(b, "rotate-keys phase during the round", round_probes(), NOT_PARSED, {"secrets_encryption_phase": "rotate-keys"})),
+    ("the round tolerating out-of-order evidence", [("summarize", "not se_complete | bool and se_out_of_order == ''", "not se_complete | bool")],
+     lambda b: health_scenario(b, "k3s03 restarted out of order", round_probes(started=(50000, 30000, 50000), verified=(55000, None, None),
+                                                                                dropin=(True, False, False)), NOT_PARSED, RESTART)),
+    ("the round without the ledger", [("summarize", "and se_ledger_ok | bool and se_checkpoint_ok | bool", "and se_checkpoint_ok | bool")],
+     lambda b: health_scenario(b, "stale marker", round_probes(ledger=LEDGER_OK + "20261023T170000Z rotate-keys k3s01\n"), NOT_PARSED, RESTART)),
+    ("the round without the pre-enable checkpoint", [("summarize", "and se_ledger_ok | bool and se_checkpoint_ok | bool", "and se_ledger_ok | bool")],
+     lambda b: health_scenario(b, "no pre-enable snapshot", round_probes(snaps=[{"files": [{"path": "/s/stage3-p1-late-k3s01-1", "mtime": 45000,
+                                                                                            "size": 10}]}] + PRE_SNAP[1:]), NOT_PARSED, RESTART)),
+    ("the round that never completes", [("summarize", 'se_complete: "{{ se_prefix | int == se_servers | length }}"', 'se_complete: "{{ false }}"')],
+     lambda b: health_scenario(b, "after the round completed", round_probes(started=(50000, 50000, 50000), verified=(55000, 55000, 55000),
+                                                                            dropin=(True, True, True)), NOT_PARSED, RESTART)),
+    ("any status failure marked unavailable",
+     [("parse_status", "\n        and se_err_lines | select('search', se_unavailable_re) | list | length == 1", "")],
+     lambda b: parse_scenario(b, "another server error", unavailable(err=['level=fatal msg="connection refused"']), False)),
+    ("the restart preconditions tolerating without the round", [("restart", "se_tolerate | bool and (st.unavailable", "(st.unavailable")],
+     lambda b: restart_scenario(b, "ledger lacks enable", cl(UNAV, phase="enable", events=("snapshot k3s01",)), "k3s01", RP_)),
+    ("the round without the next-server check", [("restart", "      - inventory_hostname == se_round.next\n", "")],
+     lambda b: restart_scenario(b, "k3s01 replayed", cl(IDENT, NOT_YET, NOT_YET, phase="enable"), "k3s01", RE)),
+    ("the round without the out-of-order check", [("restart", "      - se_round.out_of_order == ''\n", "")],
+     lambda b: restart_scenario(b, "k3s03 restarted first", cl(NOT_YET, NOT_YET, srv("disabled", "start", dropin=True, restarted=True, verified=False),
+                                                                  phase="enable"), "k3s01", RE)),
+    ("the round without the ledger check", [("restart", "      - se_round.ledger_ok | bool\n", "")],
+     lambda b: restart_scenario(b, "stale marker", cl(NOT_YET, phase="enable", events=STALE), "k3s01", RE)),
+    ("the round without the checkpoint check", [("restart", "      - se_round.checkpoint_ok | bool\n", "")],
+     lambda b: restart_scenario(b, "no pre-enable checkpoint", cl(NOT_YET, phase="enable", pre_enable_snapshot=False), "k3s01", RE)),
+    ("the post-round validation skipped",
+     [("restart", "    - inventory_hostname == groups['servers'][-1]\n  block:", "    - inventory_hostname == groups['servers'][-1]\n    - false\n  block:")],
+     lambda b: round_scenario(b, "unavailable after the round", "unavailable", REQ_ROUND)),
+    ("the post-round validation accepting an unparsed status", [("restart", "p.parsed | default(false) | bool and ", "")],
+     lambda b: round_scenario(b, "unrecognized line", "identity-extra", REQ_ROUND)),
+    ("the post-round validation ignoring hashes", [("restart", " and p.hashes_match | default(false) | bool", "")],
+     lambda b: round_scenario(b, "hash mismatch", "mismatch", REQ_ROUND)),
+    ("the post-round validation on every server's run", [("restart", "    - inventory_hostname == groups['servers'][-1]\n", "")],
+     lambda b: round_scenario(b, "k3s01's run", "unavailable", False, host="k3s01", reads_status=False)),
+]
+for label, edits, scenario in mutants:
+    add(scenario(mutant_dir(edits)), invert=True, prefix=f"mutant killed: {label}: ")
 
 # ---------------------------------------------------------------- drop-in idempotence
 dropin_copy = unroot(copy.deepcopy(task_files["dropin"]))
@@ -1518,6 +2096,19 @@ guard_cases = [
      dict(LIVE, secrets_encryption_flag_state="absent", secrets_encryption_confirm=C("restart", "k3s01")), False),
     ("restart: flag removal allowed in a rehearsal", "restart", "rehearsal", "s3r01",
      dict(REH, secrets_encryption_flag_state="absent", secrets_encryption_confirm=C("restart", "s3r01")), True),
+    ("restart: an injected enable restart round is refused", "restart", "live", "k3s01",
+     dict(LIVE, secrets_encryption_enable_round={"tolerate_unavailable_status": True, "next": "k3s01", "ledger_ok": True, "checkpoint_ok": True,
+                                                 "out_of_order": "", "complete": False}, secrets_encryption_confirm=C("restart", "k3s01")), False),
+    ("restart: an injected enable restart round is refused in a rehearsal too", "restart", "rehearsal", "s3r01",
+     dict(REH, secrets_encryption_enable_round={"tolerate_unavailable_status": True}, secrets_encryption_confirm=C("restart", "s3r01")), False),
+    ("restart: injected parsed status is refused", "restart", "live", "k3s02",
+     dict(LIVE, secrets_encryption_status_by_server={}, secrets_encryption_confirm=C("restart", "k3s02")), False),
+    ("restart: injected ledger events are refused", "restart", "live", "k3s01",
+     dict(LIVE, secrets_encryption_ledger_events=["snapshot k3s01", "enable k3s01"], secrets_encryption_confirm=C("restart", "k3s01")), False),
+    ("rotate-keys: injected server state is refused", "rotate-keys", "live", "k3s01",
+     dict(LIVE, secrets_encryption_servers={}, secrets_encryption_confirm=C("rotate-keys", "k3s01")), False),
+    ("snapshot: an injected health result is refused", "snapshot", "live", "k3s01",
+     dict(LIVE, secrets_encryption_health_problems="", secrets_encryption_confirm=C("snapshot", "k3s01")), False),
     ("rotate-keys: fresh confirmation", "rotate-keys", "live", "k3s01", dict(LIVE, secrets_encryption_confirm=C("rotate-keys", "k3s01")), True),
     ("rotate-keys: stale confirmation", "rotate-keys", "live", "k3s01", dict(LIVE, secrets_encryption_confirm=C("rotate-keys", "k3s01", 31)), False),
     ("rotate-keys: confirmation for enable", "rotate-keys", "live", "k3s01", dict(LIVE, secrets_encryption_confirm=C("enable", "k3s01")), False),

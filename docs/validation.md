@@ -474,16 +474,18 @@ install-etcdctl-rehearsal.yml
 
 - the role and playbook structure;
 - the guard, using the real phase playbooks with real `--limit` values, confirmations and environments. Refused cases must stop inside the guard, before facts or privilege escalation. They include rehearsal-only work against an inventory containing a live host name, and not-yet-rehearsal-approved rollback paths;
-- status parsing, which fails closed;
+- status parsing, which fails closed, and the narrowly defined `unavailable` status that only the enable restart round tolerates;
 - the health, preservation and snapshot gates;
 - every phase decision, including the fixed restart order and confirmation replay;
+- the corrected step 1: the exact `enable` result before the marker, no status read afterwards, and the enable restart round. That round must be strictly ordered and not replayed, and requires a consistent marker, ledger and pre-enable checkpoint. It ends with a required `Disabled`/`start`/matching-hashes status before rotation;
+- mutation tests: each reintroduced defect must change the outcome of the regression test it targets;
 - state-directory and ledger link safety;
 - the etcdctl installer's check-before-install order;
 - the exact single-key raw canary verification pipeline, with a stub etcdctl;
 - the canary lifecycle, with a stub k3s;
 - that no canary value, raw etcd record, hash-mismatch node name or protected path appears in the output.
 
-No K3s behavior has been observed: the required k3d rehearsal, the three-VM rehearsal and the live procedure remain to be performed. See [secrets-encryption.md](secrets-encryption.md).
+The required k3d rehearsal was attempted on 2026-10-23 and **did not pass**: it stopped at step 1. After `k3s secrets-encrypt enable`, `k3s secrets-encrypt status` failed on every server until restarts, which the encoded procedure did not allow for. The procedure has since been corrected and statically re-tested, but the corrected procedure has not been rehearsed. The k3d rehearsal, the three-VM rehearsal and the live procedure remain to be performed. See [secrets-encryption.md](secrets-encryption.md#k3d-rehearsal-record-2026-10-23).
 
 The recovery-tools role has not been run against a node. Downloading, checksum verification against the real archive, installation, the server's `age --version` result and idempotence on a real node remain to be shown by a separately approved live run. See [recovery-tools.md](recovery-tools.md).
 

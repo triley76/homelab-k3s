@@ -35,8 +35,9 @@
     se_swap_lines: "{{ se_swap.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
     se_swap_ok: "{{ se_swap.rc | default(1) == 0 and se_swap_lines | reject('match', '^[0-9]+$') | list | length == 0 }}"
     se_status: >-
-      {{ secrets_encryption_status_by_server[item] | default({'parsed': false, 'problems': ['missing'], 'encryption': 'unknown',
-      'stage': 'none', 'hashes_match': false, 'key_count': 0, 'active_key_type': 'none', 'active_key_name': 'none'}) }}
+      {{ secrets_encryption_status_by_server[item] | default({'parsed': false, 'problems': ['missing'], 'unavailable': false,
+      'encryption': 'unknown', 'stage': 'none', 'hashes_match': false, 'key_count': 0, 'active_key_type': 'none',
+      'active_key_name': 'none'}) }}
   ansible.builtin.set_fact:
     secrets_encryption_servers: >-
       {{ secrets_encryption_servers | combine({item: {
@@ -75,6 +76,7 @@
     se_ledger_text: >-
       {{ (secrets_encryption_ledger_probe.content | b64decode)
       if secrets_encryption_ledger_probe.content is defined else '' }}
+    se_ledger_lines: "{{ se_ledger_text.splitlines() | map('trim') | reject('equalto', '') | list }}"
   ansible.builtin.set_fact:
     secrets_encryption_marker:
       present: "{{ se_marker_ok }}"
@@ -82,6 +84,10 @@
       epoch: "{{ se_marker_text.split(' ')[0] | int if se_marker_ok | bool else 0 }}"
       phase: "{{ se_marker_text.split(' ')[1] if se_marker_ok | bool else 'none' }}"
     secrets_encryption_used_confirmations: "{{ se_ledger_text.splitlines() | map('split', ' ') | map('first') | list }}"
+    # "<phase> <host>" for each ledger line, in the order the gate appended them.
+    secrets_encryption_ledger_events: "{{ se_ledger_lines | map('regex_replace', '^\\S+ ', '') | list }}"
+    secrets_encryption_ledger_malformed: >-
+      {{ se_ledger_lines | reject('match', '^[0-9]{8}T[0-9]{6}Z [a-z-]+ \S+$') | list | length > 0 }}
     secrets_encryption_now_epoch: "{{ secrets_encryption_now_probe.stdout | default('0') | trim | int }}"
 
 # A server reaches the checkpoint of the last change when its K3s became
@@ -129,6 +135,70 @@
         'baseline': (se_base.content | b64decode | from_json) if se_base.content is defined else none,
       }}) }}
   loop: "{{ groups['servers'] }}"
+
+# The first restart round after enable (docs/secrets-encryption.md, "Between
+# enable and the first restart round"). Pure evaluation from recorded state;
+# no variable switches it on. The round is the prefix of servers, in inventory
+# order, that reached the checkpoint after enable; `next` is the only server
+# that may restart; a later server with a restart, a drop-in, a drop-in change
+# or a verification after enable is out of order. The ledger must show a
+# snapshot and then enable on the first server, and no later procedure change
+# (a stale marker otherwise); a Stage 3 snapshot older than the marker must
+# exist on the first server. Only the restart phase with the drop-in requested
+# may then tolerate an unavailable status (evaluate.yml), and only until every
+# server has reached the checkpoint.
+- name: Summarize the enable restart round
+  vars:
+    se_servers: "{{ groups['servers'] }}"
+    se_first: "{{ groups['servers'][0] }}"
+    se_active: "{{ secrets_encryption_marker.present | bool and secrets_encryption_marker.phase == 'enable' }}"
+    se_prefix: >-
+      {%- set ns = namespace(n=0, open=true) -%}
+      {%- for h in se_servers -%}
+      {%- if ns.open and secrets_encryption_servers[h].checkpoint_reached | bool -%}
+      {%- set ns.n = ns.n + 1 -%}
+      {%- else -%}
+      {%- set ns.open = false -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.n }}
+    se_out_of_order: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for h in se_servers[(se_prefix | int) + 1:] -%}
+      {%- set s = secrets_encryption_servers[h] -%}
+      {%- if s.checkpoint_reached | bool or s.restarted_since_change | bool or s.dropin_present | bool
+             or s.dropin_change_epoch | int > secrets_encryption_marker.epoch | int
+             or s.verified_epoch | int > secrets_encryption_marker.epoch | int -%}
+      {%- set ns.out = ns.out + [h] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | join(', ') }}
+    se_events: "{{ secrets_encryption_ledger_events }}"
+    se_enable_event: "enable {{ se_first }}"
+    se_snapshot_event: "snapshot {{ se_first }}"
+    se_ledger_ok: >-
+      {{ not secrets_encryption_ledger_malformed | bool
+      and se_enable_event in se_events and se_snapshot_event in se_events
+      and se_events.index(se_snapshot_event) < se_events.index(se_enable_event)
+      and se_events | select('match', '^(rotate-keys|disable|reencrypt-after-disable) ') | list | length == 0 }}
+    se_checkpoint_ok: >-
+      {{ secrets_encryption_storage[se_first].stage3_snapshots | map(attribute='mtime') | map('int')
+      | select('gt', 0) | select('lt', secrets_encryption_marker.epoch | int) | list | length > 0 }}
+    se_complete: "{{ se_prefix | int == se_servers | length }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_enable_round:
+      active: "{{ se_active | bool }}"
+      verified: "{{ se_prefix | int if se_active | bool else 0 }}"
+      next: "{{ se_servers[se_prefix | int] if (se_active | bool and not se_complete | bool) else '' }}"
+      complete: "{{ se_active | bool and se_complete | bool }}"
+      out_of_order: "{{ se_out_of_order if se_active | bool else '' }}"
+      ledger_ok: "{{ se_active | bool and se_ledger_ok | bool }}"
+      checkpoint_ok: "{{ se_active | bool and se_checkpoint_ok | bool }}"
+      tolerate_unavailable_status: >-
+        {{ se_active | bool and not se_complete | bool and se_out_of_order == ''
+        and se_ledger_ok | bool and se_checkpoint_ok | bool
+        and (secrets_encryption_phase | default('')) == 'restart'
+        and secrets_encryption_flag_state == 'present' }}
 
 - name: Evaluate the common health gate
   ansible.builtin.include_tasks: evaluate.yml

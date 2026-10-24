@@ -100,6 +100,24 @@ secrets_encryption_verifier_tokens:
   - FAIL-ENCRYPTED
   - FAIL-USAGE
 
+# Facts the gates build from what they read on the servers. The guard refuses a
+# run in which any of them is already defined (extra vars or inventory), so that
+# no injected value can stand in for gathered state, for example the enable
+# restart round that alone may tolerate an unavailable status.
+secrets_encryption_gathered_facts:
+  - secrets_encryption_enable_round
+  - secrets_encryption_servers
+  - secrets_encryption_status_by_server
+  - secrets_encryption_parsed
+  - secrets_encryption_marker
+  - secrets_encryption_ledger_events
+  - secrets_encryption_ledger_malformed
+  - secrets_encryption_used_confirmations
+  - secrets_encryption_storage
+  - secrets_encryption_now_epoch
+  - secrets_encryption_health_problems
+  - secrets_encryption_report
+
 # Owner required of the state directory and its files (root on every server).
 secrets_encryption_state_owner_uid: 0
 secrets_encryption_state_files:

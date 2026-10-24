@@ -119,6 +119,17 @@
     label: "{{ item.key }}"
   run_once: true
 
+# Gathered state is built only by the gate, after this guard. Extra vars outrank
+# facts, so a value injected under one of these names would replace it.
+- name: Refuse injected gathered state
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item, default='__not-defined__') == '__not-defined__'
+    fail_msg: "{{ item }} is gathered by the gate and may not be set from the command line or inventory."
+    quiet: true
+  loop: "{{ secrets_encryption_gathered_facts }}"
+  run_once: true
+
 - name: Require the committed gate values in a live environment
   vars:
     se_defaults: "{{ lookup('ansible.builtin.file', role_path ~ '/defaults/main.yml') | from_yaml }}"
