@@ -446,7 +446,7 @@ require("disable.yml and reencrypt.yml: preconditions before the command; marked
         and "Not yet rehearsal-approved" in task_text["disable"] and "Not yet rehearsal-approved" in task_text["reencrypt"])
 require("gate.yml: every check before any write",
         order_ok("gate", ["Gather the cluster state", "Evaluate preservation and snapshot freshness", "Enforce the common health gate",
-                          "Enforce snapshot and database preservation", "Enforce snapshot freshness", "Refuse a confirmation that was already used",
+                          "Enforce the exclusive enable restart round", "Enforce snapshot and database preservation", "Enforce snapshot freshness", "Refuse a confirmation that was already used",
                           "Ensure the Stage 3 state directory exists on every server", "Require a root-only state directory on every server",
                           "Record the preservation baseline on every server", "Record the confirmation as used"]))
 require("snapshot.yml: unique name, metadata before, save, metadata after, preservation re-checked",
@@ -687,6 +687,58 @@ structural_mutants = [
         "and se_err_lines | select('search', se_unavailable_re) | list | length == 1", ""))),
     ("an unavailable status counted as parsed", lambda: unavailable_is_narrow(task_text["parse_status"].replace(
         "parsed: \"{{ se_problems | length == 0 }}\"", "parsed: \"{{ se_problems | length == 0 or se_rc | int != 0 }}\""))),
+]
+LOCK = "Enforce the exclusive enable restart round"
+LOCK_THAT = ["not (se_round.active | bool) or se_round_restart | bool or (se_round.complete | bool and se_round.ledger_ok | bool "
+             "and se_round.checkpoint_ok | bool and se_round.out_of_order == '')"]
+VALIDATE_EVAL = "Evaluate the expected state"
+VALIDATE_ENFORCE = "Enforce the gate and the expected state"
+
+
+def gate_round_exclusive(tasks):
+    names = [t.get("name") for t in tasks]
+    if LOCK not in names:
+        return False
+    t = tasks[names.index(LOCK)]
+    that = [" ".join(x.split()) for x in t.get("ansible.builtin.assert", {}).get("that", [])]
+    return (names.index("Enforce the common health gate") < names.index(LOCK) < names.index("Ensure the Stage 3 state directory exists on every server")
+            and t["vars"] == {"se_round": "{{ secrets_encryption_enable_round }}",
+                              "se_round_restart": "{{ secrets_encryption_phase == 'restart' and secrets_encryption_flag_state == 'present' }}"}
+            and that == [" ".join(x.split()) for x in LOCK_THAT] and "when" not in t)
+
+
+def validate_blocks_round(tasks):
+    ev = next((t for t in tasks if t.get("name") == VALIDATE_EVAL), {})
+    en = next((t for t in tasks if t.get("name") == VALIDATE_ENFORCE), {})
+    blocking = " ".join(str(ev.get("vars", {}).get("se_round_blocking", "")).split())
+    met = " ".join(str(ev.get("ansible.builtin.set_fact", {}).get("secrets_encryption_expectation", {}).get("met", "")).split())
+    return (blocking == ("{{ se_round.active | bool and not (se_round.complete | bool and se_round.ledger_ok | bool and "
+                         "se_round.checkpoint_ok | bool and se_round.out_of_order == '') }}")
+            and met.startswith("{{ not se_round_blocking | bool and (")
+            and "not secrets_encryption_expectation.enable_round_blocking | bool" in en.get("ansible.builtin.assert", {}).get("that", []))
+
+
+def lock_mutate(fn):
+    def apply(tasks):
+        fn(next(t for t in tasks if t.get("name") == LOCK))
+    return apply
+
+
+require("gate.yml: an incomplete or inconsistent enable restart round admits only the restart with the drop-in, before any write",
+        gate_round_exclusive(task_files["gate"]))
+require("validate-secrets-encryption.yml: an incomplete or inconsistent enable restart round fails enforced validation",
+        validate_blocks_round(validate_pb[0]["tasks"]))
+structural_mutants += [
+    ("the exclusive round lock removed", lambda: gate_round_exclusive(mutate(task_files["gate"], remove_named(LOCK)))),
+    ("the lock admitting drop-in removal", lambda: gate_round_exclusive(mutate(task_files["gate"], lock_mutate(
+        lambda t: t["vars"].update(se_round_restart="{{ secrets_encryption_phase == 'restart' }}"))))),
+    ("the lock without the ledger, checkpoint and order evidence", lambda: gate_round_exclusive(mutate(task_files["gate"], lock_mutate(
+        lambda t: t["ansible.builtin.assert"].update(that=["not (se_round.active | bool) or se_round_restart | bool or se_round.complete | bool"]))))),
+    ("the lock after the ledger write", lambda: gate_round_exclusive(mutate(task_files["gate"], lambda ts: ts.append(
+        ts.pop([x.get("name") for x in ts].index(LOCK)))))),
+    ("validation without the round", lambda: validate_blocks_round(mutate(validate_pb[0]["tasks"], lambda ts: next(
+        t for t in ts if t.get("name") == VALIDATE_ENFORCE)["ansible.builtin.assert"]["that"].remove(
+        "not secrets_encryption_expectation.enable_round_blocking | bool")))),
 ]
 for label, check in structural_mutants:
     require(f"mutation (structure): {label} is detected", check() is False)
@@ -1367,6 +1419,107 @@ plays.append(play("enable round: an unavailable status is not tolerated by the r
                   cl(srv("enabled", "reencrypt_finished", dropin=True, key_type="XSalsa20-POLY1305"), UNAV, UNAV, phase="rotate-keys"),
                   restart_pre, RP_, extra_vars=RESTART))
 
+# ---------------------------------------------------------------- the exclusive enable restart round (gate.yml)
+# k3d, 2026-10-24: status became readable and settled on every server after S1
+# alone. The durable round state, not status readability, gates every phase.
+LOCK_ONLY = "Enforce the exclusive enable restart round"
+
+
+def add_sc(sc, invert=False, prefix=""):
+    plays.append(play(prefix + sc["name"], sc["mocks"], sc["tasks"], sc["expect_fail"], sc["checks"], sc.get("extra_vars"),
+                      sc.get("host", "k3s01"), sc.get("setup", ()), invert=invert))
+
+
+OTHER_PHASES = [("checkpoint snapshot", "snapshot", "present"), ("canary create-control", "canary-create-control", "present"),
+                ("canary verify", "canary-verify", "present"), ("canary cleanup", "canary-cleanup", "present"),
+                ("rotation", "rotate-keys", "present"), ("rollback re-encryption", "reencrypt-after-disable", "present"),
+                ("disable", "disable", "present"), ("a repeated enable", "enable", "present"),
+                ("etcdctl installation", "install-etcdctl", "present"), ("drop-in removal", "restart", "absent")]
+
+
+def lock_scenario(base, label, mocks, phase, fail, flag="present", host="k3s01"):
+    tasks = picks("summarize", "Summarize the enable restart round", base=base) + picks("gate", LOCK_ONLY, base=base)
+    return dict(name=f"exclusive round: {label}", mocks=mocks, tasks=tasks, expect_fail=fail and LOCK_ONLY, checks=[], host=host,
+                extra_vars={"secrets_encryption_phase": phase, "secrets_encryption_flag_state": flag})
+
+
+VERIFIED_S3_PENDING = srv("disabled", "start", dropin=True, restarted=True, verified=False)
+ROUND_STATES = [("before S1, status unavailable", cl(UNAV, phase="enable"), "k3s01"),
+                ("after S1, status readable and settled everywhere", cl(IDENT, NOT_YET, NOT_YET, phase="enable"), "k3s02"),
+                ("after S2, status readable and settled everywhere", cl(IDENT, IDENT, NOT_YET, phase="enable"), "k3s03"),
+                ("S3 restarted, converged status readable, not yet verified", cl(IDENT, IDENT, VERIFIED_S3_PENDING, phase="enable"), "k3s03"),
+                ("S2 restarted but its gate never passed (interrupted)", cl(IDENT, srv("disabled", "start", dropin=True, restarted=True, verified=False),
+                                                                          NOT_YET, phase="enable"), "k3s02")]
+for state, mocks, nxt in ROUND_STATES:
+    for what, phase, flag in OTHER_PHASES:
+        add_sc(lock_scenario(None, f"{state}: {what} is refused", mocks, phase, True, flag))
+    add_sc(lock_scenario(None, f"{state}: the restart with the drop-in passes the gate", mocks, "restart", False))
+    for host in SERVERS:
+        tasks = restart_pre + picks("gate", LOCK_ONLY)
+        fail = False if host == nxt else (RO if SERVERS.index(host) > SERVERS.index(nxt) else RE)
+        plays.append(play(f"exclusive round: {state}: restart {host} {'is the only one allowed' if not fail else 'is refused'}",
+                          mocks, tasks, fail, host=host, extra_vars=RESTART))
+
+# Readable, settled, matching status is not completion: the gathered round stays incomplete and the gate refuses.
+READABLE3 = [{"rc": 0, "stdout_lines": IDENTITY}] * 3
+for label, probes_kw in (
+        ("after S1", dict(started=(50000, 30000, 30000), verified=(55000, None, None), dropin=(True, False, False))),
+        ("after S2", dict(started=(50000, 50000, 30000), verified=(55000, 55000, None), dropin=(True, True, False))),
+        ("after S3's restart before its verified record", dict(started=(50000, 50000, 50000), verified=(55000, 55000, None),
+                                                               dropin=(True, True, True)))):
+    plays.append(play(f"exclusive round: readable Disabled/start/matching status {label} is healthy but not completion; p1 refused",
+                      round_probes(status=READABLE3, **probes_kw), summary_tasks + picks("gate", LOCK_ONLY), LOCK_ONLY,
+                      [f"{HP} | length == 0", f"not ({ROUND}.complete | bool)", f"{ROUND}.next != ''"],
+                      {"secrets_encryption_phase": "snapshot"}))
+plays.append(play("exclusive round: all three durably verified after the converged status: complete, p1 allowed",
+                  round_probes(status=READABLE3, started=(50000, 50000, 50000), verified=(55000, 55000, 56000), dropin=(True, True, True)),
+                  summary_tasks + picks("gate", LOCK_ONLY), False, [f"{ROUND}.complete | bool", f"{HP} | length == 0"],
+                  {"secrets_encryption_phase": "snapshot"}))
+
+# Once complete, the next lifecycle phases are eligible under their normal prerequisites.
+for what, phase, flag in OTHER_PHASES:
+    add_sc(lock_scenario(None, f"round complete: {what} passes the round gate", cl(IDENT, phase="enable"), phase, False, flag))
+add_sc(lock_scenario(None, "round complete: a further restart passes the gate, then restart.yml refuses the replay", cl(IDENT, phase="enable"),
+                  "restart", False))
+plays.append(play("round complete: rotation preconditions are met", cl(IDENT, phase="enable"),
+                  round_task + picks("gate", LOCK_ONLY) + picks("rotate", "Decide the rotation purpose", "Enforce the rotation preconditions"), False,
+                  ["secrets_encryption_rotation_purpose == 'enabling'"], {"secrets_encryption_phase": "rotate-keys"}))
+for marker_phase, ok_phase in (("rotate-keys", "disable"), ("disable", "reencrypt-after-disable"), ("reencrypt-after-disable", "snapshot")):
+    add_sc(lock_scenario(None, f"after the round (marker {marker_phase}): {ok_phase} is not affected by the round gate",
+                      cl(ENAB if marker_phase == "rotate-keys" else DISAB, phase=marker_phase), ok_phase, False))
+
+# Interrupted or inconsistent evidence fails closed.
+for label, mocks in (("a stale marker (ledger records rotate-keys)", cl(IDENT, phase="enable", events=STALE)),
+                     ("a ledger without snapshot before enable", cl(IDENT, phase="enable", events=("enable k3s01", "snapshot k3s01"))),
+                     ("a malformed ledger", cl(IDENT, phase="enable", ledger_malformed=True)),
+                     ("no pre-enable checkpoint", cl(IDENT, phase="enable", pre_enable_snapshot=False)),
+                     ("an interrupted rotation (rotate-keys recorded, marker still enable)",
+                      cl(IDENT, phase="enable", events=("snapshot k3s01", "enable k3s01", "snapshot k3s01", "rotate-keys k3s01")))):
+    for what, phase in (("checkpoint snapshot", "snapshot"), ("rotation", "rotate-keys"), ("canary verify", "canary-verify")):
+        add_sc(lock_scenario(None, f"round complete with {label}: {what} is refused", mocks, phase, True))
+    plays.append(play(f"round complete with {label}: no restart is admitted either", mocks, restart_pre + picks("gate", LOCK_ONLY), RE,
+                      extra_vars=RESTART))
+
+# Enforced validation follows the same rule.
+validate_tasks = [pick("validate", n, tasks=validate_pb[0]["tasks"]) for n in ("Evaluate the expected state", "Enforce the gate and the expected state")]
+VAL_ENF = "Enforce the gate and the expected state"
+
+
+def validate_scenario(tasks, label, mocks, fail, expect=""):
+    m = dict(mocks, secrets_encryption_report={"health_problems": []}, secrets_encryption_preservation_problems="",
+             secrets_encryption_snapshot_gate={"age_seconds": 60})
+    return dict(name=f"validation: {label}", mocks=m, tasks=round_task + tasks, expect_fail=fail and VAL_ENF,
+                checks=[f"(secrets_encryption_expectation.enable_round_blocking | bool) == {bool(fail)}"],
+                extra_vars={"secrets_encryption_enforce": True, "secrets_encryption_expect": expect})
+
+
+for state, mocks, _ in ROUND_STATES:
+    add_sc(validate_scenario(validate_tasks, f"enforced validation fails {state}", mocks, True))
+add_sc(validate_scenario(validate_tasks, "enforced configured-disabled validation passes after the completed round", cl(IDENT, phase="enable"),
+                      False, "configured-disabled"))
+add_sc(validate_scenario(validate_tasks, "enforced validation fails after a completed round with a stale marker",
+                      cl(IDENT, phase="enable", events=STALE), True))
+
 decide = picks("restart", "Decide the restart")
 R = "secrets_encryption_restart_required | bool"
 plays.append(play("restart decision: idempotent when already restarted and the drop-in is unchanged",
@@ -1869,8 +2022,35 @@ mutants = [
     ("the post-round validation on every server's run", [("restart", "    - inventory_hostname == groups['servers'][-1]\n", "")],
      lambda b: round_scenario(b, "k3s01's run", "unavailable", False, host="k3s01", reads_status=False)),
 ]
+AFTER_S1 = cl(IDENT, NOT_YET, NOT_YET, phase="enable")
+mutants += [
+    ("the exclusive round lock disabled", [("gate", "not (se_round.active | bool) or se_round_restart | bool", "true or se_round_restart | bool")],
+     lambda b: lock_scenario(b, "after S1 readable: checkpoint snapshot", AFTER_S1, "snapshot", True)),
+    ("readable status counted as completion",
+     [("gate", "or (se_round.complete | bool and se_round.ledger_ok",
+       "or ((se_round.complete | bool or secrets_encryption_servers.values() | map(attribute='status') | selectattr('parsed') | list | length == 3)"
+       " and se_round.ledger_ok")],
+     lambda b: lock_scenario(b, "after S1 readable: rotation", AFTER_S1, "rotate-keys", True)),
+    ("the lock admitting drop-in removal",
+     [("gate", "se_round_restart: \"{{ secrets_encryption_phase == 'restart' and secrets_encryption_flag_state == 'present' }}\"",
+       "se_round_restart: \"{{ secrets_encryption_phase == 'restart' }}\"")],
+     lambda b: lock_scenario(b, "after S1 readable: drop-in removal", AFTER_S1, "restart", True, "absent")),
+    ("the lock trusting an inconsistent completed round",
+     [("gate", "se_round.complete | bool and se_round.ledger_ok | bool and se_round.checkpoint_ok | bool", "se_round.complete | bool")],
+     lambda b: lock_scenario(b, "complete with a stale marker: checkpoint snapshot", cl(IDENT, phase="enable", events=STALE), "snapshot", True)),
+    ("the lock lifted once the next server is the last one",
+     [("gate", "not (se_round.active | bool) or se_round_restart | bool",
+       "not (se_round.active | bool) or se_round_restart | bool or se_round.next == groups['servers'][-1]")],
+     lambda b: lock_scenario(b, "after S2 readable: checkpoint snapshot", cl(IDENT, IDENT, NOT_YET, phase="enable"), "snapshot", True)),
+]
 for label, edits, scenario in mutants:
     add(scenario(mutant_dir(edits)), invert=True, prefix=f"mutant killed: {label}: ")
+validate_mutant = copy.deepcopy(validate_tasks)
+validate_mutant[1]["ansible.builtin.assert"]["that"].remove("not secrets_encryption_expectation.enable_round_blocking | bool")
+validate_mutant[0]["ansible.builtin.set_fact"]["secrets_encryption_expectation"]["met"] = \
+    validate_mutant[0]["ansible.builtin.set_fact"]["secrets_encryption_expectation"]["met"].replace("not se_round_blocking | bool and (", "(", 1)
+add(validate_scenario(validate_mutant, "after S1 readable: enforced validation", AFTER_S1, True), invert=True,
+    prefix="mutant killed: validation without the round: ")
 
 # ---------------------------------------------------------------- drop-in idempotence
 dropin_copy = unroot(copy.deepcopy(task_files["dropin"]))

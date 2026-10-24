@@ -478,6 +478,7 @@ install-etcdctl-rehearsal.yml
 - the health, preservation and snapshot gates;
 - every phase decision, including the fixed restart order and confirmation replay;
 - the corrected step 1: the exact `enable` result before the marker, no status read afterwards, and the enable restart round. That round must be strictly ordered and not replayed, and requires a consistent marker, ledger and pre-enable checkpoint. It ends with a required `Disabled`/`start`/matching-hashes status before rotation;
+- the exclusive enable restart round. While it is incomplete, the next restart is the only phase admitted, even when status is readable and settled. Every other phase, including enforced validation, is refused until all three servers are durably verified after the converged status check. Inconsistent ledger, marker or checkpoint evidence fails closed;
 - mutation tests: each reintroduced defect must change the outcome of the regression test it targets;
 - state-directory and ledger link safety;
 - the etcdctl installer's check-before-install order;
@@ -485,7 +486,12 @@ install-etcdctl-rehearsal.yml
 - the canary lifecycle, with a stub k3s;
 - that no canary value, raw etcd record, hash-mismatch node name or protected path appears in the output.
 
-The required k3d rehearsal was attempted on 2026-10-23 and **did not pass**: it stopped at step 1. After `k3s secrets-encrypt enable`, `k3s secrets-encrypt status` failed on every server until restarts, which the encoded procedure did not allow for. The procedure has since been corrected and statically re-tested, but the corrected procedure has not been rehearsed. The k3d rehearsal, the three-VM rehearsal and the live procedure remain to be performed. See [secrets-encryption.md](secrets-encryption.md#k3d-rehearsal-record-2026-10-23).
+The required k3d rehearsal has **not passed**:
+
+- **2026-10-23:** stopped at step 1. After `k3s secrets-encrypt enable`, `k3s secrets-encrypt status` failed on every server until restarts, which the encoded procedure did not allow for.
+- **2026-10-24:** stopped after `k3s01`'s restart. Status then became readable and settled on every server, so a gate that relied on the unavailable status no longer blocked checkpoint p1 mid-round.
+
+Both findings are corrected and statically re-tested. Phase transitions are now gated by the durable state of the enable restart round, not by status readability. The latest correction has not been rehearsed. The k3d rehearsal, the three-VM rehearsal and the live procedure remain to be performed. See [secrets-encryption.md](secrets-encryption.md#k3d-rehearsal-record-2026-10-24).
 
 The recovery-tools role has not been run against a node. Downloading, checksum verification against the real archive, installation, the server's `age --version` result and idempotence on a real node remain to be shown by a separately approved live run. See [recovery-tools.md](recovery-tools.md).
 

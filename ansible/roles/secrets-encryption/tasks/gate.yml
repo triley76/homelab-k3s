@@ -21,6 +21,34 @@
     fail_msg: "Health gate failed: {{ secrets_encryption_report.health_problems }}"
     quiet: true
 
+# The enable restart round is exclusive. In the k3d rehearsal of 2026-10-24,
+# status became readable and settled on every server after S1 alone restarted,
+# so readable status is no evidence that the round is complete. While the enable
+# marker stands, the only phase allowed is the restart with the drop-in
+# requested (restart.yml then admits only the next server in the order), until
+# every server has a durable restart-verified record; the last server's record
+# is written only after the converged status check. Every other phase also
+# requires the round's ledger, pre-enable checkpoint and order evidence to be
+# consistent, so interrupted or inconsistent state fails closed.
+- name: Enforce the exclusive enable restart round
+  vars:
+    se_round: "{{ secrets_encryption_enable_round }}"
+    se_round_restart: "{{ secrets_encryption_phase == 'restart' and secrets_encryption_flag_state == 'present' }}"
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (se_round.active | bool) or se_round_restart | bool
+        or (se_round.complete | bool and se_round.ledger_ok | bool and se_round.checkpoint_ok | bool
+            and se_round.out_of_order == '')
+    fail_msg: >-
+      Phase {{ secrets_encryption_phase }} is refused: the enable restart round is
+      {{ 'complete but its ledger, pre-enable checkpoint or order evidence is inconsistent'
+         if se_round.complete | bool else 'incomplete (next: ' ~ (se_round.next or 'none') ~ ')' }}.
+      Until all three servers have restarted in order and the converged status has been validated,
+      only secrets-encryption-restart.yml for the next server may run. Readable status does not
+      complete the round.
+    quiet: true
+
 - name: Enforce snapshot and database preservation
   ansible.builtin.assert:
     that:

@@ -4,7 +4,7 @@
 
 The automation for enabling Kubernetes Secrets encryption at rest is **implemented and statically tested only**:
 
-- It has **not** passed a rehearsal. The required three-server k3d rehearsal was attempted on 2026-10-23 and **stopped at step 1** (see [k3d rehearsal record](#k3d-rehearsal-record-2026-10-23)). The encoded procedure has been corrected for what it showed, but the corrected procedure has not been rehearsed. The three-VM rehearsal has not run.
+- It has **not** passed a rehearsal. The required three-server k3d rehearsal was attempted on 2026-10-23 and **stopped at step 1** (see the [first k3d record](#k3d-rehearsal-record-2026-10-23)). On 2026-10-24 it was attempted again and **stopped after `k3s01`'s restart** (see the [second k3d record](#k3d-rehearsal-record-2026-10-24)). The encoded procedure has been corrected for both findings, but the latest correction has not been rehearsed. The three-VM rehearsal has not run.
 - It has **not** been run against the live cluster.
 - Nothing in this repository has changed the live cluster's encryption state, which remains disabled.
 - [`site.yml`](../ansible/site.yml) does not run any of it.
@@ -113,7 +113,18 @@ The k3d rehearsal showed that `k3s secrets-encrypt status` fails on every server
   - the servers that reached the checkpoint are exactly a prefix of the order `k3s01`, `k3s02`, `k3s03`, and no later server shows a restart, a drop-in, a drop-in change or a verified restart since `enable`;
   - the target is the next server in that order. A server that already passed is refused (no replayed restart), and so is any server after the next one (no skipped or out-of-order restart).
 - **What it tolerates.** Only a status result that failed, printed nothing on standard output and reported exactly the observed server error (`Internal error occurred: secret-encrypt error ID <n>`). That result is recorded as `unavailable`. It is never parsed, and it is never treated as evidence of health or of the encryption state. Every other part of the gate is unchanged: service, version, local `/readyz` and `/readyz/etcd`, node readiness and pressure, etcd members, workloads, Chrony, swap, free space, state-directory safety, preservation and snapshot freshness. A status that does parse must still be settled, and may not report `Enabled`.
-- **How it ends.** In the run that restarts `k3s03`, after its post-restart gate, status must become readable on every server and parse as `Disabled`, stage `start`, with matching hashes. It is polled for up to `secrets_encryption_ready_retries` × `secrets_encryption_ready_delay_seconds`. Only then is `k3s03` recorded as verified. If that check fails, the round stays incomplete: `k3s03` can be re-run, and checkpoint p1, rotation and every other phase stay refused, because outside the round an unparsed status fails the gate.
+- **The round is exclusive.** Status availability is independent of the round's progress. In the k3d rehearsal of 2026-10-24 (see [the 2026-10-24 record](#k3d-rehearsal-record-2026-10-24)), status became readable on every server after `k3s01` alone had restarted, and reported `Disabled`, stage `start` and matching hashes while `k3s02` and `k3s03` still ran without the drop-in. Phase transitions are therefore gated by the **durable round state**, never by status readability. While the marker is `enable` and the round is incomplete, the gate refuses every phase except `secrets-encryption-restart.yml` with the drop-in requested, which then admits only the next server in the order. That includes:
+  - snapshots and checkpoints after p0;
+  - canary create, verify and cleanup;
+  - enforced validation (`validate-secrets-encryption.yml -e secrets_encryption_enforce=true`, which reports `enable_round_blocking: true`);
+  - rotation, disable and the rollback re-encryption;
+  - drop-in removal (`flag_state=absent`);
+  - a repeated `enable`;
+  - the rehearsal-only etcdctl installation.
+
+  A readable status during the round is parsed and checked like any other: it must be settled and may not report `Enabled`. It does not count towards completion.
+- **How it ends.** In the run that restarts `k3s03`, after its post-restart gate, status must be readable on every server and parse as `Disabled`, stage `start`, with matching hashes. It is polled for up to `secrets_encryption_ready_retries` × `secrets_encryption_ready_delay_seconds`. Only then is `k3s03` recorded as verified. The round is complete when all three servers have a durable `restart-verified` record after the `enable` marker, in order. If the convergence check fails, the round stays incomplete: `k3s03` can be re-run, and every other phase stays refused.
+- **After completion.** Checkpoint p1, rotation and the other phases become eligible under their normal prerequisites. While the marker is still `enable`, they also require the round's ledger, pre-enable checkpoint and order evidence to be consistent. Interrupted or inconsistent evidence fails closed, for example a ledger that records `rotate-keys` while the marker still says `enable` because a rotation stopped before recording its change. Such a state needs manual investigation; the automation offers no way forward from it.
 - **No option.** The exception is computed from recorded state. There is no variable that turns it on, and the guard refuses any attempt to inject the round, the parsed status or the gathered server state as extra variables.
 
 ## Implementation
@@ -318,7 +329,7 @@ Every command needs a new confirmation naming its phase, its host and the curren
 - run `validate-secrets-encryption.yml` and `validate-time-sync.yml -e time_sync_enforce_acceptance=true`;
 - keep the LAN canary monitor running throughout.
 
-During the enable restart round (after `k3s01` and `k3s02` in step 2), `validate-secrets-encryption.yml` reports every server's status as not parsed, with `unavailable: true`. That is the expected state, not a pass. Do not run it with `secrets_encryption_enforce=true` until the `k3s03` restart has completed.
+During the enable restart round, `validate-secrets-encryption.yml` reports `enable_round_blocking: true`, and with `secrets_encryption_enforce=true` it fails, until the `k3s03` restart has completed with the converged status. The status it reports during the round may be unavailable (`unavailable: true`) or already readable. Neither means the round is complete.
 
 ```bash
 E="-e secrets_encryption_environment=live"
@@ -453,7 +464,27 @@ A disposable three-server k3d cluster (k3d v5.9.0, Docker 29.1.3 under WSL2, ima
 - In the `rancher/k3s` image, `k3s kubectl …` fails (`unknown command "kubectl" for "kubectl"`). The image's `kubectl` works. This does not apply to the VM rehearsal or the live servers, where the playbooks call `k3s kubectl`.
 - A WSL2 host stops the distribution, Docker and every k3d server when no WSL session is open, and clears `/tmp`. A first attempt on 2026-10-23 was discarded before step 1 for that reason. The rehearsal host needs a session kept open for the whole run.
 
-**Still unanswered, because the run stopped at step 1:** whether status becomes readable after the first restart round (and after which server), and what it shows then (rehearsal questions 1 and 3); questions 2 and 4 to 12, apart from the partial observations above on 9 (the no-configuration status text), 10 (the plaintext controls) and 11 (one CLI save on S1 created one file on S1 only).
+**Still unanswered after this run, because it stopped at step 1** (see the 2026-10-24 record for what was observed later): whether status becomes readable after the first restart round (and after which server), and what it shows then (rehearsal questions 1 and 3); questions 2 and 4 to 12, apart from the partial observations above on 9 (the no-configuration status text), 10 (the plaintext controls) and 11 (one CLI save on S1 created one file on S1 only).
+
+### k3d rehearsal record (2026-10-24)
+
+A fresh disposable three-server k3d cluster at `rancher/k3s:v1.36.4-k3s1` (k3d v5.9.0, Docker 29.1.3 under WSL2), driven from the pushed commit `ccfaf34`, which already contained the step 1 correction. The run **stopped after `k3s01`'s restart** on a failed acceptance check. The rehearsal has still **not** passed. The cluster was deleted afterwards. An earlier attempt the same day stopped at the same point on a defect in the rehearsal driver's restart-counter comparison. Docker events showed only the planned restart. That attempt was discarded and the driver fixed.
+
+**Observed:**
+
+- **Baseline, canary controls and p0:** as on 2026-10-23. p0 created exactly one file, on S1 only.
+- **Step 1:** `enable` exited 0 with exactly `secrets-encryption enabled`. Status then failed on all three servers with the narrowly defined `unavailable` result.
+- **The corrected transition:** the restart phase tolerated the unavailable status, with `k3s01` as the next server, a consistent ledger and the pre-enable checkpoint present. The snapshot, rotate-keys, validation and canary-verify gates refused it, as did drop-in removal and an S2 or S3 restart before S1.
+- **`k3s01`'s restart with the drop-in:** ready in about 20 seconds, with no unplanned restart. The post-restart gate passed and the restart was verified.
+- **After `k3s01` alone:** `k3s secrets-encrypt status` became readable on **all three** servers and reported `Disabled`, stage `start` and **matching hashes**, while `k3s02` and `k3s03` had not restarted and carried no drop-in. A replay of `k3s01` and an S3 restart before S2 were still refused. But the snapshot gate, which relied on the unavailable status to refuse, **passed**: checkpoint p1 was not blocked mid-round. That was the failed check. Rotation stayed blocked by its own prerequisites (every server verified, with the drop-in).
+
+**Corrected in the encoded procedure** (statically tested only, not yet rehearsed): the [enable restart round](#between-enable-and-the-first-restart-round) is exclusive. The gate refuses every phase other than the next restart until all three servers have durable `restart-verified` records, and status readability never counts as completion. The validation playbook reports and enforces the same rule.
+
+**Still unanswered:**
+
+- what status shows after `k3s02` and `k3s03`, and whether hashes keep matching;
+- every later step: rotation, re-encryption, the encrypted canary checks, the rollback (R1–R3), drop-in removal and snapshot restore;
+- rehearsal questions 2 and 4 to 12, apart from the partial observations on 9, 10 and 11.
 
 ### Three-VM Ubuntu (after k3d)
 
@@ -466,7 +497,7 @@ Three disposable VMs built with this repository's Packer image and playbooks, wi
 
 ### Rehearsal questions
 
-1. Does `k3s secrets-encrypt enable` work on an existing `v1.36.4+k3s1` cluster without encryption configuration? What does `status` show after it, and after the first restart of each server? *Partly observed:* `enable` exits 0 with the exact documented output, and `status` then fails on every server until restarts. What status shows after each restart is still open.
+1. Does `k3s secrets-encrypt enable` work on an existing `v1.36.4+k3s1` cluster without encryption configuration? What does `status` show after it, and after the first restart of each server? *Partly observed:* `enable` exits 0 with the exact documented output. `status` then fails on every server until `k3s01` restarts with the drop-in. After that single restart it is readable on every server as `Disabled`, `start`, with matching hashes. What it shows after `k3s02` and `k3s03` is still open.
 2. Does `secretbox` as the configured provider work with the existing-cluster path (does `rotate-keys` generate an `XSalsa20-POLY1305` key)?
 3. Does the order of the "restart all servers" steps matter, and does a peer report matching hashes only after its own restart?
 4. Does `rotate-keys` finish within the CLI's 90-second timeout for this cluster's Secret count? If not, does the server finish on its own, as the polling assumes?
@@ -528,6 +559,13 @@ The test contacts no node, API, etcd or AWS, and downloads nothing. It runs in s
 - status parsing, including fail-closed cases and the narrow `unavailable` result;
 - the health gate, with every failure class;
 - the enable restart round: tolerated only in order, in the restart phase, with the marker, ledger and pre-enable checkpoint consistent; refused for a stale marker, a missing ledger entry or checkpoint, a skipped, out-of-order, partial or replayed restart, another phase, any other status failure, and after the round has completed;
+- the exclusive enable restart round:
+  - before S1 with an unavailable status, after S1 or S2 with a readable and settled status, after S3's restart before its verified record, and after an interrupted restart, only the next server's restart passes;
+  - every other phase is refused: snapshots, canaries, rotation, re-encryption, disable, drop-in removal, a repeated `enable`, the etcdctl installation, and enforced validation;
+  - replayed, skipped and out-of-order restarts stay refused;
+  - readable converged status without the durable verified records is not completion;
+  - after completion the next phases pass the round gate, and rotation meets its prerequisites;
+  - a stale marker, an inconsistent or malformed ledger, a missing pre-enable checkpoint or an interrupted rotation fail closed;
 - `enable` with a stub k3s: the exact result is mandatory, a failed or unexpected result writes no marker, and no status is read afterwards;
 - the post-round validation with a stub k3s: `Disabled`, `start` and matching hashes pass; an unavailable status, a mismatch, `Enabled` or no configuration fail, and the restart is not recorded as verified;
 - preservation of protected artifacts and freshness;
@@ -542,7 +580,7 @@ The test contacts no node, API, etcd or AWS, and downloads nothing. It runs in s
 - the raw verification pipeline, with a stub etcdctl;
 - the canary lifecycle, with a stub k3s: success, failure and interruption.
 
-**6. Mutation tests.** Each mutant is a copy of the role's task files with one change that reintroduces a defect: the post-enable status assertion, a relaxed or removed enable-result check, the marker written before the check, the tolerance without the round, the round without its order, ledger or checkpoint conditions, the target check removed, or the post-round validation removed. Each mutant is run against the same scenario as the regression test it targets, and must change the outcome; a surviving mutant fails the suite. The structure checks are also re-applied to mutated copies and must detect them.
+**6. Mutation tests.** Each mutant is a copy of the role's task files with one change that reintroduces a defect: the post-enable status assertion, a relaxed or removed enable-result check, the marker written before the check, the tolerance without the round, the round without its order, ledger or checkpoint conditions, the target check removed, the post-round validation removed, the exclusive round lock removed or weakened (readable status counted as completion, drop-in removal admitted, an inconsistent completed round trusted, the lock lifted early), or validation without the round. Each mutant is run against the same scenario as the regression test it targets, and must change the outcome; a surviving mutant fails the suite. The structure checks are also re-applied to mutated copies and must detect them.
 
 Finally, the complete output is scanned for every canary value, raw etcd record, hash-mismatch node name and protected path.
 
