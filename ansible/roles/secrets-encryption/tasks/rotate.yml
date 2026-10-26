@@ -11,6 +11,13 @@
 # After a rotation the state is Enabled/reencrypt_finished, from which only an
 # additional rotation could start, and that is refused unless a reason is
 # recorded and separately approved for this confirmation.
+#
+# The enabling rotation is the point of no in-place return. With secretbox, K3s
+# v1.36.4+k3s1 offers no way back to plaintext (reencrypt is rejected for
+# secretbox; rotate-keys always writes an encrypting configuration), so the only
+# rollback afterwards is restoring the pre-enable snapshot (checkpoint p0). The
+# enabling rotation therefore also requires that snapshot to exist on the first
+# server with a consistent ledger. rotate-keys is never a plaintext rollback.
 - name: Decide the rotation purpose
   vars:
     se_all: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | list }}"
@@ -36,10 +43,14 @@
       - se_all | selectattr('checkpoint_reached', 'equalto', false) | list | length == 0
       - se_all | selectattr('dropin_present', 'equalto', false) | list | length == 0
       - se_all | map(attribute='status') | selectattr('hashes_match', 'equalto', false) | list | length == 0
+      - >-
+        secrets_encryption_rotation_purpose != 'enabling'
+        or (secrets_encryption_enable_round.checkpoint_ok | bool and secrets_encryption_enable_round.ledger_ok | bool)
     fail_msg: >-
       Rotation refused. It requires: after enable, every server restarted in order with the
       drop-in, its post-restart gate passed, reporting Disabled at stage start with matching
-      hashes; or, for an additional rotation, every server Enabled at reencrypt_finished and
+      hashes, and the pre-enable snapshot (checkpoint p0, the only rollback after activation)
+      present on the first server with a consistent ledger; or, for an additional rotation, every server Enabled at reencrypt_finished and
       verified after the last rotation, a recorded secrets_encryption_additional_rotation_reason,
       and -e secrets_encryption_additional_rotation_approval=additional-rotation:<this confirmation's time>.
       Purpose: {{ secrets_encryption_rotation_purpose }}; state: {{ secrets_encryption_report.encryption }}.

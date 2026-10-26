@@ -37,6 +37,24 @@
       {{ secrets_encryption_report.encryption }}; last change {{ secrets_encryption_marker.phase }}.
     quiet: true
 
+# p0 (docs/secrets-encryption.md, "The pre-enable checkpoint (p0)"): the newest
+# Stage 3 snapshot on the first server must be a p0-pre-enable snapshot whose
+# checkpoint record (name, size, SHA-256, token presence) matches it, and the
+# snapshot must be the last accepted invocation before this one. Its freshness
+# was already enforced by the gate.
+- name: Require the recorded pre-enable checkpoint
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_enable_decision == 'done' or secrets_encryption_p0.ok | bool
+    fail_msg: >-
+      Enable requires the pre-enable checkpoint: take a fresh snapshot with
+      secrets_encryption_snapshot_checkpoint={{ secrets_encryption_p0_checkpoint }} immediately before
+      enable. Newest Stage 3 snapshot: {{ secrets_encryption_p0.newest | default('none', true) }};
+      p0 label {{ secrets_encryption_p0.newest_is_p0 }}, recorded {{ secrets_encryption_p0.newest_recorded }},
+      last invocation was the snapshot {{ secrets_encryption_p0.last_event_snapshot }},
+      malformed records {{ secrets_encryption_p0.records_malformed }}.
+    quiet: true
+
 - name: Report that enable has already been applied
   ansible.builtin.debug:
     msg: "secrets-encrypt enable was already applied; nothing to do. Continue with the restarts."

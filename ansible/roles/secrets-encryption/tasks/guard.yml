@@ -158,13 +158,13 @@
   when: secrets_encryption_environment == 'live'
 
 # Paths that still depend on rehearsal answers fail closed in a live
-# environment until a reviewed change lists them as rehearsal-approved.
+# environment until a reviewed change lists them as rehearsal-approved. The only
+# such path is drop-in removal before activation. There is no in-place rollback
+# after activation (secretbox): disable and reencrypt are not phases at all, so
+# the first check above refuses them; the rollback is a snapshot restore.
 - name: Refuse procedure paths that are not yet rehearsal-approved
   vars:
-    se_path: >-
-      {{ 'flag-removal' if (secrets_encryption_phase == 'restart' and secrets_encryption_flag_state != 'present')
-      else secrets_encryption_phase if secrets_encryption_phase in ['disable', 'reencrypt-after-disable']
-      else '' }}
+    se_path: "{{ 'flag-removal' if (secrets_encryption_phase == 'restart' and secrets_encryption_flag_state != 'present') else '' }}"
   ansible.builtin.assert:
     that:
       - >-

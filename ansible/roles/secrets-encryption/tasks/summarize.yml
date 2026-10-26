@@ -136,6 +136,44 @@
       }}) }}
   loop: "{{ groups['servers'] }}"
 
+# Checkpoint records (snapshot.yml) and p0, the pre-enable checkpoint that is
+# the only rollback after activation. Pure evaluation; metadata only (label,
+# file name, size, SHA-256, token presence). p0 is acceptable to enable only when
+# the newest Stage 3 snapshot on the first server is a p0 checkpoint with a
+# matching record (name and size), taken by the last accepted invocation.
+# Malformed records or ledger lines fail closed.
+- name: Summarize the checkpoint records and the pre-enable checkpoint
+  vars:
+    se_text: >-
+      {{ (secrets_encryption_checkpoints_probe.content | b64decode)
+      if secrets_encryption_checkpoints_probe.content is defined else '' }}
+    se_lines: "{{ se_text.splitlines() | map('trim') | reject('equalto', '') | list }}"
+    se_valid_re: '^[0-9]+ [a-z0-9]+(-[a-z0-9]+)* stage3-[A-Za-z0-9._-]+ [0-9]+ [0-9a-f]{64} token=present$'
+    se_valid: "{{ se_lines | select('match', se_valid_re) | list }}"
+    se_p0_records: "{{ se_valid | select('match', '^[0-9]+ ' ~ (secrets_encryption_p0_checkpoint | regex_escape) ~ ' ') | list }}"
+    se_snaps: "{{ secrets_encryption_storage[groups['servers'][0]].stage3_snapshots | sort(attribute='mtime') }}"
+    se_newest: "{{ (se_snaps | last) if se_snaps | length > 0 else {} }}"
+    se_newest_name: "{{ (se_newest.path | default('')) | basename }}"
+    se_newest_key: "{{ ' ' ~ se_newest_name ~ ' ' ~ (se_newest.size | default(-1) | int) ~ ' ' }}"
+    se_newest_records: "{{ se_p0_records | select('search', se_newest_key | regex_escape) | list }}"
+    se_malformed: "{{ se_lines | length != se_valid | length }}"
+    se_last_snapshot: "{{ secrets_encryption_ledger_events[-1:] == ['snapshot ' ~ groups['servers'][0]] }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_checkpoint_records: "{{ se_valid }}"
+    secrets_encryption_p0:
+      records_malformed: "{{ se_malformed | bool }}"
+      p0_records: "{{ se_p0_records }}"
+      newest: "{{ se_newest_name }}"
+      newest_is_p0: "{{ se_newest_name is match('^stage3-' ~ (secrets_encryption_p0_checkpoint | regex_escape) ~ '-') }}"
+      newest_recorded: "{{ se_newest_records | length == 1 }}"
+      # Immediately before enable: the last accepted invocation in the ledger is
+      # the snapshot on the first server, so nothing ran between p0 and enable.
+      last_event_snapshot: "{{ se_last_snapshot | bool }}"
+      ok: >-
+        {{ not se_malformed | bool and not secrets_encryption_ledger_malformed | bool
+        and se_newest_name is match('^stage3-' ~ (secrets_encryption_p0_checkpoint | regex_escape) ~ '-')
+        and se_newest_records | length == 1 and se_last_snapshot | bool }}
+
 # The first restart round after enable (docs/secrets-encryption.md, "Between
 # enable and the first restart round"). Pure evaluation from recorded state;
 # no variable switches it on. The round is the prefix of servers, in inventory
@@ -143,7 +181,7 @@
 # that may restart; a later server with a restart, a drop-in, a drop-in change
 # or a verification after enable is out of order. The ledger must show a
 # snapshot and then enable on the first server, and no later procedure change
-# (a stale marker otherwise); a Stage 3 snapshot older than the marker must
+# (a stale marker otherwise); a recorded p0 snapshot older than the marker must
 # exist on the first server. Only the restart phase with the drop-in requested
 # may then tolerate an unavailable status (evaluate.yml), and only until every
 # server has reached the checkpoint.
@@ -181,9 +219,17 @@
       and se_enable_event in se_events and se_snapshot_event in se_events
       and se_events.index(se_snapshot_event) < se_events.index(se_enable_event)
       and se_events | select('match', '^(rotate-keys|disable|reencrypt-after-disable) ') | list | length == 0 }}
+    # A recorded p0 (name and size match its checkpoint record) older than the marker.
     se_checkpoint_ok: >-
-      {{ secrets_encryption_storage[se_first].stage3_snapshots | map(attribute='mtime') | map('int')
-      | select('gt', 0) | select('lt', secrets_encryption_marker.epoch | int) | list | length > 0 }}
+      {%- set ns = namespace(ok=false) -%}
+      {%- for f in secrets_encryption_storage[se_first].stage3_snapshots -%}
+      {%- set key = ' ' ~ (f.path | basename) ~ ' ' ~ (f.size | int) ~ ' ' -%}
+      {%- if f.mtime | int > 0 and f.mtime | int < secrets_encryption_marker.epoch | int
+             and secrets_encryption_p0.p0_records | select('search', key | regex_escape) | list | length > 0 -%}
+      {%- set ns.ok = true -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.ok and not secrets_encryption_p0.records_malformed | bool }}
     se_complete: "{{ se_prefix | int == se_servers | length }}"
   ansible.builtin.set_fact:
     secrets_encryption_enable_round:

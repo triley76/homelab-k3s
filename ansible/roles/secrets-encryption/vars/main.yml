@@ -33,6 +33,16 @@ secrets_encryption_db_dir: /var/lib/rancher/k3s/server/db
 secrets_encryption_scheduled_snapshot_pattern: '^etcd-snapshot-'
 secrets_encryption_snapshot_name_pattern: '^stage3-[a-z0-9]+(-[a-z0-9]+)*$'
 
+# p0, the pre-enable checkpoint and the only rollback after activation: the
+# snapshot taken with this checkpoint label, recorded (name, size, SHA-256) in
+# the checkpoints state file, and the newest Stage 3 snapshot when enable runs.
+secrets_encryption_p0_checkpoint: p0-pre-enable
+
+# The server token file. A snapshot restores only with the token in use when it
+# was taken, so every checkpoint confirms that this file exists, by lstat only:
+# its content is never read, displayed, copied or hashed.
+secrets_encryption_token_file: /var/lib/rancher/k3s/server/token
+
 # The live cluster. Rehearsal inventories must not use these names.
 secrets_encryption_live_hosts:
   - k3s01
@@ -59,8 +69,21 @@ secrets_encryption_settled_stages:
 secrets_encryption_change_phases:
   - enable
   - rotate-keys
+
+# Rollback model (docs/secrets-encryption.md, "Rollback"). With the pinned
+# secretbox provider, K3s v1.36.4+k3s1 rejects `secrets-encrypt reencrypt` ("does
+# not support secretbox key type", pkg/server/handlers/secrets-encrypt.go;
+# observed in the k3d rehearsal of 2026-10-26), and `rotate-keys` always writes
+# an encrypting configuration, so neither converts Secrets back to plaintext.
+# There is therefore no in-place rollback after activation (rotate-keys): the
+# rollback boundary is the verified pre-enable snapshot (checkpoint p0), restored
+# with K3s's embedded-etcd restore procedure, which this automation does not run.
+# These secrets-encrypt subcommands are never run by any phase:
+secrets_encryption_unsupported_rollback_commands:
   - disable
-  - reencrypt-after-disable
+  - reencrypt
+  - prepare
+  - rotate
 
 # Pinned etcdctl for raw verification of the canary records (D2), from the etcd
 # release that K3s v1.36.4+k3s1 embeds (go.etcd.io/etcd v3.6.14). Installed only
@@ -117,6 +140,8 @@ secrets_encryption_gathered_facts:
   - secrets_encryption_now_epoch
   - secrets_encryption_health_problems
   - secrets_encryption_report
+  - secrets_encryption_checkpoint_records
+  - secrets_encryption_p0
 
 # Owner required of the state directory and its files (root on every server).
 secrets_encryption_state_owner_uid: 0
@@ -126,6 +151,7 @@ secrets_encryption_state_files:
   - restart-verified
   - preservation-baseline
   - confirmations
+  - checkpoints
 
 # The mutating phases and their confirmation. Every invocation needs
 # -e secrets_encryption_confirm=<phase>:<target host>:<UTC time YYYYMMDDTHHMMSSZ>,
@@ -139,8 +165,6 @@ secrets_encryption_mutating_phases:
   - canary-create-control
   - canary-verify
   - canary-cleanup
-  - disable
-  - reencrypt-after-disable
   - install-etcdctl
 secrets_encryption_confirm_max_age_minutes: 30
 
@@ -153,7 +177,7 @@ secrets_encryption_rehearsal_only_phases:
 # "Rehearsal questions"). In a live environment each one fails with "not yet
 # rehearsal-approved" until a reviewed change lists it here, citing the
 # rehearsal record. Rehearsal environments may run them to produce that record.
-# Allowed entries: disable, reencrypt-after-disable, flag-removal.
+# Allowed entry: flag-removal (drop-in removal before activation only).
 secrets_encryption_rehearsal_approved_paths: []
 
 # Gate defaults that a live environment may not relax: the guard requires their

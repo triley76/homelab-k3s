@@ -71,8 +71,6 @@ MUTATING = {
     "secrets-encryption-restart": ("restart", "single", "gate.yml", "restart.yml"),
     "secrets-encryption-rotate": ("rotate-keys", "first", "gate.yml", "rotate.yml"),
     "secrets-encryption-canary": ("canary-{{ secrets_encryption_canary_action | default('unset') }}", "first", "gate.yml", "canary.yml"),
-    "secrets-encryption-disable": ("disable", "first", "gate.yml", "disable.yml"),
-    "secrets-encryption-reencrypt": ("reencrypt-after-disable", "first", "gate.yml", "reencrypt.yml"),
     "install-etcdctl-rehearsal": ("install-etcdctl", "first", "gate.yml", "etcdctl.yml"),
 }
 playbooks = {name: load(ans / f"{name}.yml") for name in MUTATING}
@@ -192,9 +190,9 @@ for name, (phase, target, gate, action) in MUTATING.items():
 gate_vars = {n: playbooks[n][0]["tasks"][0].get("vars", {}) for n in MUTATING}
 require("snapshot-etcd: the only phase without the snapshot freshness gate",
         [n for n, v in gate_vars.items() if v.get("secrets_encryption_require_snapshot") is False] == ["snapshot-etcd"])
-require("rotate, disable and reencrypt: snapshot must be newer than the last change",
+require("rotate: snapshot must be newer than the last change",
         sorted(n for n, v in gate_vars.items() if v.get("secrets_encryption_snapshot_after_change") is True)
-        == ["secrets-encryption-disable", "secrets-encryption-reencrypt", "secrets-encryption-rotate"])
+        == ["secrets-encryption-rotate"])
 require("guard.yml: only controller-side assert and set_fact tasks",
         {module_of(t) for t in task_files["guard"]} == {"ansible.builtin.assert", "ansible.builtin.set_fact"}
         and not any("delegate_to" in t or "become" in t for t in task_files["guard"]))
@@ -285,8 +283,7 @@ for f, a in argvs:
     if a[:2] == [k3s, "secrets-encrypt"]:
         se_sub.setdefault(" ".join(a[2:]), set()).add(f)
 require("role: secrets-encrypt subcommands only where documented",
-        se_sub == {"status": {"gather", "restart", "rotate", "reencrypt"}, "enable": {"enable"}, "rotate-keys": {"rotate"},
-                   "disable": {"disable"}, "reencrypt --force --skip": {"reencrypt"}})
+        se_sub == {"status": {"gather", "restart", "rotate"}, "enable": {"enable"}, "rotate-keys": {"rotate"}})
 require("role: etcd-snapshot only as 'save --name', only in snapshot.yml",
         [(f, a[2:4]) for f, a in argvs if a[:2] == [k3s, "etcd-snapshot"]] == [("snapshot", ["save", "--name"])])
 kubectl_writes = sorted({(f, a[2], a[3]) for f, a in argvs if a[:2] == [k3s, "kubectl"] and a[2] in ("create", "delete", "label", "apply", "replace", "patch", "edit")})
@@ -398,7 +395,7 @@ def needs_no_log(t):
 
 
 require("no_log: every status read, canary value, readback and raw etcd query hides its output",
-        len([1 for _, t in all_role_tasks if needs_no_log(t)]) >= 10 and all(t.get("no_log") is True for _, t in all_role_tasks if needs_no_log(t)))
+        len([1 for _, t in all_role_tasks if needs_no_log(t)]) == 9 and all(t.get("no_log") is True for _, t in all_role_tasks if needs_no_log(t)))
 RAW_REGISTERS = ["secrets_encryption_status_probe", "secrets_encryption_round_status", "secrets_encryption_rotate_wait",
                  "secrets_encryption_reencrypt_wait", "secrets_encryption_raw_probe", "secrets_encryption_readback_probe",
                  "secrets_encryption_status_input", "secrets_encryption_protected_probe"]
@@ -439,11 +436,272 @@ require("restart.yml: preconditions, order, enable round, drop-in, decision, res
                              "Wait for a readable status on every server after the enable restart round",
                              "Require Disabled, start and matching hashes on every server after the enable restart round",
                              "Record the passed post-restart gate"]))
-require("disable.yml and reencrypt.yml: preconditions before the command; marked not yet rehearsal-approved",
-        order_ok("disable", ["Enforce the disable preconditions", "Run secrets-encrypt disable on the first server", "Record the disable change"])
-        and order_ok("reencrypt", ["Enforce the rollback re-encryption preconditions",
-                                   "Run secrets-encrypt reencrypt --force --skip on the first server", "Record the rollback re-encryption change"])
-        and "Not yet rehearsal-approved" in task_text["disable"] and "Not yet rehearsal-approved" in task_text["reencrypt"])
+# Rollback model: secretbox has no in-place way back to plaintext on K3s v1.36.4+k3s1
+# (reencrypt rejected for secretbox; rotate-keys always encrypts). After
+# activation the only rollback is restoring the pre-enable snapshot (p0).
+ROLLBACK_DOC = (repo / "docs/secrets-encryption.md").read_text()
+README_TEXT = (repo / "README.md").read_text()
+VALIDATION_DOC = (repo / "docs/validation.md").read_text()
+ARCH_DOC = (repo / "docs/architecture.md").read_text()
+PLAYBOOK_NAMES = sorted(x.stem for x in ans.glob("*.yml"))
+P0_RULE = ("secrets_encryption_rotation_purpose != 'enabling' or (secrets_encryption_enable_round.checkpoint_ok | bool "
+           "and secrets_encryption_enable_round.ledger_ok | bool)")
+
+
+def secrets_encrypt_subcommands(task_map):
+    out = set()
+    for ts in task_map.values():
+        for t in walk(ts):
+            a = t.get("ansible.builtin.command", {}).get("argv", [])
+            if a[1:2] == ["secrets-encrypt"] and len(a) > 2:
+                out.add(a[2])
+    return out
+
+
+def no_inplace_rollback(task_map, texts, playbook_names, vars_):
+    banned = set(vars_.get("secrets_encryption_unsupported_rollback_commands", []))
+    code = "\n".join(line for text in texts.values() for line in text.splitlines() if not line.lstrip().startswith("#"))
+    return (banned == {"disable", "reencrypt", "prepare", "rotate"}
+            and not secrets_encrypt_subcommands(task_map) & banned
+            and not re.search(r"secrets-encrypt,?\s+(disable|reencrypt|prepare|rotate)\b(?!-)", code)
+            and not {"disable", "reencrypt-after-disable"} & set(vars_["secrets_encryption_mutating_phases"])
+            and not {"disable", "reencrypt-after-disable"} & set(vars_["secrets_encryption_change_phases"])
+            and not any("disable" in n or "reencrypt" in n for n in playbook_names)
+            and "disable" not in task_map and "reencrypt" not in task_map)
+
+
+def flag_removal_preactivation_only(restart_text, guard_text):
+    return ("or (se_encryptions == ['disabled'] and secrets_encryption_marker.phase == 'enable')" in restart_text
+            and "reencrypt-after-disable" not in restart_text
+            and ("se_path: \"{{ 'flag-removal' if (secrets_encryption_phase == 'restart' and secrets_encryption_flag_state != 'present') "
+                 "else '' }}\"") in guard_text)
+
+
+def rotation_requires_p0(rotate_tasks):
+    t = next((t for t in rotate_tasks if t.get("name") == "Enforce the rotation preconditions"), {})
+    return P0_RULE in [" ".join(x.split()) for x in t.get("ansible.builtin.assert", {}).get("that", [])]
+
+
+def rotate_never_plaintext(rotate_tasks):
+    req = next((t for t in walk(rotate_tasks) if t.get("name") == "Require encryption with the approved provider"), {})
+    that = req.get("ansible.builtin.assert", {}).get("that", [])
+    dec = json.dumps(next((t for t in rotate_tasks if t.get("name") == "Decide the rotation purpose"), {}))
+    return ("secrets_encryption_parsed.encryption == 'enabled'" in that
+            and "secrets_encryption_parsed.active_key_type == secrets_encryption_expected_key_type" in that
+            and "'disable'" not in dec and "reencrypt-after-disable" not in dec and "'disabled-no-config'" not in dec
+            and "secrets_encryption_marker.phase == 'enable'" in dec and "secrets_encryption_marker.phase == 'rotate-keys'" in dec)
+
+
+def docs_rollback_consistent(doc, readme, validation):
+    return (all(x in doc for x in ("reencrypt does not support secretbox key type, use rotate-keys instead", "## Rollback",
+                                   "pre-enable snapshot", "--cluster-reset-restore-path", "is not supported",
+                                   "rotate-keys` cannot convert", "Disabled-but-not-rewritten"))
+            and not re.search(r"\(\.\./ansible/secrets-encryption-(disable|reencrypt)\.yml\)", doc)
+            and not re.search(r"(ansible-playbook\s+)?secrets-encryption-(disable|reencrypt)\.yml", doc + readme + validation)
+            and "snapshot restore" in validation.lower() and "snapshot restore" in readme.lower())
+
+
+P0_OK_TERMS = ("not se_malformed | bool and not secrets_encryption_ledger_malformed | bool",
+               "se_newest_name is match('^stage3-' ~ (secrets_encryption_p0_checkpoint | regex_escape) ~ '-')",
+               "se_newest_records | length == 1 and se_last_snapshot | bool")
+P0_RECORD_LINE = ("{{ secrets_encryption_snapshot_stat.stat.mtime | int }} {{ secrets_encryption_snapshot_checkpoint }} "
+                  "{{ secrets_encryption_snapshot_new[0] }} {{ secrets_encryption_snapshot_stat.stat.size }} "
+                  "{{ secrets_encryption_snapshot_stat.stat.checksum }} token=present")
+
+
+def token_stat_only(task_map):
+    """The server token file is only ever lstat'ed: no checksum, MIME type, attributes, content or other use."""
+    uses = [(f, x) for f, ts in task_map.items() for x in walk(ts) if "secrets_encryption_token_file" in json.dumps(x)]
+    if len(uses) != 1 or uses[0][0] != "snapshot":
+        return False
+    st = uses[0][1].get("ansible.builtin.stat", {})
+    reg_uses = [x for _, ts in task_map.items() for x in walk(ts) if "secrets_encryption_token_stat" in json.dumps(x)]
+    return (set(uses[0][1]) == {"name", "ansible.builtin.stat", "register"} and st.get("path") == "{{ secrets_encryption_token_file }}"
+            and st.get("get_checksum") is False and st.get("get_mime") is False and st.get("get_attributes") is False
+            and st.get("follow") is False and "checksum_algorithm" not in st
+            and [x.get("name") for x in reg_uses] == ["Inspect the server token file without reading it",
+                                                      "Require the server token file for a restorable checkpoint"]
+            and "ansible.builtin.assert" in reg_uses[1])
+
+
+def checkpoint_record_fixed(snapshot_tasks, summarize_text):
+    names = [x.get("name") for x in snapshot_tasks]
+    rec = next((x for x in snapshot_tasks if x.get("name") == "Record the checkpoint metadata"), {}).get("ansible.builtin.lineinfile", {})
+    return (" ".join(str(rec.get("line", "")).split()) == P0_RECORD_LINE
+            and rec.get("path") == "{{ secrets_encryption_state_dir }}/checkpoints" and rec.get("mode") == "0600"
+            and names.index("Inspect the server token file without reading it") < names.index("Take the on-demand etcd snapshot")
+            < names.index("Require a non-empty regular snapshot file") < names.index("Record the checkpoint metadata")
+            and "[0-9a-f]{64} token=present$" in summarize_text)
+
+
+def enable_requires_p0(enable_tasks, summarize_text):
+    names = [x.get("name") for x in enable_tasks]
+    req = next((x for x in enable_tasks if x.get("name") == "Require the recorded pre-enable checkpoint"), {})
+    run = next((i for i, x in enumerate(enable_tasks) if "secrets-encrypt enable" in json.dumps(x) or "block" in x), len(enable_tasks))
+    flat = " ".join(summarize_text.split())
+    return ("Require the recorded pre-enable checkpoint" in names and names.index("Require the recorded pre-enable checkpoint") < run
+            and req.get("ansible.builtin.assert", {}).get("that") == ["secrets_encryption_enable_decision == 'done' or secrets_encryption_p0.ok | bool"]
+            and all(x in flat for x in P0_OK_TERMS)
+            and "se_last_snapshot: \"{{ secrets_encryption_ledger_events[-1:] == ['snapshot ' ~ groups['servers'][0]] }}\"" in summarize_text)
+
+
+def round_requires_recorded_p0(summarize_tasks):
+    rt = next((x for x in summarize_tasks if x.get("name") == "Summarize the enable restart round"), {})
+    ck = " ".join(str(rt.get("vars", {}).get("se_checkpoint_ok", "")).split())
+    return ("secrets_encryption_p0.p0_records | select('search', key | regex_escape) | list | length > 0" in ck
+            and "f.mtime | int < secrets_encryption_marker.epoch | int" in ck and "not secrets_encryption_p0.records_malformed | bool" in ck)
+
+
+def configured_disabled_preactivation(validate_text, parse_text):
+    flat = " ".join(validate_text.split())
+    return ("(secrets_encryption_expect == 'configured-disabled' and se_encryptions == ['disabled'] "
+            "and secrets_encryption_marker.phase == 'enable')" in flat and "      Disabled: disabled\n" in parse_text)
+
+
+RESTORE_DOC_PHRASES = (
+    "rolls back all Kubernetes and etcd state created or changed after p0, not only the encryption configuration",
+    "**Operator impact acknowledgment.**", "No future live restore starts without a written acknowledgment",
+    "**`disable` is not accepted or used.**", "**`Disabled` is still parsed and reported.**", "no supported mutating phase creates it",
+    "### The pre-enable checkpoint (p0)", "**Created immediately before `enable`.**", "**Verified and fresh.**",
+    "**Stored on the designated first server.**", "**Name and checksum recorded as metadata.**",
+    "**Matching server token availability confirmed, never read.**", "never read, displayed, copied or hashed",
+    "### Restore procedure (manual, separately approved)", "This automation does not run it.", "https://docs.k3s.io/cli/etcd-snapshot",
+    "**Stop K3s on every server:**", "`k3s server --cluster-reset --cluster-reset-restore-path=<p0 path>`", "**Start K3s on `k3s01` normally:**",
+    "**Rejoin `k3s02`, then `k3s03`:**", "**Rebuild a peer that does not rejoin.**",
+    "**All three servers return Ready.**", "**All three etcd endpoints are healthy.**", "**The pre-enable plaintext controls return byte-for-byte:**",
+    "**The post-enable Secret and ConfigMap canaries are absent.**", "**Encryption status returns to the original not-configured state:**",
+    "**The encryption drop-in is absent**", "**The container lifecycle contains only planned events:**",
+    "removes the cluster, its volumes, the kubeconfigs, the temporary worktree and every rehearsal process",
+    "A passing static test run is not completion.")
+
+
+def docs_restore_defined(doc, readme, validation):
+    """The restore impact, p0 definition, official sequence, acceptance criteria, and no claim that disable restores plaintext."""
+    live = doc[doc.find("## Live Rollout"):doc.find("### Stop conditions")]
+    order = [live.find(x) for x in ("secrets_encryption_canary_action=create-control", "secrets_encryption_snapshot_checkpoint=p0-pre-enable",
+                                    "secrets-encryption-enable.yml")]
+    return (all(x in doc for x in RESTORE_DOC_PHRASES) and -1 not in order and order == sorted(order)
+            and not re.search(r"leaves plaintext|successfully rewrites|disable[^.\n]{0,60}rewrites? [^.\n]{0,40}plaintext", doc + readme + validation)
+            and "is not Stage 3 completion" in validation and "is not completion" in readme)
+
+
+require("role: no phase runs secrets-encrypt disable, reencrypt, prepare or rotate, and no rollback phase or playbook exists",
+        no_inplace_rollback(task_files, task_text, PLAYBOOK_NAMES, role_vars))
+require("restart.yml and guard.yml: drop-in removal only before activation (marker enable); the only not-yet-approved path",
+        flag_removal_preactivation_only(task_text["restart"], task_text["guard"]))
+require("rotate.yml: the enabling rotation requires the pre-enable snapshot (the rollback boundary) and a consistent ledger",
+        rotation_requires_p0(task_files["rotate"]))
+require("rotate.yml: rotate-keys only after enable or a completed rotation, and always ends Enabled with secretbox (never a plaintext rollback)",
+        rotate_never_plaintext(task_files["rotate"]))
+require("docs: in-place conversion to plaintext documented as unsupported; rollback after activation is the pre-enable snapshot restore; no R1/R3 playbook named",
+        docs_rollback_consistent(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC))
+require("snapshot.yml: the server token file is only inspected by lstat (no checksum, MIME type, attributes or content)",
+        token_stat_only(task_files))
+require("snapshot.yml: token check before the save; the checkpoint record has the fixed metadata format and is parsed strictly",
+        checkpoint_record_fixed(task_files["snapshot"], task_text["summarize"]))
+require("enable.yml: enable requires the recorded p0 as the newest Stage 3 snapshot, taken by the last accepted invocation",
+        enable_requires_p0(task_files["enable"], task_text["summarize"]))
+require("summarize.yml: the enable round requires a recorded p0 (name and size match its record) older than the marker",
+        round_requires_recorded_p0(task_files["summarize"]))
+require("validate: configured-disabled requires the last change enable; the parser still maps Disabled for diagnosis",
+        configured_disabled_preactivation((ans / "validate-secrets-encryption.yml").read_text(), task_text["parse_status"]))
+def doc_section(doc, start, end):
+    a = doc.find(start)
+    b = doc.find(end, a + 1) if a >= 0 else -1
+    return doc[a:b] if a >= 0 and b > a else ""
+
+
+def in_order(text, phrases):
+    pos = [text.find(x) for x in phrases]
+    return -1 not in pos and pos == sorted(pos)
+
+
+REAL_RESTORE = ("### Restore procedure (manual, separately approved)", "#### Accepting the reset")
+K3D_RESTORE = ("### Restore in the k3d rehearsal (rehearsal tooling only)", "## Fresh Builds and Replacement Joins")
+RESET_ACCEPT = ("#### Accepting the reset", "#### Encryption files during a restore")
+ENC_FILES = ("#### Encryption files during a restore", "### Restore in the k3d rehearsal")
+
+
+def docs_restore_mechanism(doc):
+    """Real servers: explicit reset invocation, never config-file fields, never the k3d runner. The reset is accepted only
+    with exit 0, the ERROR-level documented message and the reset flag. Retained encryption files prove nothing. The k3d
+    rehearsal restore keeps S1's identity, refuses unsafe address handoffs and is documented as rehearsal tooling only."""
+    real, k3d = doc_section(doc, *REAL_RESTORE), doc_section(doc, *K3D_RESTORE)
+    acc, enc = doc_section(doc, *RESET_ACCEPT), doc_section(doc, *ENC_FILES)
+    real_ok = (
+        "**This is the procedure for the real servers**" in real
+        and "**Reset and restore on `k3s01`, by explicit invocation:**" in real
+        and "`k3s server --cluster-reset --cluster-reset-restore-path=<p0 path>` in the foreground" in real
+        and "Never deliver the reset by writing `cluster-reset` fields into a configuration file" in real
+        and "are **never** a recovery method for the real servers" in real
+        and in_order(real, ("**Stop K3s on every server:**", "**Return every server to the pre-enable configuration:**",
+                            "by explicit invocation:**", "**Start K3s on `k3s01` normally:**", "**Rejoin `k3s02`, then `k3s03`:**"))
+        and not re.search(r"docker|--volumes-from|runner|network (dis)?connect", real.split("are **never** a recovery method")[1], re.I)
+        and not re.search(r"^\s*cluster-reset(-restore-path)?:\s", doc, re.M))
+    accept_ok = (
+        all(x in acc for x in ("**exit status 0**", "**ERROR level**", 'level=error msg="Shutdown request received:',
+                               "The reset is accepted **only** when all three hold", "the process exited with status 0",
+                               "restart without --cluster-reset flag now", "/var/lib/rancher/k3s/server/db/reset-flag",
+                               "The ERROR level of that line is not a failure, and exit status 0 alone is not success",
+                               "do not start `k3s01`")))
+    enc_ok = all(x in enc for x in (
+        "the encryption drop-in is moved aside before the reset", "**remain on disk**",
+        "**Their presence alone must not be interpreted as active encryption**",
+        "The effective state after a restore is established only by the post-restore status",
+        "API readbacks and raw etcd checks"))
+    k3d_ok = (
+        all(x in k3d for x in (
+            "None of them is a recovery method for the real servers",
+            "Refuse before any shutdown if a disconnect and reconnect could not rebuild the network attachment exactly",
+            "Its container and volumes are never deleted or recreated",
+            "held by no endpoint and reserved by no other container; otherwise stop",
+            "An address-allocation failure is a rehearsal-harness failure, not a restore result",
+            "`/bin/k3s server <S1's own server arguments> --cluster-reset --cluster-reset-restore-path=<p0> --token-file=<server token file>`",
+            "No token or join URL is passed in the environment or on the command line", "S1 stays stopped",
+            "the container identity, hostname, network, address, prefix, gateway, aliases and volumes must be unchanged",
+            "two collectors", "reports every runner exit status as a number", "INFO and ERROR lines"))
+        and in_order(k3d, ("**Record S1's identity before the stop:**", "**Stop all three server containers concurrently**",
+                           "**Move the drop-in aside**", "**Disconnect only S1**", "**Run the explicit reset**", "**Accept the reset**",
+                           "**Remove the runner, prove the address is free again, and reconnect the original S1**", "**Rejoin S2, then S3**")))
+    return real_ok and accept_ok and enc_ok and k3d_ok
+
+
+require("docs: restore by explicit invocation on the real servers; reset accepted by exit 0, ERROR-level message and reset flag; retained encryption files are no proof; k3d runner with a safe network handoff is rehearsal tooling only",
+        docs_restore_mechanism(ROLLBACK_DOC))
+STALE_STATUS = re.compile(
+    r"k3d rehearsal has \*\*not\*\* passed|required k3d rehearsal has \*\*not passed\*\*|has \*\*not\*\* passed a rehearsal|"
+    r"not yet passed a rehearsal|has not yet passed a rehearsal|implemented and statically tested only|It is statically tested only|"
+    r"complete rehearsal with the corrected restore has \*\*not\*\* run|complete rehearsal has not been run with the corrected restore")
+OVERCLAIM = re.compile(
+    r"three-VM rehearsal (has |was )?(passed|succeeded|completed)|live (rollout|procedure) (was|has been) (passed|performed|completed|applied)|live (rollout|procedure) (passed|succeeded)|"
+    r"Stage 3 (is|was|has been) (now )?(complete|completed|applied)\b(?! only)", re.I)
+
+
+def docs_status_current(doc, readme, validation, arch):
+    """The required k3d rehearsal is recorded as passed; the three-VM rehearsal pending; the live rollout neither approved nor
+    performed; Stage 3 neither complete nor applied. No stale "not passed" claim, no overclaim; S1's exit 1 recorded as open."""
+    texts = (doc, readme, validation, arch)
+    s1_obs = doc_section(doc, "**S1 shutdown observation:**", "**Encryption files:** see")
+    return (
+        not any(STALE_STATUS.search(x) for x in texts) and not any(OVERCLAIM.search(x) for x in texts)
+        and "**The required disposable k3d rehearsal passed on 2026-10-26**" in doc
+        and "### k3d rehearsal record (2026-10-26, run 8: passed)" in doc
+        and "**The three-VM rehearsal is still pending.**" in doc and "**The live rollout is not approved and not performed.**" in doc
+        and "**Stage 3 is not complete** and has not been applied to the real cluster" in doc
+        and "rehearsal **passed on 2026-10-26 (run 8)**" in validation and "three-VM rehearsal is still pending" in validation
+        and "passed the required disposable k3d rehearsal" in readme and "three-VM rehearsal pending" in readme
+        and "passed the required disposable k3d rehearsal" in arch and "three-VM rehearsal is still pending" in arch
+        and all(x in s1_obs for x in ("S2 and S3 exited 143; **S1 exited 1**", "was not OOM-killed and was not restarted",
+                                      "The cause of the exit status 1 was not determined",
+                                      "not as expected behavior and not as evidence of failure"))
+        and "did not compare their inode or modification time after the restore" in doc
+        and "not applicable** in disposable k3d and are not claimed as passed" in doc)
+
+
+require("docs: k3d rehearsal recorded as passed; three-VM pending; live rollout not approved or performed; Stage 3 not complete; no stale or overclaimed status; S1 exit 1 recorded as open",
+        docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC, ARCH_DOC))
+require("docs: restore impact and acknowledgment, p0 definition, official restore sequence with S2/S3, acceptance criteria, disable not used",
+        docs_restore_defined(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC))
 require("gate.yml: every check before any write",
         order_ok("gate", ["Gather the cluster state", "Evaluate preservation and snapshot freshness", "Enforce the common health gate",
                           "Enforce the exclusive enable restart round", "Enforce snapshot and database preservation", "Enforce snapshot freshness", "Refuse a confirmation that was already used",
@@ -740,6 +998,120 @@ structural_mutants += [
         t for t in ts if t.get("name") == VALIDATE_ENFORCE)["ansible.builtin.assert"]["that"].remove(
         "not secrets_encryption_expectation.enable_round_blocking | bool")))),
 ]
+def add_reencrypt_task(task_map):
+    out = copy.deepcopy(task_map)
+    out["rotate"].append({"name": "legacy rollback", "ansible.builtin.command": {
+        "argv": ["{{ secrets_encryption_k3s_bin }}", "secrets-encrypt", "reencrypt", "--force", "--skip"]}})
+    return out
+
+
+def rotate_decision_after_disable(tasks):
+    t = next(t for t in tasks if t.get("name") == "Decide the rotation purpose")
+    t["ansible.builtin.set_fact"]["secrets_encryption_rotation_purpose"] = t["ansible.builtin.set_fact"][
+        "secrets_encryption_rotation_purpose"].replace("else 'refuse'", "else 'plaintext' if secrets_encryption_marker.phase == 'disable' else 'refuse'")
+
+
+structural_mutants += [
+    ("a reintroduced reencrypt --force --skip rollback task", lambda: no_inplace_rollback(
+        add_reencrypt_task(task_files), task_text, PLAYBOOK_NAMES, role_vars)),
+    ("disable reintroduced as a mutating phase", lambda: no_inplace_rollback(
+        task_files, task_text, PLAYBOOK_NAMES, dict(role_vars, secrets_encryption_mutating_phases=role_vars["secrets_encryption_mutating_phases"] + ["disable"]))),
+    ("a reintroduced rollback playbook", lambda: no_inplace_rollback(task_files, task_text, PLAYBOOK_NAMES + ["secrets-encryption-reencrypt"], role_vars)),
+    ("drop-in removal after a rollback re-encryption marker", lambda: flag_removal_preactivation_only(task_text["restart"].replace(
+        "secrets_encryption_marker.phase == 'enable')", "secrets_encryption_marker.phase in ['enable', 'reencrypt-after-disable'])"), task_text["guard"])),
+    ("the enabling rotation without the pre-enable snapshot", lambda: rotation_requires_p0(mutate(task_files["rotate"], drop_that(
+        "Enforce the rotation preconditions", next(x for x in next(t for t in task_files["rotate"] if t.get("name") == "Enforce the rotation preconditions")
+                                                   ["ansible.builtin.assert"]["that"] if "checkpoint_ok" in x))))),
+    ("rotate-keys used as a plaintext rollback after disable", lambda: rotate_never_plaintext(mutate(task_files["rotate"], rotate_decision_after_disable))),
+    ("documentation naming the R3 rollback playbook", lambda: docs_rollback_consistent(
+        ROLLBACK_DOC + "\nansible-playbook secrets-encryption-reencrypt.yml --limit k3s01\n", README_TEXT, VALIDATION_DOC)),
+]
+def token_with_checksum(tasks):
+    next(x for x in tasks if x.get("name") == "Inspect the server token file without reading it")["ansible.builtin.stat"]["get_checksum"] = True
+
+
+def token_debugged(tasks):
+    tasks.append({"name": "Show the token stat", "ansible.builtin.debug": {"var": "secrets_encryption_token_stat"}})
+
+
+def enable_without_p0(tasks):
+    next(x for x in tasks if x.get("name") == "Require the recorded pre-enable checkpoint")["ansible.builtin.assert"]["that"] = ["true"]
+
+
+def round_unrecorded(tasks):
+    rt = next(x for x in tasks if x.get("name") == "Summarize the enable restart round")
+    rt["vars"]["se_checkpoint_ok"] = rt["vars"]["se_checkpoint_ok"].replace(
+        "and secrets_encryption_p0.p0_records | select('search', key | regex_escape) | list | length > 0", "")
+
+
+VALIDATE_TEXT = (ans / "validate-secrets-encryption.yml").read_text()
+structural_mutants += [
+    ("the token file inspected with a checksum", lambda: token_stat_only(dict(task_files, snapshot=mutate(task_files["snapshot"], token_with_checksum)))),
+    ("the token stat shown in a report", lambda: token_stat_only(dict(task_files, snapshot=mutate(task_files["snapshot"], token_debugged)))),
+    ("the checkpoint record without the token confirmation", lambda: checkpoint_record_fixed(mutate(task_files["snapshot"], lambda ts: next(
+        x for x in ts if x.get("name") == "Record the checkpoint metadata")["ansible.builtin.lineinfile"].update(line="{{ x }}")), task_text["summarize"])),
+    ("enable without the p0 requirement", lambda: enable_requires_p0(mutate(task_files["enable"], enable_without_p0), task_text["summarize"])),
+    ("p0 accepted without the last-invocation rule", lambda: enable_requires_p0(task_files["enable"], task_text["summarize"].replace(
+        "se_newest_records | length == 1 and se_last_snapshot | bool", "se_newest_records | length == 1"))),
+    ("the round accepting an unrecorded snapshot", lambda: round_requires_recorded_p0(mutate(task_files["summarize"], round_unrecorded))),
+    ("configured-disabled accepted after activation", lambda: configured_disabled_preactivation(VALIDATE_TEXT.replace(
+        "\n                and secrets_encryption_marker.phase == 'enable')", ")"), task_text["parse_status"])),
+    ("Disabled no longer parsed", lambda: configured_disabled_preactivation(VALIDATE_TEXT, task_text["parse_status"].replace(
+        "      Disabled: disabled\n", ""))),
+    ("documentation without the operator impact acknowledgment", lambda: docs_restore_defined(ROLLBACK_DOC.replace(
+        "No future live restore starts without a written acknowledgment", "A restore may start"), README_TEXT, VALIDATION_DOC)),
+    ("documentation claiming disable restores plaintext", lambda: docs_restore_defined(
+        ROLLBACK_DOC + "\n`disable` successfully rewrites Secretbox records to plaintext.\n", README_TEXT, VALIDATION_DOC)),
+    ("documentation taking p0 before the canary controls", lambda: docs_restore_defined(ROLLBACK_DOC.replace(
+        "secrets_encryption_snapshot_checkpoint=p0-pre-enable\n", "secrets_encryption_snapshot_checkpoint=p0-pre-enable-moved\n").replace(
+        "secrets_encryption_snapshot_checkpoint=baseline\n", "secrets_encryption_snapshot_checkpoint=p0-pre-enable\n"), README_TEXT, VALIDATION_DOC)),
+    ("documentation treating static tests as completion", lambda: docs_restore_defined(
+        ROLLBACK_DOC.replace("A passing static test run is not completion.", ""), README_TEXT, VALIDATION_DOC)),
+    ("documentation delivering the real-server reset through configuration-file fields", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "Never deliver the reset by writing `cluster-reset` fields into a configuration file",
+        "Deliver the reset by writing these fields into a configuration file:\n\ncluster-reset: true\n\nand never by command line"))),
+    ("documentation presenting the Docker runner as the real-server recovery method", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "5. **Start K3s on `k3s01` normally:**", "5. Alternatively run the reset in a docker runner with --volumes-from.\n5. **Start K3s on `k3s01` normally:**"))),
+    ("documentation accepting a reset by exit status alone", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "The ERROR level of that line is not a failure, and exit status 0 alone is not success", "Exit status 0 is sufficient"))),
+    ("documentation without the reset flag requirement", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "/var/lib/rancher/k3s/server/db/reset-flag", "<none>"))),
+    ("documentation treating retained encryption files as active encryption", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "**Their presence alone must not be interpreted as active encryption**", "**Their presence means encryption is active**"))),
+    ("documentation without the free-address check before the runner attaches", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "held by no endpoint and reserved by no other container; otherwise stop", "available"))),
+    ("documentation without the unchanged-identity check after reconnect", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "the container identity, hostname, network, address, prefix, gateway, aliases and volumes must be unchanged", "the container runs"))),
+    ("documentation allowing S1's container or volumes to be recreated", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "Its container and volumes are never deleted or recreated", "Its container may be recreated"))),
+    ("documentation running the runner while S1 stays attached", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "4. **Disconnect only S1**", "4. **Keep S1 attached**"))),
+    ("documentation removing the runner after S1 is reconnected", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "**Remove the runner, prove the address is free again, and reconnect the original S1**", "**Reconnect the original S1, then remove the runner**"))),
+    ("documentation stopping the k3d servers one after another", lambda: docs_restore_mechanism(ROLLBACK_DOC.replace(
+        "**Stop all three server containers concurrently**", "**Stop the server containers one after another**"))),
+    ("a stale claim that the k3d rehearsal has not passed", lambda: docs_status_current(
+        ROLLBACK_DOC + "\nThe k3d rehearsal has **not** passed.\n", README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a stale README status", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT.replace(
+        "passed the required disposable k3d rehearsal, including", "not yet passed a rehearsal, including", 1), VALIDATION_DOC, ARCH_DOC)),
+    ("a claim that the three-VM rehearsal passed", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT,
+        VALIDATION_DOC + "\nThe three-VM rehearsal passed.\n", ARCH_DOC)),
+    ("a claim that the live rollout was performed", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC,
+        ARCH_DOC + "\nThe live rollout has been performed.\n")),
+    ("a claim that Stage 3 is complete", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "**Stage 3 is not complete** and has not been applied", "**Stage 3 is complete** and has been applied"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the three-VM rehearsal no longer marked pending", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC,
+        ARCH_DOC.replace("three-VM rehearsal is still pending", "three-VM rehearsal follows"))),
+    ("S1's exit 1 called expected", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "not as expected behavior and not as evidence of failure", "as expected behavior"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("S1's undetermined cause dropped", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "The cause of the exit status 1 was not determined", "The exit status 1 is harmless"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("Flux acceptance claimed as passed", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "not applicable** in disposable k3d and are not claimed as passed", "passed** in disposable k3d"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("post-restore encryption-file metadata claimed as compared", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "did not compare their inode or modification time after the restore", "compared their inode and modification time after the restore"),
+        README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+]
 for label, check in structural_mutants:
     require(f"mutation (structure): {label} is detected", check() is False)
 
@@ -965,7 +1337,7 @@ def statefiles(overrides=None):
 def probes(svc=None, ver=None, readyz=None, etcd=None, chrony=None, swap=None, dropin=None, change=None, verified=None,
            statedir=None, sfiles=None, status_lines=None, nodes=None, etcd_nodes=None, flux=None, flux_rc=0, helm=None, helm_rc=0,
            deploy=None, sts=None, ds=None, df=None, snaps=None, dbs=None, baseline=None, marker=None, ledger=None, protected=None,
-           status_results=None):
+           status_results=None, checkpoints=None):
     six = ["flux-system/flux-system", "flux-system/infrastructure-controllers", "flux-system/infrastructure-configs",
            "flux-system/monitoring", "flux-system/monitoring-configs", "flux-system/apps"]
     return {
@@ -997,6 +1369,7 @@ def probes(svc=None, ver=None, readyz=None, etcd=None, chrony=None, swap=None, d
         "secrets_encryption_baseline_probe": results(baseline or [absent()] * 3),
         "secrets_encryption_marker_probe": {"content": b64(marker)} if marker else absent(),
         "secrets_encryption_ledger_probe": {"content": b64(ledger)} if ledger else absent(),
+        "secrets_encryption_checkpoints_probe": {"content": b64(checkpoints)} if checkpoints else absent(),
         "secrets_encryption_now_probe": {"rc": 0, "stdout": str(NOW)},
         "secrets_encryption_protected_probe": {"results": protected or []},
     }
@@ -1105,16 +1478,20 @@ health("rehearsal without Flux, Helm or monitoring passes", probes(flux=[], flux
 LEDGER_OK = "20261023T160800Z snapshot k3s01\n20261023T160830Z enable k3s01\n"
 PRE_SNAP = [{"files": [{"path": "/s/stage3-p0-pre-enable-20261023t160817z-k3s01-1", "mtime": 39000, "size": 10},
                        {"path": "/s/etcd-snapshot-x-1", "mtime": 1, "size": 1}]}] + [{"files": [{"path": "/s/etcd-snapshot-x-1", "mtime": 1, "size": 1}]}] * 2
+SHA = "a" * 64
+CP_OK = f"39000 p0-pre-enable stage3-p0-pre-enable-20261023t160817z-k3s01-1 10 {SHA} token=present\n"
+P0_TASK = "Summarize the checkpoint records and the pre-enable checkpoint"
 UNAV3 = [unavailable()] * 3
 NOT_PARSED = "secrets-encrypt status not parsed"
 
 
 def round_probes(started=(30000, 30000, 30000), verified=(None, None, None), dropin=(False, False, False), status=None,
-                 ledger=LEDGER_OK, snaps=None, marker="40000 enable", change=None):
+                 ledger=LEDGER_OK, snaps=None, marker="40000 enable", change=None, checkpoints=CP_OK):
     return probes(svc=[{"rc": 0, "stdout": f"NRestarts=0\nActiveState=active\nActiveEnterTimestamp=@{s}"} for s in started],
                   verified=[{"content": b64(str(v))} if v else absent() for v in verified],
                   dropin=[{"stat": {"exists": d, "isreg": d, "islnk": False}} for d in dropin],
-                  change=change, status_results=status or UNAV3, ledger=ledger, snaps=snaps or PRE_SNAP, marker=marker)
+                  change=change, status_results=status or UNAV3, ledger=ledger, snaps=snaps or PRE_SNAP, marker=marker,
+                  checkpoints=checkpoints)
 
 
 RESTART = {"secrets_encryption_phase": "restart"}
@@ -1149,6 +1526,10 @@ for label, mocks, extra, checks in (
         ("when the marker is stale (ledger records disable)", round_probes(ledger=LEDGER_OK + "20261023T170000Z disable k3s01\n"), RESTART,
          [f"not ({ROUND}.ledger_ok | bool)"]),
         ("with a malformed ledger line", round_probes(ledger=LEDGER_OK + "garbage\n"), RESTART, [f"not ({ROUND}.ledger_ok | bool)"]),
+        ("without a recorded p0 checkpoint", round_probes(checkpoints=""), RESTART, [f"not ({ROUND}.checkpoint_ok | bool)"]),
+        ("when the p0 record's size differs", round_probes(checkpoints=CP_OK.replace(" 10 ", " 11 ")), RESTART,
+         [f"not ({ROUND}.checkpoint_ok | bool)"]),
+        ("with a malformed checkpoint record", round_probes(checkpoints=CP_OK + "garbage\n"), RESTART, [f"not ({ROUND}.checkpoint_ok | bool)"]),
         ("without a snapshot older than enable", round_probes(snaps=[{"files": [{"path": "/s/stage3-p1-late-k3s01-1", "mtime": 45000, "size": 10}]}]
                                                               + PRE_SNAP[1:]), RESTART, [f"not ({ROUND}.checkpoint_ok | bool)"]),
         ("when k3s03 restarted before k3s02 (out of order)", round_probes(started=(50000, 30000, 50000), verified=(55000, None, None),
@@ -1324,13 +1705,17 @@ def srv(enc="disabled-no-config", stage="none", hashes=True, restarted=True, dro
 
 
 def cl(s1, s2=None, s3=None, phase=None, epoch=90000, confirm_id="20261020T080000Z", events=("snapshot k3s01", "enable k3s01"),
-       ledger_malformed=False, pre_enable_snapshot=True):
-    first = storage(stage3=[("stage3-p0-pre-enable-x", 89000)] if pre_enable_snapshot else [("stage3-p1-x", 95000)])
+       ledger_malformed=False, pre_enable_snapshot=True, stage3=None, checkpoints=None):
+    first = storage(stage3=stage3 if stage3 is not None else
+                    [("stage3-p0-pre-enable-x", 89000)] if pre_enable_snapshot else [("stage3-p1-x", 95000)])
+    if checkpoints is None:
+        checkpoints = f"89000 p0-pre-enable stage3-p0-pre-enable-x 10 {SHA} token=present\n" if pre_enable_snapshot else ""
     return {"secrets_encryption_servers": {"k3s01": s1, "k3s02": s2 or s1, "k3s03": s3 or s1},
             "secrets_encryption_marker": {"present": phase is not None, "malformed": False, "epoch": epoch if phase else 0, "phase": phase or "none"},
             "secrets_encryption_report": {"encryption": "mocked"}, "secrets_encryption_now_epoch": NOW,
             "secrets_encryption_confirm_id": confirm_id, "secrets_encryption_ledger_events": list(events),
             "secrets_encryption_ledger_malformed": ledger_malformed,
+            "secrets_encryption_checkpoints_probe": {"content": b64(checkpoints)} if checkpoints else absent(),
             "secrets_encryption_storage": {"k3s01": first, "k3s02": storage(), "k3s03": storage()}}
 
 
@@ -1340,10 +1725,13 @@ IDENT_NODROP = srv("disabled", "start")
 ENAB = srv("enabled", "reencrypt_finished", dropin=True, key_type="XSalsa20-POLY1305")
 DISAB = srv("disabled", "reencrypt_finished", dropin=True)
 
-enable_dec = picks("enable", "Decide whether enable is required", "Enforce the enable preconditions")
+enable_dec = (picks("summarize", P0_TASK)
+              + picks("enable", "Decide whether enable is required", "Enforce the enable preconditions", "Require the recorded pre-enable checkpoint"))
 D = "secrets_encryption_enable_decision"
 EE = "Enforce the enable preconditions"
-plays.append(play("enable: fresh cluster runs", cl(NOCONF), enable_dec, False, [f"{D} == 'run'"]))
+EP0 = "Require the recorded pre-enable checkpoint"
+AFTER_P0 = ("snapshot k3s01",)
+plays.append(play("enable: fresh cluster runs", cl(NOCONF, events=AFTER_P0), enable_dec, False, [f"{D} == 'run'", "secrets_encryption_p0.ok | bool"]))
 plays.append(play("enable: idempotent after enable (identity configuration on the first server)", cl(IDENT_NODROP, NOCONF, NOCONF, phase="enable"),
                   enable_dec, False, [f"{D} == 'done'"]))
 plays.append(play("enable: idempotent after enable and restarts", cl(IDENT, phase="enable"), enable_dec, False, [f"{D} == 'done'"]))
@@ -1351,8 +1739,66 @@ plays.append(play("enable: refused when encryption is already enabled", cl(ENAB,
 plays.append(play("enable: refused with a drop-in already present", cl(srv(dropin=True)), enable_dec, EE))
 plays.append(play("enable: refused with an unexplained identity configuration", cl(IDENT_NODROP, NOCONF, NOCONF), enable_dec, EE))
 plays.append(play("enable: refused after a recorded disable", cl(DISAB, phase="disable"), enable_dec, EE))
+P0X = f"89000 p0-pre-enable stage3-p0-pre-enable-x 10 {SHA} token=present\n"
+for label, kw, checks in (
+        ("the newest Stage 3 snapshot is not p0", dict(stage3=[("stage3-p0-pre-enable-x", 89000), ("stage3-baseline-x", 89500)]),
+         ["not secrets_encryption_p0.newest_is_p0 | bool"]),
+        ("no Stage 3 snapshot exists", dict(stage3=[], checkpoints=""), ["secrets_encryption_p0.newest == ''"]),
+        ("p0 has no checkpoint record", dict(checkpoints=""), ["not secrets_encryption_p0.newest_recorded | bool"]),
+        ("p0 is recorded under another label", dict(checkpoints=P0X.replace("p0-pre-enable stage3", "baseline stage3")),
+         ["not secrets_encryption_p0.newest_recorded | bool"]),
+        ("p0's size differs from its record", dict(checkpoints=P0X.replace(" 10 ", " 11 ")), ["not secrets_encryption_p0.newest_recorded | bool"]),
+        ("p0 is recorded twice", dict(checkpoints=P0X + P0X), ["not secrets_encryption_p0.newest_recorded | bool"]),
+        ("a checkpoint record is malformed", dict(checkpoints=P0X + "garbage\n"), ["secrets_encryption_p0.records_malformed | bool"]),
+        ("a checkpoint record lacks the token confirmation", dict(checkpoints=P0X.replace(" token=present", "")),
+         ["secrets_encryption_p0.records_malformed | bool"]),
+        ("another invocation followed p0", dict(events=("snapshot k3s01", "canary-create-control k3s01")),
+         ["not secrets_encryption_p0.last_event_snapshot | bool"]),
+        ("a refused enable followed p0", dict(events=("snapshot k3s01", "enable k3s01")), ["not secrets_encryption_p0.last_event_snapshot | bool"]),
+        ("the ledger is malformed", dict(events=AFTER_P0, ledger_malformed=True), [])):
+    kw = dict({"events": AFTER_P0}, **kw)
+    plays.append(play(f"enable: p0 refused when {label}", cl(NOCONF, **kw), enable_dec, EP0, [f"{D} == 'run'"] + checks))
+plays.append(play("enable: p0 not required once enable is done", cl(IDENT, phase="enable", checkpoints=""), enable_dec, False, [f"{D} == 'done'"]))
 
-round_task = picks("summarize", "Summarize the enable restart round")
+# The record written by snapshot.yml, read back exactly as gather.yml reads it, is an acceptable p0.
+cp_dir = tmp_root / "checkpoint-roundtrip"
+cp_dir.mkdir()
+cp_tasks = (unroot(picks("snapshot", "Record the checkpoint metadata"))
+            + [{"name": "read back", "ansible.builtin.slurp": {"src": f"{cp_dir}/checkpoints"}, "register": "secrets_encryption_checkpoints_probe"}]
+            + picks("summarize", P0_TASK))
+cp_mocks = dict(cl(NOCONF, events=AFTER_P0, stage3=[("stage3-p0-pre-enable-20261026t100000z-k3s01-1", 89000)], checkpoints=""),
+                secrets_encryption_snapshot_stat={"stat": {"mtime": 89000.5, "size": 10, "checksum": SHA}},
+                secrets_encryption_snapshot_new=["stage3-p0-pre-enable-20261026t100000z-k3s01-1"])
+plays.append(play("checkpoint: the record written by the snapshot phase is accepted as p0", cp_mocks, cp_tasks, False,
+                  ["secrets_encryption_p0.ok | bool", "secrets_encryption_checkpoint_records | length == 1",
+                   f"lookup('ansible.builtin.file', '{cp_dir}/checkpoints') is match('^89000 p0-pre-enable stage3-p0-pre-enable-20261026t100000z-k3s01-1 10 [0-9a-f]{{64}} token=present$')"],
+                  extra_vars={"secrets_encryption_state_dir": str(cp_dir), "secrets_encryption_snapshot_checkpoint": "p0-pre-enable"}))
+
+
+def token_scenario(base, label, path, fail, uid=None):
+    tasks = picks("snapshot", "Inspect the server token file without reading it", "Require the server token file for a restorable checkpoint",
+                  base=base)
+    checks = ["secrets_encryption_token_stat.stat.checksum is not defined", "secrets_encryption_token_stat.stat.mimetype is not defined"]
+    return dict(name=f"token check: {label}", mocks={}, tasks=tasks, expect_fail=fail and "Require the server token file for a restorable checkpoint",
+                checks=checks, extra_vars={"secrets_encryption_token_file": str(path),
+                                           "secrets_encryption_state_owner_uid": UID if uid is None else uid})
+
+
+tok_dir = tmp_root / "token-stand-in"
+tok_dir.mkdir()
+(tok_dir / "present").write_text("stand-in\n")
+(tok_dir / "empty").write_text("")
+os.symlink(tok_dir / "present", tok_dir / "link")
+TOKEN_OK = tok_dir / "present"
+for label, path, fail, uid in (("a non-empty regular file owned by the state owner passes, by lstat only", TOKEN_OK, False, None),
+                               ("a missing file fails", tok_dir / "missing", True, None),
+                               ("an empty file fails", tok_dir / "empty", True, None),
+                               ("a symbolic link fails", tok_dir / "link", True, None),
+                               ("a file owned by another user fails", TOKEN_OK, True, UID + 1)):
+    sc = token_scenario(None, label, path, fail, uid)
+    plays.append(play(sc["name"], sc["mocks"], sc["tasks"], sc["expect_fail"], sc["checks"], sc["extra_vars"]))
+
+round_task = picks("summarize", P0_TASK, "Summarize the enable restart round")
 restart_pre = round_task + picks("restart", "Enforce the restart preconditions", "Enforce the restart order", "Enforce the enable restart round")
 RP_ = "Enforce the restart preconditions"
 RO = "Enforce the restart order"
@@ -1382,8 +1828,9 @@ plays.append(play("restart: flag removal refused while encryption is enabled", c
                   extra_vars={"secrets_encryption_flag_state": "absent"}))
 plays.append(play("restart: flag removal allowed before rotation (rehearsal state)", cl(IDENT_NODROP, phase="enable"), restart_pre, False,
                   extra_vars={"secrets_encryption_flag_state": "absent"}))
-plays.append(play("restart: flag removal refused after disable until the rollback re-encryption", cl(DISAB, phase="disable"), restart_pre, RP_,
-                  extra_vars={"secrets_encryption_flag_state": "absent"}))
+for legacy in ("disable", "reencrypt-after-disable"):
+    plays.append(play(f"restart: drop-in removal refused for a legacy {legacy} marker (after activation only a snapshot restore)",
+                      cl(DISAB, phase=legacy), restart_pre, RP_, extra_vars={"secrets_encryption_flag_state": "absent"}))
 plays.append(play("restart: unknown flag state refused", cl(IDENT, phase="enable"), restart_pre, RP_,
                   extra_vars={"secrets_encryption_flag_state": "maybe"}))
 # The enable restart round: status is unavailable until the round completes.
@@ -1432,13 +1879,12 @@ def add_sc(sc, invert=False, prefix=""):
 
 OTHER_PHASES = [("checkpoint snapshot", "snapshot", "present"), ("canary create-control", "canary-create-control", "present"),
                 ("canary verify", "canary-verify", "present"), ("canary cleanup", "canary-cleanup", "present"),
-                ("rotation", "rotate-keys", "present"), ("rollback re-encryption", "reencrypt-after-disable", "present"),
-                ("disable", "disable", "present"), ("a repeated enable", "enable", "present"),
+                ("rotation", "rotate-keys", "present"), ("a repeated enable", "enable", "present"),
                 ("etcdctl installation", "install-etcdctl", "present"), ("drop-in removal", "restart", "absent")]
 
 
 def lock_scenario(base, label, mocks, phase, fail, flag="present", host="k3s01"):
-    tasks = picks("summarize", "Summarize the enable restart round", base=base) + picks("gate", LOCK_ONLY, base=base)
+    tasks = picks("summarize", P0_TASK, "Summarize the enable restart round", base=base) + picks("gate", LOCK_ONLY, base=base)
     return dict(name=f"exclusive round: {label}", mocks=mocks, tasks=tasks, expect_fail=fail and LOCK_ONLY, checks=[], host=host,
                 extra_vars={"secrets_encryption_phase": phase, "secrets_encryption_flag_state": flag})
 
@@ -1484,9 +1930,9 @@ add_sc(lock_scenario(None, "round complete: a further restart passes the gate, t
 plays.append(play("round complete: rotation preconditions are met", cl(IDENT, phase="enable"),
                   round_task + picks("gate", LOCK_ONLY) + picks("rotate", "Decide the rotation purpose", "Enforce the rotation preconditions"), False,
                   ["secrets_encryption_rotation_purpose == 'enabling'"], {"secrets_encryption_phase": "rotate-keys"}))
-for marker_phase, ok_phase in (("rotate-keys", "disable"), ("disable", "reencrypt-after-disable"), ("reencrypt-after-disable", "snapshot")):
-    add_sc(lock_scenario(None, f"after the round (marker {marker_phase}): {ok_phase} is not affected by the round gate",
-                      cl(ENAB if marker_phase == "rotate-keys" else DISAB, phase=marker_phase), ok_phase, False))
+for ok_phase in ("snapshot", "canary-verify", "rotate-keys"):
+    add_sc(lock_scenario(None, f"after the round (marker rotate-keys): {ok_phase} is not affected by the round gate",
+                         cl(ENAB, phase="rotate-keys"), ok_phase, False))
 
 # Interrupted or inconsistent evidence fails closed.
 for label, mocks in (("a stale marker (ledger records rotate-keys)", cl(IDENT, phase="enable", events=STALE)),
@@ -1517,6 +1963,10 @@ for state, mocks, _ in ROUND_STATES:
     add_sc(validate_scenario(validate_tasks, f"enforced validation fails {state}", mocks, True))
 add_sc(validate_scenario(validate_tasks, "enforced configured-disabled validation passes after the completed round", cl(IDENT, phase="enable"),
                       False, "configured-disabled"))
+CD_AFTER = dict(validate_scenario(validate_tasks, "enforced configured-disabled validation fails after activation (Disabled after rotate-keys)",
+                                   cl(DISAB, phase="rotate-keys", events=STALE), True, "configured-disabled"),
+                checks=["not (secrets_encryption_expectation.met | bool)", "not (secrets_encryption_expectation.enable_round_blocking | bool)"])
+add_sc(CD_AFTER)
 add_sc(validate_scenario(validate_tasks, "enforced validation fails after a completed round with a stale marker",
                       cl(IDENT, phase="enable", events=STALE), True))
 
@@ -1530,7 +1980,7 @@ plays.append(play("restart decision: restart when started before the change",
                   dict(cl(srv("disabled", "start", dropin=True, restarted=False), phase="enable"), secrets_encryption_dropin_changed=False),
                   decide, False, [R]))
 
-rot_pre = picks("rotate", "Decide the rotation purpose", "Enforce the rotation preconditions")
+rot_pre = round_task + picks("rotate", "Decide the rotation purpose", "Enforce the rotation preconditions")
 RPU = "secrets_encryption_rotation_purpose"
 ER = "Enforce the rotation preconditions"
 REASON = {"secrets_encryption_additional_rotation_reason": "annual rotation per the backup design"}
@@ -1558,26 +2008,14 @@ plays.append(play("rotation: a too-short reason is refused", cl(ENAB, phase="rot
                               "secrets_encryption_additional_rotation_approval": "additional-rotation:20261020T080000Z"}))
 plays.append(play("rotation: an additional rotation with a reason and an approval for this confirmation", cl(ENAB, phase="rotate-keys"), rot_pre, False,
                   [f"{RPU} == 'additional'"], dict(REASON, secrets_encryption_additional_rotation_approval="additional-rotation:20261020T080000Z")))
-plays.append(play("rotation: refused after disable", cl(DISAB, phase="disable"), rot_pre, ER))
-
-dis = picks("disable", "Decide whether disable is required", "Enforce the disable preconditions")
-ED = "Enforce the disable preconditions"
-plays.append(play("disable: after a completed rotation and verified restarts", cl(ENAB, phase="rotate-keys"), dis, False,
-                  ["secrets_encryption_disable_decision == 'run'"]))
-plays.append(play("disable: idempotent after disable", cl(DISAB, ENAB, ENAB, phase="disable"), dis, False,
-                  ["secrets_encryption_disable_decision == 'done'"]))
-plays.append(play("disable: refused before the restarts after rotation",
-                  cl(srv("enabled", "reencrypt_finished", dropin=True, restarted=False), phase="rotate-keys"), dis, ED))
-plays.append(play("disable: refused when never enabled", cl(IDENT, phase="enable"), dis, ED))
-reenc = picks("reencrypt", "Decide whether the rollback re-encryption is required", "Enforce the rollback re-encryption preconditions")
-ERE = "Enforce the rollback re-encryption preconditions"
-plays.append(play("rollback re-encryption: after disable and verified restarts", cl(DISAB, phase="disable"), reenc, False,
-                  ["secrets_encryption_reencrypt_decision == 'run'"]))
-plays.append(play("rollback re-encryption: idempotent afterwards", cl(DISAB, phase="reencrypt-after-disable"), reenc, False,
-                  ["secrets_encryption_reencrypt_decision == 'done'"]))
-plays.append(play("rollback re-encryption: refused before every server restarted",
-                  cl(DISAB, srv("disabled", "reencrypt_finished", dropin=True, restarted=False), phase="disable"), reenc, ERE))
-plays.append(play("rollback re-encryption: refused without disable", cl(ENAB, phase="rotate-keys"), reenc, ERE))
+plays.append(play("rotation: refused after a legacy disable marker (rotate-keys is never a plaintext rollback)", cl(DISAB, phase="disable"),
+                  rot_pre, ER))
+plays.append(play("rotation: refused after a legacy rollback re-encryption marker", cl(DISAB, phase="reencrypt-after-disable"), rot_pre, ER))
+plays.append(play("rotation: the enabling rotation is refused without the pre-enable snapshot (the rollback boundary)",
+                  cl(IDENT, phase="enable", pre_enable_snapshot=False), rot_pre, ER))
+plays.append(play("rotation: the enabling rotation is refused with a stale ledger", cl(IDENT, phase="enable", events=STALE), rot_pre, ER))
+plays.append(play("rotation: the enabling rotation is refused with a malformed ledger", cl(IDENT, phase="enable", ledger_malformed=True),
+                  rot_pre, ER))
 
 can = picks("canary", "Require a canary action", "Decide the canary preconditions", "Enforce the canary preconditions")
 EC = "Enforce the canary preconditions"
@@ -1854,7 +2292,7 @@ def stub_log(sv):
     return f"lookup('ansible.builtin.file', '{sv['stub_state']}/log')"
 
 
-def enable_scenario(base, label, enable_mode, fail, status_mode="unavailable"):
+def enable_scenario(base, label, enable_mode, fail, status_mode="unavailable", mocks=None):
     sv = stubs(f"enable-{len(plays)}")
     sd = pathlib.Path(sv["stub_state"]).parent / "statedir"
     sd.mkdir()
@@ -1863,7 +2301,8 @@ def enable_scenario(base, label, enable_mode, fail, status_mode="unavailable"):
               f"{stub_log(sv)} is not search('secrets-encrypt status')"]
     if not fail:
         checks.append(f"lookup('ansible.builtin.file', '{sd}/last-change') is match('^[0-9]+ enable$')")
-    return dict(name=f"step 1: {label}", mocks=cl(NOCONF), tasks=tasks, expect_fail=fail, checks=checks,
+    tasks = picks("summarize", P0_TASK, base=base) + tasks
+    return dict(name=f"step 1: {label}", mocks=mocks or cl(NOCONF, events=("snapshot k3s01",)), tasks=tasks, expect_fail=fail, checks=checks,
                 extra_vars=dict(sv, secrets_encryption_state_dir=str(sd)),
                 setup=[stub_file("enable-mode", enable_mode), stub_file("status-mode", status_mode)])
 
@@ -1888,7 +2327,7 @@ def health_scenario(base, label, mocks, problem, extra_vars):
 
 
 def restart_scenario(base, label, mocks, host, fail):
-    tasks = (picks("summarize", "Summarize the enable restart round", base=base)
+    tasks = (picks("summarize", P0_TASK, "Summarize the enable restart round", base=base)
              + picks("restart", "Enforce the restart preconditions", "Enforce the restart order", ROUND_ENFORCE, base=base))
     return dict(name=f"enable round: {label}", mocks=mocks, tasks=tasks, expect_fail=fail, checks=[], extra_vars=RESTART, host=host)
 
@@ -1912,6 +2351,9 @@ for label, mode, fail in (("exit 0 with exactly the documented line records the 
                           ("a failed command is refused and records nothing", "fail", REQ_ENABLE)):
     add(enable_scenario(None, label, mode, fail))
 add(enable_scenario(None, "a readable status afterwards is still not read", "ok", False, status_mode="identity"))
+NO_P0 = cl(NOCONF, events=("snapshot k3s01",), checkpoints="")
+add(dict(enable_scenario(None, "without a recorded p0, enable is not run and nothing is recorded", "ok", "Require the recorded pre-enable checkpoint",
+                         mocks=NO_P0), checks=[]))
 for label, mode, fail in (("Disabled, start and matching hashes on every server complete the round", "identity", False),
                           ("an unavailable status fails and k3s03 is not recorded as verified", "unavailable", REQ_ROUND),
                           ("mismatched hashes fail", "mismatch", REQ_ROUND),
@@ -2023,7 +2465,36 @@ mutants = [
      lambda b: round_scenario(b, "k3s01's run", "unavailable", False, host="k3s01", reads_status=False)),
 ]
 AFTER_S1 = cl(IDENT, NOT_YET, NOT_YET, phase="enable")
+
+
+def rotation_scenario(base, label, mocks, fail, extra_vars=None):
+    tasks = (picks("summarize", P0_TASK, "Summarize the enable restart round", base=base)
+             + picks("rotate", "Decide the rotation purpose", "Enforce the rotation preconditions", base=base))
+    return dict(name=f"rotation: {label}", mocks=mocks, tasks=tasks, expect_fail=fail, checks=[], extra_vars=extra_vars)
+
+
+def dropin_removal_scenario(base, label, mocks, fail):
+    tasks = (picks("summarize", P0_TASK, "Summarize the enable restart round", base=base)
+             + picks("restart", "Enforce the restart preconditions", base=base))
+    return dict(name=f"drop-in removal: {label}", mocks=mocks, tasks=tasks, expect_fail=fail, checks=[],
+                extra_vars={"secrets_encryption_flag_state": "absent"})
+
+
+APPROVED_EXTRA = dict(REASON, secrets_encryption_additional_rotation_approval="additional-rotation:20261020T080000Z")
+
+
 mutants += [
+    ("the enabling rotation without the pre-enable snapshot",
+     [("rotate", "      - >-\n        secrets_encryption_rotation_purpose != 'enabling'\n"
+                 "        or (secrets_encryption_enable_round.checkpoint_ok | bool and secrets_encryption_enable_round.ledger_ok | bool)\n", "")],
+     lambda b: rotation_scenario(b, "no pre-enable snapshot", cl(IDENT, phase="enable", pre_enable_snapshot=False), ER)),
+    ("rotate-keys as a plaintext rollback after disable",
+     [("rotate", "      else 'refuse' }}", "      else 'additional' if secrets_encryption_marker.phase == 'disable' else 'refuse' }}")],
+     lambda b: rotation_scenario(b, "after a legacy disable marker, even with a reason and an approval", cl(IDENT, phase="disable"), ER,
+                                 APPROVED_EXTRA)),
+    ("drop-in removal after a rollback re-encryption",
+     [("restart", "secrets_encryption_marker.phase == 'enable')", "secrets_encryption_marker.phase in ['enable', 'reencrypt-after-disable'])")],
+     lambda b: dropin_removal_scenario(b, "legacy reencrypt-after-disable marker", cl(DISAB, phase="reencrypt-after-disable"), RP_)),
     ("the exclusive round lock disabled", [("gate", "not (se_round.active | bool) or se_round_restart | bool", "true or se_round_restart | bool")],
      lambda b: lock_scenario(b, "after S1 readable: checkpoint snapshot", AFTER_S1, "snapshot", True)),
     ("readable status counted as completion",
@@ -2043,8 +2514,30 @@ mutants += [
        "not (se_round.active | bool) or se_round_restart | bool or se_round.next == groups['servers'][-1]")],
      lambda b: lock_scenario(b, "after S2 readable: checkpoint snapshot", cl(IDENT, IDENT, NOT_YET, phase="enable"), "snapshot", True)),
 ]
+mutants += [
+    ("enable without the p0 requirement",
+     [("enable", "      - secrets_encryption_enable_decision == 'done' or secrets_encryption_p0.ok | bool\n", "      - true\n")],
+     lambda b: dict(enable_scenario(b, "no recorded p0", "ok", "Require the recorded pre-enable checkpoint", mocks=NO_P0), checks=[])),
+    ("p0 without the last-invocation rule",
+     [("summarize", "and se_newest_records | length == 1 and se_last_snapshot | bool", "and se_newest_records | length == 1")],
+     lambda b: dict(enable_scenario(b, "another invocation after p0", "ok", "Require the recorded pre-enable checkpoint",
+                                    mocks=cl(NOCONF, events=("snapshot k3s01", "canary-create-control k3s01"))), checks=[])),
+    ("the token inspected with a checksum", [("snapshot", "    get_checksum: false\n    get_mime: false\n", "    get_checksum: true\n    get_mime: false\n")],
+     lambda b: token_scenario(b, "checksum", TOKEN_OK, False)),
+    ("the token stat following a link", [("snapshot", "    follow: false\n  register: secrets_encryption_token_stat\n",
+                                          "    follow: true\n  register: secrets_encryption_token_stat\n")],
+     lambda b: token_scenario(b, "link", tok_dir / "link", True)),
+    ("the round accepting an unrecorded snapshot",
+     [("summarize", "\n             and secrets_encryption_p0.p0_records | select('search', key | regex_escape) | list | length > 0", "")],
+     lambda b: health_scenario(b, "p0 not recorded", round_probes(checkpoints=""), NOT_PARSED, RESTART)),
+]
 for label, edits, scenario in mutants:
     add(scenario(mutant_dir(edits)), invert=True, prefix=f"mutant killed: {label}: ")
+cd_mutant = copy.deepcopy(validate_tasks)
+cd_met = cd_mutant[0]["ansible.builtin.set_fact"]["secrets_encryption_expectation"]
+assert len(re.findall(r"\s*and secrets_encryption_marker\.phase == 'enable'\)", cd_met["met"])) == 1
+cd_met["met"] = re.sub(r"\s*and secrets_encryption_marker\.phase == 'enable'\)", ")", cd_met["met"])
+add(dict(CD_AFTER, tasks=round_task + cd_mutant), invert=True, prefix="mutant killed: configured-disabled accepted after activation: ")
 validate_mutant = copy.deepcopy(validate_tasks)
 validate_mutant[1]["ansible.builtin.assert"]["that"].remove("not secrets_encryption_expectation.enable_round_blocking | bool")
 validate_mutant[0]["ansible.builtin.set_fact"]["secrets_encryption_expectation"]["met"] = \
@@ -2198,8 +2691,7 @@ if syntax_failures:
 # the phase tasks replaced by a marker (so nothing escalates locally).
 guard_names = {t["name"] for t in task_files["guard"]}
 PB_OF = {"snapshot": "snapshot-etcd", "enable": "secrets-encryption-enable", "restart": "secrets-encryption-restart",
-         "rotate-keys": "secrets-encryption-rotate", "canary": "secrets-encryption-canary", "disable": "secrets-encryption-disable",
-         "reencrypt-after-disable": "secrets-encryption-reencrypt", "install-etcdctl": "install-etcdctl-rehearsal"}
+         "rotate-keys": "secrets-encryption-rotate", "canary": "secrets-encryption-canary", "install-etcdctl": "install-etcdctl-rehearsal"}
 guard_only = {}
 for key, pb_name in PB_OF.items():
     p = copy.deepcopy(playbooks[pb_name][0])
@@ -2321,16 +2813,11 @@ guard_cases = [
     ("install-etcdctl: allowed in a rehearsal", "install-etcdctl", "rehearsal", "s3r01",
      dict(REH, secrets_encryption_confirm=C("install-etcdctl", "s3r01")), True),
     ("snapshot: exact k3s01", "snapshot", "live", "k3s01", dict(LIVE, secrets_encryption_confirm=C("snapshot", "k3s01")), True),
-    ("disable: not yet rehearsal-approved for live", "disable", "live", "k3s01", dict(LIVE, secrets_encryption_confirm=C("disable", "k3s01")), False),
-    ("disable: approval cannot be injected with extra vars", "disable", "live", "k3s01",
-     dict(LIVE, secrets_encryption_rehearsal_approved_paths=["disable"], secrets_encryption_confirm=C("disable", "k3s01")), False),
-    ("disable: allowed in a rehearsal", "disable", "rehearsal", "s3r01", dict(REH, secrets_encryption_confirm=C("disable", "s3r01")), True),
-    ("reencrypt: not yet rehearsal-approved for live", "reencrypt-after-disable", "live", "k3s01",
-     dict(LIVE, secrets_encryption_confirm=C("reencrypt-after-disable", "k3s01")), False),
-    ("reencrypt: a disable confirmation is not accepted", "reencrypt-after-disable", "rehearsal", "s3r01",
-     dict(REH, secrets_encryption_confirm=C("disable", "s3r01")), False),
-    ("reencrypt: allowed in a rehearsal with its own confirmation", "reencrypt-after-disable", "rehearsal", "s3r01",
-     dict(REH, secrets_encryption_confirm=C("reencrypt-after-disable", "s3r01")), True),
+    ("restart: flag-removal approval cannot be injected with extra vars", "restart", "live", "k3s01",
+     dict(LIVE, secrets_encryption_flag_state="absent", secrets_encryption_rehearsal_approved_paths=["flag-removal"],
+          secrets_encryption_confirm=C("restart", "k3s01")), False),
+    ("restart: a reintroduced disable phase cannot be approved by extra vars", "restart", "live", "k3s01",
+     dict(LIVE, secrets_encryption_mutating_phases=["disable"], secrets_encryption_confirm=C("restart", "k3s01")), False),
 ]
 TASK_RE = re.compile(r"^TASK \[(?:[^\]]+? : )?(.+?)\] \*+$", re.MULTILINE)
 guard_failures = []

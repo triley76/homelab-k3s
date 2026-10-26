@@ -127,6 +127,14 @@
   failed_when: false
   run_once: true
 
+- name: Read the checkpoint records on the first server
+  ansible.builtin.slurp:
+    src: "{{ secrets_encryption_state_dir }}/checkpoints"
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: secrets_encryption_checkpoints_probe
+  failed_when: false
+  run_once: true
+
 - name: Read the time on the first server
   ansible.builtin.command:
     argv: [date, +%s]

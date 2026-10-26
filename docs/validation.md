@@ -460,10 +460,6 @@ secrets-encryption-rotate.yml
 
 secrets-encryption-canary.yml
 
-secrets-encryption-disable.yml
-
-secrets-encryption-reencrypt.yml
-
 validate-secrets-encryption.yml
 
 install-etcdctl-rehearsal.yml
@@ -473,7 +469,8 @@ install-etcdctl-rehearsal.yml
 `ansible/tests/secrets_encryption_expressions.py` checks:
 
 - the role and playbook structure;
-- the guard, using the real phase playbooks with real `--limit` values, confirmations and environments. Refused cases must stop inside the guard, before facts or privilege escalation. They include rehearsal-only work against an inventory containing a live host name, and not-yet-rehearsal-approved rollback paths;
+- the guard, using the real phase playbooks with real `--limit` values, confirmations and environments. Refused cases must stop inside the guard, before facts or privilege escalation. They include rehearsal-only work against an inventory containing a live host name, not-yet-rehearsal-approved drop-in removal, and injected approvals or rollback phases;
+- the rollback model. No phase runs `secrets-encrypt disable`, `reencrypt`, `prepare` or `rotate`, and no rollback playbook exists. `enable` requires the recorded pre-enable checkpoint p0 (newest Stage 3 snapshot, name and SHA-256 recorded, token presence confirmed by `lstat` only, taken by the last accepted invocation), and the enabling rotation requires it too. `rotate-keys` is never a plaintext rollback, and `disable` is not accepted or used. `Disabled` is still parsed for diagnosis, but `configured-disabled` validation passes only before activation. After activation the only rollback is a snapshot restore of p0, a documented manual procedure that rolls back all Kubernetes and etcd state after p0 and requires a written operator impact acknowledgment;
 - status parsing, which fails closed, and the narrowly defined `unavailable` status that only the enable restart round tolerates;
 - the health, preservation and snapshot gates;
 - every phase decision, including the fixed restart order and confirmation replay;
@@ -486,12 +483,30 @@ install-etcdctl-rehearsal.yml
 - the canary lifecycle, with a stub k3s;
 - that no canary value, raw etcd record, hash-mismatch node name or protected path appears in the output.
 
-The required k3d rehearsal has **not passed**:
+The required disposable k3d rehearsal **passed on 2026-10-26 (run 8)**, after earlier attempts that each led to a correction:
 
 - **2026-10-23:** stopped at step 1. After `k3s secrets-encrypt enable`, `k3s secrets-encrypt status` failed on every server until restarts, which the encoded procedure did not allow for.
 - **2026-10-24:** stopped after `k3s01`'s restart. Status then became readable and settled on every server, so a gate that relied on the unavailable status no longer blocked checkpoint p1 mid-round.
+- **2026-10-25 and 2026-10-26:** passed enablement, the exclusive restart round, rotation, the second restart round and the encrypted canary checks. They stopped at the rollback re-encryption: K3s `v1.36.4+k3s1` rejects `reencrypt` for secretbox ("use rotate-keys instead"), and `rotate-keys` always re-encrypts.
+- **2026-10-26 (complete lifecycle):** passed every forward step through the post-encryption checkpoint. It stopped at the restore: the reset, delivered as configuration-file fields followed by an ordinary start of the S1 container, did not complete within 600 seconds.
+- **2026-10-26 (run 8, passed):**
+  - every forward phase passed, including all 11 p0 negative checks and exactly one rotation;
+  - the explicit p0 restore passed, with exit status 0, the documented message at ERROR level and the reset flag;
+  - S1 recovered as a healthy single member, then S2 and S3 rejoined one at a time to 3/3 healthy etcd;
+  - the restored p0 controls matched byte-for-byte, the post-p0 canaries were absent, and the restored Secret was plaintext in raw etcd;
+  - the lifecycle audit and teardown passed;
+  - the Flux and workload acceptance checks were not applicable in disposable k3d and are not claimed as passed;
+  - during the planned concurrent stop, S1 exited 1 while S2 and S3 exited 143. The cause was not determined, and it remains an open observation.
+- **2026-10-26 (restore-mechanism diagnostic, not a complete rehearsal):** the explicit `k3s server --cluster-reset --cluster-reset-restore-path=<p0>` restored p0 and exited 0, with the documented message at ERROR level and the reset flag present. S1 was recovered with its network identity, and S2 and S3 rejoined one at a time. The generated encryption files stayed on disk while the status returned to not-configured.
 
-Both findings are corrected and statically re-tested. Phase transitions are now gated by the durable state of the enable restart round, not by status readability. The latest correction has not been rehearsed. The k3d rehearsal, the three-VM rehearsal and the live procedure remain to be performed. See [secrets-encryption.md](secrets-encryption.md#k3d-rehearsal-record-2026-10-24).
+All findings are corrected and statically re-tested:
+
+- phase transitions are gated by the durable state of the enable restart round, not by status readability;
+- the in-place rollback is removed;
+- after activation, the only rollback is a snapshot restore of the pre-enable checkpoint;
+- the restore is delivered by explicit invocation, accepted only with exit status 0, the documented message and the reset flag, and judged by status, readbacks and raw records rather than by the retained encryption files; the k3d rehearsal reproduces it with an auxiliary runner and a controlled network handoff that are rehearsal tooling only.
+
+Passing the static tests is not Stage 3 completion, and neither is the k3d rehearsal: the three-VM rehearsal is still pending, the live rollout is not approved and not performed, and Stage 3 is not complete or applied to the real cluster. See [secrets-encryption.md](secrets-encryption.md#rollback).
 
 The recovery-tools role has not been run against a node. Downloading, checksum verification against the real archive, installation, the server's `age --version` result and idempotence on a real node remain to be shown by a separately approved live run. See [recovery-tools.md](recovery-tools.md).
 

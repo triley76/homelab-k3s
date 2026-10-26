@@ -44,14 +44,14 @@
       - secrets_encryption_flag_state in ['present', 'absent']
       - >-
         secrets_encryption_flag_state == 'present'
-        or (se_encryptions == ['disabled'] and secrets_encryption_marker.phase in ['enable', 'reencrypt-after-disable'])
+        or (se_encryptions == ['disabled'] and secrets_encryption_marker.phase == 'enable')
     fail_msg: >-
       Restart refused. It requires a recorded procedure change, every server in a settled
       rotation stage ({{ secrets_encryption_settled_stages | join(', ') }}; never during
       re-encryption; during the enable restart round a server's status may instead be unavailable),
-      and flag_state=absent only when every server reports Disabled after enable or after
-      reencrypt-after-disable. Last change: {{ secrets_encryption_marker.phase }};
-      not settled: {{ se_unsettled or 'none' }}.
+      and flag_state=absent only before activation: every server Disabled and the last change
+      enable. After rotate-keys there is no in-place rollback; restore the pre-enable snapshot.
+      Last change: {{ secrets_encryption_marker.phase }}; not settled: {{ se_unsettled or 'none' }}.
     quiet: true
 
 - name: Enforce the restart order

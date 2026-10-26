@@ -41,6 +41,30 @@
     fail_msg: An existing snapshot already starts with {{ secrets_encryption_snapshot_name }}; wait and retry.
     quiet: true
 
+# A snapshot restores only with the server token in use when it was taken. Its
+# presence is confirmed by lstat alone: no content, checksum or MIME type is read.
+- name: Inspect the server token file without reading it
+  ansible.builtin.stat:
+    path: "{{ secrets_encryption_token_file }}"
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+    follow: false
+  register: secrets_encryption_token_stat
+
+- name: Require the server token file for a restorable checkpoint
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_token_stat.stat.exists | default(false)
+      - secrets_encryption_token_stat.stat.isreg | default(false)
+      - not (secrets_encryption_token_stat.stat.islnk | default(true))
+      - secrets_encryption_token_stat.stat.size | default(0) > 0
+      - secrets_encryption_token_stat.stat.uid | default(-1) == secrets_encryption_state_owner_uid | int
+    fail_msg: >-
+      The server token file is missing, empty, not a root-owned regular file, or a link. Without the
+      token in use when the snapshot is taken, the snapshot cannot be restored. Stop.
+    quiet: true
+
 - name: Record the snapshot metadata before the save
   ansible.builtin.set_fact:
     secrets_encryption_snapshot_meta_before: "{{ secrets_encryption_storage[inventory_hostname].snapshot_meta }}"
@@ -111,6 +135,23 @@
       - not secrets_encryption_snapshot_stat.stat.islnk
       - secrets_encryption_snapshot_stat.stat.size > 0
     quiet: true
+
+# The checkpoint record: label, file name, size, SHA-256 and the confirmed
+# presence of the token file (never its content). p0 is only accepted by enable
+# when its record exists and matches the file. Appended with lineinfile, like
+# the ledger, only after gather.yml found the file absent or a root-owned
+# regular file inside the root-only state directory.
+- name: Record the checkpoint metadata
+  ansible.builtin.lineinfile:
+    path: "{{ secrets_encryption_state_dir }}/checkpoints"
+    line: >-
+      {{ secrets_encryption_snapshot_stat.stat.mtime | int }} {{ secrets_encryption_snapshot_checkpoint }}
+      {{ secrets_encryption_snapshot_new[0] }} {{ secrets_encryption_snapshot_stat.stat.size }}
+      {{ secrets_encryption_snapshot_stat.stat.checksum }} token=present
+    create: true
+    owner: root
+    group: root
+    mode: '0600'
 
 - name: Gather the state again after the snapshot
   ansible.builtin.include_tasks: gather.yml
