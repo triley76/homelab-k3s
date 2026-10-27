@@ -81,7 +81,7 @@ The addresses above use the RFC 5737 documentation range and are examples rather
 | Flux Git source reconciliation | Validated |
 | Flux Kustomization reconciliation | Validated |
 | Serial Chrony rollout and enforced one-hour stability window | Validated |
-| Kubernetes Secrets encryption at rest (secretbox) | Implemented and statically tested; passed the required disposable k3d rehearsal, including the pre-enable snapshot restore; three-VM rehearsal pending; not approved for or applied to the live cluster |
+| Kubernetes Secrets encryption at rest (secretbox) | Implemented and statically tested; passed the required disposable k3d rehearsal, including the pre-enable snapshot restore; the three-VM rehearsal passed on 2026-10-27 under systemd, including both restores and the ordered drop-in removal; not approved for or applied to the live cluster |
 | GitOps platform-service expansion | In progress |
 
 The current Kubernetes baseline is pinned to **K3s v1.36.4+k3s1**. Flux **2.9.5** has been bootstrapped and validated against the V2 cluster.
@@ -162,7 +162,7 @@ It is statically tested and passed the required disposable k3d rehearsal on 2026
 - at the rollback re-encryption, because K3s rejects `reencrypt` for the secretbox provider;
 - at the snapshot restore, because a reset delivered through configuration-file fields did not complete. A focused diagnostic then restored the snapshot with the explicit `k3s server --cluster-reset` invocation.
 
-The procedure now gates every phase on the durable state of that round. With secretbox there is no in-place rollback after activation: the only rollback is a snapshot restore of the pre-enable checkpoint, a documented manual procedure that rolls back all Kubernetes and etcd state after that checkpoint. Passing the static tests is not completion, and neither is the k3d rehearsal: the three-VM rehearsal is still pending, the live rollout is not approved and has not been performed, and `site.yml` does not use it; see [docs/secrets-encryption.md](docs/secrets-encryption.md).
+The procedure now gates every phase on the durable state of that round. With secretbox there is no in-place rollback after activation: the only rollback is a snapshot restore of the pre-enable checkpoint, a documented manual procedure that rolls back all Kubernetes and etcd state after that checkpoint. Passing the static tests is not completion, and neither are the rehearsals: the three-VM rehearsal passed on 2026-10-27, but the live rollout is not approved and has not been performed, and `site.yml` does not use it; see [docs/secrets-encryption.md](docs/secrets-encryption.md).
 
 ## GitOps Boundary
 

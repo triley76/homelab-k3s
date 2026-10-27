@@ -506,7 +506,9 @@ All findings are corrected and statically re-tested:
 - after activation, the only rollback is a snapshot restore of the pre-enable checkpoint;
 - the restore is delivered by explicit invocation, accepted only with exit status 0, the documented message and the reset flag, and judged by status, readbacks and raw records rather than by the retained encryption files; the k3d rehearsal reproduces it with an auxiliary runner and a controlled network handoff that are rehearsal tooling only.
 
-Passing the static tests is not Stage 3 completion, and neither is the k3d rehearsal: the three-VM rehearsal is still pending, the live rollout is not approved and not performed, and Stage 3 is not complete or applied to the real cluster. See [secrets-encryption.md](secrets-encryption.md#rollback).
+The three-VM rehearsal **passed on 2026-10-27** at commit `825b09b`, under systemd: both cycles, the p2 and p0 restores, and the ordered drop-in removal. It found and corrected two repository defects: the service probe's split property argument (`0dea720`) and the removal round refused after its first server (`825b09b`). See the [three-VM record](secrets-encryption.md#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed).
+
+Passing the static tests is not Stage 3 completion, and neither are the rehearsals: the live rollout is not approved and not performed, and Stage 3 is not complete or applied to the real cluster. See [secrets-encryption.md](secrets-encryption.md#rollback).
 
 The recovery-tools role has not been run against a node. Downloading, checksum verification against the real archive, installation, the server's `age --version` result and idempotence on a real node remain to be shown by a separately approved live run. See [recovery-tools.md](recovery-tools.md).
 

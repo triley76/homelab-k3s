@@ -674,34 +674,46 @@ require("docs: restore by explicit invocation on the real servers; reset accepte
 STALE_STATUS = re.compile(
     r"k3d rehearsal has \*\*not\*\* passed|required k3d rehearsal has \*\*not passed\*\*|has \*\*not\*\* passed a rehearsal|"
     r"not yet passed a rehearsal|has not yet passed a rehearsal|implemented and statically tested only|It is statically tested only|"
-    r"complete rehearsal with the corrected restore has \*\*not\*\* run|complete rehearsal has not been run with the corrected restore")
+    r"complete rehearsal with the corrected restore has \*\*not\*\* run|complete rehearsal has not been run with the corrected restore|"
+    r"three-VM rehearsal is still pending|three-VM rehearsal pending|recorded as an open observation for the three-VM rehearsal")
 OVERCLAIM = re.compile(
-    r"three-VM rehearsal (has |was )?(passed|succeeded|completed)|live (rollout|procedure) (was|has been) (passed|performed|completed|applied)|live (rollout|procedure) (passed|succeeded)|"
+    r"live (rollout|procedure) (was|has been) (passed|performed|completed|applied)|live (rollout|procedure) (passed|succeeded)|"
+    r"live rollout (is|was|has been) (now )?approved|"
     r"Stage 3 (is|was|has been) (now )?(complete|completed|applied)\b(?! only)", re.I)
+THREE_VM_RECORD = ("### Three-VM rehearsal record (2026-10-27, commit 825b09b: passed)", "### Rehearsal questions")
+THREE_VM_FACTS = ("825b09b2b9bfffef1e227a843600a83665664d99", "0dea72001a3c757bc946e3f7259a9595ab242806",
+                  "`stage3-vm-rehearsal-evidence-20261027.tar.gz`, 208 files, 132,209 bytes, SHA-256 "
+                  "`078219c49d7572bab3f128cefd6496f3e94536349fb97490e8c83c549bf2ab80`",
+                  "The rehearsal **is not approval**", "**not applicable** in this rehearsal", "**every server stopped with exit status 0**")
+SENSITIVE_IN_RECORD = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b|[A-Za-z]:\\|/home/|/mnt/")
 
 
 def docs_status_current(doc, readme, validation, arch):
-    """The required k3d rehearsal is recorded as passed; the three-VM rehearsal pending; the live rollout neither approved nor
-    performed; Stage 3 neither complete nor applied. No stale "not passed" claim, no overclaim; S1's exit 1 recorded as open."""
+    """Both rehearsals recorded as passed: k3d (run 8) and three-VM (825b09b, with both corrections, the evidence and no host
+    addresses, MAC addresses or workstation paths); the live rollout neither approved nor performed; Stage 3 neither complete nor
+    applied. No stale "not passed" or "pending" claim, no overclaim; S1's k3d exit 1 recorded with the systemd result."""
     texts = (doc, readme, validation, arch)
     s1_obs = doc_section(doc, "**S1 shutdown observation:**", "**Encryption files:** see")
+    record = doc_section(doc, *THREE_VM_RECORD)
     return (
         not any(STALE_STATUS.search(x) for x in texts) and not any(OVERCLAIM.search(x) for x in texts)
         and "**The required disposable k3d rehearsal passed on 2026-10-26**" in doc
         and "### k3d rehearsal record (2026-10-26, run 8: passed)" in doc
-        and "**The three-VM rehearsal is still pending.**" in doc and "**The live rollout is not approved and not performed.**" in doc
+        and "**The three-VM rehearsal passed on 2026-10-27**" in doc and "**The live rollout is not approved and not performed.**" in doc
         and "**Stage 3 is not complete** and has not been applied to the real cluster" in doc
-        and "rehearsal **passed on 2026-10-26 (run 8)**" in validation and "three-VM rehearsal is still pending" in validation
-        and "passed the required disposable k3d rehearsal" in readme and "three-VM rehearsal pending" in readme
-        and "passed the required disposable k3d rehearsal" in arch and "three-VM rehearsal is still pending" in arch
+        and record != "" and all(x in record for x in THREE_VM_FACTS) and not SENSITIVE_IN_RECORD.search(record)
+        and "rehearsal **passed on 2026-10-26 (run 8)**" in validation and "three-VM rehearsal **passed on 2026-10-27**" in validation
+        and "passed the required disposable k3d rehearsal" in readme and "three-VM rehearsal passed on 2026-10-27" in readme
+        and "passed the required disposable k3d rehearsal" in arch and "three-VM rehearsal passed on 2026-10-27" in arch
         and all(x in s1_obs for x in ("S2 and S3 exited 143; **S1 exited 1**", "was not OOM-killed and was not restarted",
                                       "The cause of the exit status 1 was not determined",
-                                      "not as expected behavior and not as evidence of failure"))
+                                      "not as expected behavior and not as evidence of failure",
+                                      "**It did not reproduce under systemd:**"))
         and "did not compare their inode or modification time after the restore" in doc
         and "not applicable** in disposable k3d and are not claimed as passed" in doc)
 
 
-require("docs: k3d rehearsal recorded as passed; three-VM pending; live rollout not approved or performed; Stage 3 not complete; no stale or overclaimed status; S1 exit 1 recorded as open",
+require("docs: k3d and three-VM rehearsals recorded as passed (three-VM record sanitized, with both corrections and the evidence); live rollout not approved or performed; Stage 3 not complete; no stale or overclaimed status; S1's k3d exit 1 recorded with the systemd result",
         docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC, ARCH_DOC))
 require("docs: restore impact and acknowledgment, p0 definition, official restore sequence with S2/S3, acceptance criteria, disable not used",
         docs_restore_defined(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC))
@@ -1097,14 +1109,34 @@ structural_mutants += [
         ROLLBACK_DOC + "\nThe k3d rehearsal has **not** passed.\n", README_TEXT, VALIDATION_DOC, ARCH_DOC)),
     ("a stale README status", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT.replace(
         "passed the required disposable k3d rehearsal, including", "not yet passed a rehearsal, including", 1), VALIDATION_DOC, ARCH_DOC)),
-    ("a claim that the three-VM rehearsal passed", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT,
-        VALIDATION_DOC + "\nThe three-VM rehearsal passed.\n", ARCH_DOC)),
+    ("a stale claim that the three-VM rehearsal is pending", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT,
+        VALIDATION_DOC + "\nThe three-VM rehearsal is still pending.\n", ARCH_DOC)),
+    ("a claim that the live rollout is approved", lambda: docs_status_current(
+        ROLLBACK_DOC + "\nThe live rollout is approved.\n", README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the three-VM record removed", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        THREE_VM_RECORD[0], "### Three-VM rehearsal notes"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the three-VM record without the evidence hash", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "078219c49d7572bab3f128cefd6496f3e94536349fb97490e8c83c549bf2ab80", "(see the operator)"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the three-VM record without the first correction", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "0dea72001a3c757bc946e3f7259a9595ab242806", "an earlier commit"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the three-VM record claimed as approval", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "The rehearsal **is not approval**", "The rehearsal **approves the live rollout**"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("three-VM Flux acceptance claimed as passed", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "**not applicable** in this rehearsal", "**passed** in this rehearsal"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a host address in the three-VM record", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        THREE_VM_RECORD[0] + "\n", THREE_VM_RECORD[0] + "\n\nThe first server was 192.0.2.41.\n"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a MAC address in the three-VM record", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        THREE_VM_RECORD[0] + "\n", THREE_VM_RECORD[0] + "\n\nNIC 00:00:5e:00:53:01.\n"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a workstation path in the three-VM record", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        THREE_VM_RECORD[0] + "\n", THREE_VM_RECORD[0] + "\n\nKept in C:\\evidence.\n"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the systemd stop result dropped", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "**It did not reproduce under systemd:**", "It is unexplained:"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
     ("a claim that the live rollout was performed", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC,
         ARCH_DOC + "\nThe live rollout has been performed.\n")),
     ("a claim that Stage 3 is complete", lambda: docs_status_current(ROLLBACK_DOC.replace(
         "**Stage 3 is not complete** and has not been applied", "**Stage 3 is complete** and has been applied"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
-    ("the three-VM rehearsal no longer marked pending", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC,
-        ARCH_DOC.replace("three-VM rehearsal is still pending", "three-VM rehearsal follows"))),
+    ("the three-VM rehearsal no longer recorded as passed", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC,
+        ARCH_DOC.replace("three-VM rehearsal passed on 2026-10-27", "three-VM rehearsal follows"))),
     ("S1's exit 1 called expected", lambda: docs_status_current(ROLLBACK_DOC.replace(
         "not as expected behavior and not as evidence of failure", "as expected behavior"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
     ("S1's undetermined cause dropped", lambda: docs_status_current(ROLLBACK_DOC.replace(
