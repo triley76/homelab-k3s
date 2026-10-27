@@ -1163,6 +1163,32 @@ structural_mutants += [
     ("the service probe's property list unquoted (exact argv)",
      lambda: service_argv(yaml.safe_load(task_text["gather"].replace(SVC_QUOTED, SVC_UNQUOTED))) == SVC_ARGV),
 ]
+
+
+# The drop-in removal round (three-VM rehearsal, 2026-10-27): summarized from
+# recorded state after the enable restart round, refused as an injected fact,
+# and used only by the restart preconditions.
+def removal_round_wired(vars_, summarize_tasks, task_map):
+    names = [t.get("name") for t in summarize_tasks]
+    users = sorted(f for f, ts in task_map.items() for t in walk(ts) if "secrets_encryption_removal_round" in json.dumps(t)
+                   and t.get("name") != "Summarize the drop-in removal round")
+    return ("secrets_encryption_removal_round" in vars_["secrets_encryption_gathered_facts"]
+            and "Summarize the drop-in removal round" in names
+            and names.index("Summarize the enable restart round") < names.index("Summarize the drop-in removal round")
+            < names.index("Evaluate the common health gate")
+            and users == ["restart"])
+
+
+require("summarize.yml: the drop-in removal round follows the enable restart round, is refused as an injected fact and used only by the restart preconditions",
+        removal_round_wired(role_vars, task_files["summarize"], task_files))
+structural_mutants += [
+    ("the removal round no longer refused as an injected fact", lambda: removal_round_wired(dict(role_vars, secrets_encryption_gathered_facts=[
+        f for f in role_vars["secrets_encryption_gathered_facts"] if f != "secrets_encryption_removal_round"]), task_files["summarize"], task_files)),
+    ("the removal round summarized before the enable restart round", lambda: removal_round_wired(role_vars, mutate(task_files["summarize"], lambda ts: ts.insert(
+        0, ts.pop([x.get("name") for x in ts].index("Summarize the drop-in removal round")))), task_files)),
+    ("the removal round used by the gate", lambda: removal_round_wired(role_vars, task_files["summarize"], dict(task_files, gate=task_files["gate"] + [
+        {"name": "use", "ansible.builtin.debug": {"msg": "{{ secrets_encryption_removal_round }}"}}]))),
+]
 for label, check in structural_mutants:
     require(f"mutation (structure): {label} is detected", check() is False)
 
@@ -1849,7 +1875,8 @@ for label, path, fail, uid in (("a non-empty regular file owned by the state own
     sc = token_scenario(None, label, path, fail, uid)
     plays.append(play(sc["name"], sc["mocks"], sc["tasks"], sc["expect_fail"], sc["checks"], sc["extra_vars"]))
 
-round_task = picks("summarize", P0_TASK, "Summarize the enable restart round")
+REMOVAL_SUMMARY = "Summarize the drop-in removal round"
+round_task = picks("summarize", P0_TASK, "Summarize the enable restart round", REMOVAL_SUMMARY)
 restart_pre = round_task + picks("restart", "Enforce the restart preconditions", "Enforce the restart order", "Enforce the enable restart round")
 RP_ = "Enforce the restart preconditions"
 RO = "Enforce the restart order"
@@ -1916,6 +1943,93 @@ for label, mocks, host, fail in (
 plays.append(play("enable round: an unavailable status is not tolerated by the restart after rotate-keys",
                   cl(srv("enabled", "reencrypt_finished", dropin=True, key_type="XSalsa20-POLY1305"), UNAV, UNAV, phase="rotate-keys"),
                   restart_pre, RP_, extra_vars=RESTART))
+
+
+# ---------------------------------------------------------------- the drop-in removal round
+# Three-VM rehearsal, 2026-10-27: after k3s01's drop-in removal it reported
+# Disabled without a configuration file, and the preconditions refused k3s02.
+# Epochs: enable marker 90000 (cl), enable round 901xx-903xx, removals from 91000.
+def rs(enc, stage, dropin, change, start, verified, hashes=None, parsed=True, unavailable=False):
+    s = srv(enc, stage, hashes=(enc == "disabled") if hashes is None else hashes, dropin=dropin, parsed=parsed, unavailable=unavailable)
+    since = max(90000, change)
+    s.update(dropin_change_epoch=change, start_epoch=start, verified_epoch=verified, restarted_since_change=start > since,
+             checkpoint_reached=start > since and verified >= start and verified > since)
+    return s
+
+
+K1, K2, K3 = (rs("disabled", "start", True, c, c + 10, c + 50) for c in (90100, 90200, 90300))
+R1, R2, R3 = (rs("disabled-no-config", "none", False, c, c + 10, c + 50) for c in (91000, 91100, 91200))
+ABSENT_RUN = dict(RESTART, secrets_encryption_flag_state="absent")
+REMOVAL_RR = "secrets_encryption_removal_round"
+REMOVAL_CASES = {
+    "k3s02 after k3s01 completed": (cl(R1, K2, K3, phase="enable"), "k3s02"),
+    "earlier server without a recorded gate": (cl(rs("disabled-no-config", "none", False, 91000, 91010, 0), K2, K3, phase="enable"), "k3s02"),
+    "earlier server with a gate recorded before its restart":
+        (cl(rs("disabled-no-config", "none", False, 91000, 91010, 91005), K2, K3, phase="enable"), "k3s02"),
+    "earlier server without a drop-in change record": (cl(rs("disabled-no-config", "none", False, 0, 91010, 91050), K2, K3, phase="enable"), "k3s02"),
+    "earlier removal before the enable round completed (another round)":
+        (cl(rs("disabled-no-config", "none", False, 90200, 90210, 90250), K2, K3, phase="enable"), "k3s02"),
+    "earlier removal from before the enable marker (stale)":
+        (cl(rs("disabled-no-config", "none", False, 89000, 89100, 89200), K2, K3, phase="enable"), "k3s02"),
+    "k3s02 removed before k3s01's gate passed":
+        (cl(R1, rs("disabled-no-config", "none", False, 91040, 91110, 91150), K3, phase="enable"), "k3s03"),
+    "earlier no-config server still carrying its drop-in":
+        (cl(rs("disabled-no-config", "none", True, 91000, 91010, 91050), K2, K3, phase="enable"), "k3s02"),
+    "earlier server with an unparsed status": (cl(rs("disabled-no-config", "none", False, 91000, 91010, 91050, parsed=False), K2, K3,
+                                                  phase="enable"), "k3s02"),
+    "earlier server reporting Enabled": (cl(rs("enabled", "reencrypt_finished", False, 91000, 91010, 91050, hashes=True), K2, K3,
+                                            phase="enable"), "k3s02"),
+    "later server without its drop-in": (cl(R1, K2, rs("disabled", "start", False, 90300, 90310, 90350), phase="enable"), "k3s02"),
+    "later server with mismatched hashes": (cl(R1, K2, rs("disabled", "start", True, 90300, 90310, 90350, hashes=False), phase="enable"), "k3s02"),
+    "later server in stage reencrypt_finished": (cl(R1, K2, rs("disabled", "reencrypt_finished", True, 90300, 90310, 90350), phase="enable"),
+                                                 "k3s02"),
+    "later server reporting Enabled at stage start": (cl(R1, K2, rs("enabled", "start", True, 90300, 90310, 90350, hashes=True), phase="enable"),
+                                                      "k3s02"),
+    "later server with an unparsed status": (cl(R1, K2, rs("disabled", "start", True, 90300, 90310, 90350, parsed=False), phase="enable"), "k3s02"),
+    "later server restarted after the removal began": (cl(R1, K2, rs("disabled", "start", True, 90300, 91020, 91030), phase="enable"), "k3s02"),
+    "target already without configuration": (cl(R1, rs("disabled-no-config", "none", True, 90200, 90210, 90250), K3, phase="enable"), "k3s02"),
+    "target with an unavailable status": (cl(R1, rs("unknown", "none", True, 90200, 90210, 90250, parsed=False, unavailable=True), K3,
+                                             phase="enable"), "k3s02"),
+    "out of order: k3s03 before k3s02": (cl(R1, K2, K3, phase="enable"), "k3s03"),
+    "replay: k3s01 again": (cl(R1, K2, K3, phase="enable"), "k3s01"),
+    "replay: k3s02 again after its removal": (cl(R1, R2, K3, phase="enable"), "k3s02"),
+    "replay: k3s03 after the round completed": (cl(R1, R2, R3, phase="enable"), "k3s03"),
+    "after rotate-keys": (cl(R1, K2, K3, phase="rotate-keys"), "k3s02"),
+    "with an incomplete enable round": (cl(R1, K2, rs("disabled", "start", True, 90300, 90310, 0), phase="enable"), "k3s02"),
+    "with a stale ledger (rotate-keys recorded)": (cl(R1, K2, K3, phase="enable", events=STALE), "k3s02"),
+    "with a malformed ledger": (cl(R1, K2, K3, phase="enable", ledger_malformed=True), "k3s02"),
+    "without a pre-enable checkpoint": (cl(R1, K2, K3, phase="enable", pre_enable_snapshot=False), "k3s02"),
+}
+
+
+def removal_scenario(base, label, case, fail, extra_vars=ABSENT_RUN, checks=()):
+    mocks, host = REMOVAL_CASES[case]
+    tasks = (picks("summarize", P0_TASK, "Summarize the enable restart round", REMOVAL_SUMMARY, base=base)
+             + picks("restart", RP_, RO, ROUND_ENFORCE, base=base))
+    return dict(name=f"removal round: {label}", mocks=mocks, tasks=tasks, expect_fail=fail, checks=list(checks), extra_vars=extra_vars, host=host)
+
+
+def add_removal(sc):
+    plays.append(play(sc["name"], sc["mocks"], sc["tasks"], sc["expect_fail"], sc["checks"], sc["extra_vars"], sc["host"]))
+
+
+REMOVAL_CASES["k3s01 first, every server configured-disabled"] = (cl(K1, K2, K3, phase="enable"), "k3s01")
+REMOVAL_CASES["k3s03 after k3s01 and k3s02 completed"] = (cl(R1, R2, K3, phase="enable"), "k3s03")
+REMOVAL_CASES["k3s02 while k3s01 still carries its drop-in"] = (cl(K1, K2, K3, phase="enable"), "k3s02")
+for case, fail, checks in (
+        ("k3s01 first, every server configured-disabled", False, [f"{REMOVAL_RR}.next == 'k3s01'", f"{REMOVAL_RR}.removed == []", f"{REMOVAL_RR}.consistent | bool",
+                                                                 f"not ({REMOVAL_RR}.active | bool)"]),
+        ("k3s02 after k3s01 completed", False, [f"{REMOVAL_RR}.next == 'k3s02'", f"{REMOVAL_RR}.removed == ['k3s01']", f"{REMOVAL_RR}.active | bool",
+                                                f"{REMOVAL_RR}.consistent | bool", f"{REMOVAL_RR}.problems == ''"]),
+        ("k3s03 after k3s01 and k3s02 completed", False, [f"{REMOVAL_RR}.next == 'k3s03'", f"{REMOVAL_RR}.removed == ['k3s01', 'k3s02']"]),
+        ("k3s02 while k3s01 still carries its drop-in", RO, [])):
+    add_removal(removal_scenario(None, case, case, fail, checks=checks))
+for case in [c for c in REMOVAL_CASES if c not in ("k3s01 first, every server configured-disabled", "k3s02 after k3s01 completed",
+                                                   "k3s03 after k3s01 and k3s02 completed", "k3s02 while k3s01 still carries its drop-in")]:
+    add_removal(removal_scenario(None, f"refused: {case}", case, RP_))
+add_removal(removal_scenario(None, "refused: the stuck state with flag_state=present", "k3s02 after k3s01 completed", RP_, extra_vars=RESTART))
+add_removal(removal_scenario(None, "refused: the stuck state outside the restart phase", "k3s02 after k3s01 completed", RP_,
+                        extra_vars={"secrets_encryption_flag_state": "absent"}))
 
 # ---------------------------------------------------------------- the exclusive enable restart round (gate.yml)
 # k3d, 2026-10-24: status became readable and settled on every server after S1
@@ -2378,7 +2492,7 @@ def health_scenario(base, label, mocks, problem, extra_vars):
 
 
 def restart_scenario(base, label, mocks, host, fail):
-    tasks = (picks("summarize", P0_TASK, "Summarize the enable restart round", base=base)
+    tasks = (picks("summarize", P0_TASK, "Summarize the enable restart round", REMOVAL_SUMMARY, base=base)
              + picks("restart", "Enforce the restart preconditions", "Enforce the restart order", ROUND_ENFORCE, base=base))
     return dict(name=f"enable round: {label}", mocks=mocks, tasks=tasks, expect_fail=fail, checks=[], extra_vars=RESTART, host=host)
 
@@ -2525,7 +2639,7 @@ def rotation_scenario(base, label, mocks, fail, extra_vars=None):
 
 
 def dropin_removal_scenario(base, label, mocks, fail):
-    tasks = (picks("summarize", P0_TASK, "Summarize the enable restart round", base=base)
+    tasks = (picks("summarize", P0_TASK, "Summarize the enable restart round", REMOVAL_SUMMARY, base=base)
              + picks("restart", "Enforce the restart preconditions", base=base))
     return dict(name=f"drop-in removal: {label}", mocks=mocks, tasks=tasks, expect_fail=fail, checks=[],
                 extra_vars={"secrets_encryption_flag_state": "absent"})
@@ -2625,6 +2739,50 @@ add(service_probe_scenario(None, "systemctl receives the property list as one ar
 mutants += [
     ("the service probe's property list unquoted", [("gather", SVC_QUOTED, SVC_UNQUOTED)],
      lambda b: service_probe_scenario(b, "property list unquoted")),
+]
+
+
+def rm_mutant(label, file, old, new, case, fail, **kw):
+    return (f"removal round: {label}", [(file, old, new)], lambda b: removal_scenario(b, case, case, fail, **kw))
+
+
+mutants += [
+    rm_mutant("a removed server may keep its drop-in", "summarize", "ns.open and not s.dropin_present | bool and ", "ns.open and ",
+              "earlier no-config server still carrying its drop-in", RP_),
+    rm_mutant("a removed server's status need not parse", "summarize", " and s.status.parsed | bool\n", "\n",
+              "earlier server with an unparsed status", RP_),
+    rm_mutant("a removed server may report any encryption", "summarize", "             and s.status.encryption == 'disabled-no-config' -%}",
+              "             -%}", "earlier server reporting Enabled", RP_),
+    rm_mutant("removals need not follow one another", "summarize", "\n             <= secrets_encryption_servers[se_servers[i - 1]].verified_epoch | int",
+              " < 0", "k3s02 removed before k3s01's gate passed", RP_),
+    rm_mutant("a later server may lack its drop-in", "summarize", "{%- if not (s.dropin_present | bool and s.status.encryption == 'disabled'",
+              "{%- if not (s.status.encryption == 'disabled'", "later server without its drop-in", RP_),
+    rm_mutant("a later server may report any encryption", "summarize", "s.status.encryption == 'disabled' and s.status.stage == 'start'",
+              "s.status.stage == 'start'", "later server reporting Enabled at stage start", RP_),
+    rm_mutant("a later server may be in any settled stage", "summarize", " and s.status.stage == 'start'\n", "\n",
+              "later server in stage reencrypt_finished", RP_),
+    rm_mutant("a later server's hashes need not match", "summarize", "s.status.hashes_match | bool and (n == 0", "(n == 0",
+              "later server with mismatched hashes", RP_),
+    rm_mutant("a later server may have restarted during the removal round", "summarize", "(n == 0 or s.verified_epoch | int < first)", "true",
+              "later server restarted after the removal began", RP_),
+    rm_mutant("the first removal judged as if earlier servers were removed", "summarize", "(n == 0 or s.verified_epoch | int < first)",
+              "(s.verified_epoch | int < first)", "k3s01 first, every server configured-disabled", False, checks=[f"{REMOVAL_RR}.consistent | bool"]),
+    rm_mutant("the removal round without a complete enable round", "summarize", 'se_base: "{{ se_er.complete | bool and ', 'se_base: "{{ ',
+              "with an incomplete enable round", RP_),
+    rm_mutant("the removal round without a consistent ledger", "summarize", " and se_er.ledger_ok | bool and ", " and ",
+              "with a stale ledger (rotate-keys recorded)", RP_),
+    rm_mutant("the removal round without the pre-enable checkpoint", "summarize", " and se_er.checkpoint_ok | bool }}", " }}",
+              "without a pre-enable checkpoint", RP_),
+    rm_mutant("the tolerance with the drop-in requested", "restart", "{{ secrets_encryption_flag_state == 'absent' and (secrets_encryption_phase",
+              "{{ (secrets_encryption_phase", "k3s02 after k3s01 completed", RP_, extra_vars=RESTART),
+    rm_mutant("the tolerance outside the restart phase", "restart", " and (secrets_encryption_phase | default('')) == 'restart'\n", "\n",
+              "k3s02 after k3s01 completed", RP_, extra_vars={"secrets_encryption_flag_state": "absent"}),
+    rm_mutant("the tolerance for an inconsistent round", "restart", "and se_removal.consistent | bool and inventory_hostname", "and inventory_hostname",
+              "later server without its drop-in", RP_),
+    rm_mutant("the tolerance for any server", "restart", " and inventory_hostname == se_removal.next }}", " }}", "replay: k3s01 again", RP_),
+    rm_mutant("the tolerance for servers that were not removed", "restart", "{%- elif se_removal_tolerate | bool and h in se_removal.removed -%}",
+              "{%- elif se_removal_tolerate | bool -%}", "later server with an unparsed status", RP_),
+    rm_mutant("the removal round not admitted", "restart", "        or se_removal_tolerate | bool\n", "", "k3s02 after k3s01 completed", False),
 ]
 for label, edits, scenario in mutants:
     add(scenario(mutant_dir(edits)), invert=True, prefix=f"mutant killed: {label}: ")
@@ -2868,6 +3026,9 @@ guard_cases = [
                                                  "out_of_order": "", "complete": False}, secrets_encryption_confirm=C("restart", "k3s01")), False),
     ("restart: an injected enable restart round is refused in a rehearsal too", "restart", "rehearsal", "s3r01",
      dict(REH, secrets_encryption_enable_round={"tolerate_unavailable_status": True}, secrets_encryption_confirm=C("restart", "s3r01")), False),
+    ("restart: an injected drop-in removal round is refused in a rehearsal", "restart", "rehearsal", "s3r02",
+     dict(REH, secrets_encryption_flag_state="absent", secrets_encryption_removal_round={"consistent": True, "next": "s3r02", "removed": ["s3r01"]},
+          secrets_encryption_confirm=C("restart", "s3r02")), False),
     ("restart: injected parsed status is refused", "restart", "live", "k3s02",
      dict(LIVE, secrets_encryption_status_by_server={}, secrets_encryption_confirm=C("restart", "k3s02")), False),
     ("restart: injected ledger events are refused", "restart", "live", "k3s01",

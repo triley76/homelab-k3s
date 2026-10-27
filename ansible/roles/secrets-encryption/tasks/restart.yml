@@ -25,6 +25,13 @@
     se_all: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | list }}"
     se_encryptions: "{{ se_all | map(attribute='status') | map(attribute='encryption') | unique | list }}"
     se_tolerate: "{{ secrets_encryption_enable_round.tolerate_unavailable_status | bool }}"
+    # Only the next server of an active, consistent drop-in removal round, in a
+    # removal run, accepts the servers before it reporting Disabled without a
+    # configuration file: their own removal completed (summarize.yml).
+    se_removal: "{{ secrets_encryption_removal_round }}"
+    se_removal_tolerate: >-
+      {{ secrets_encryption_flag_state == 'absent' and (secrets_encryption_phase | default('')) == 'restart'
+      and se_removal.consistent | bool and inventory_hostname == se_removal.next }}
     se_unsettled: >-
       {%- set ns = namespace(out=[]) -%}
       {%- for h in groups['servers'] -%}
@@ -32,6 +39,7 @@
       {%- if st.parsed | bool and st.stage in secrets_encryption_settled_stages -%}
       {%- elif se_tolerate | bool and (st.unavailable | default(false) | bool
                or (st.parsed | bool and st.encryption == 'disabled-no-config')) -%}
+      {%- elif se_removal_tolerate | bool and h in se_removal.removed -%}
       {%- else -%}
       {%- set ns.out = ns.out + [h] -%}
       {%- endif -%}
@@ -45,13 +53,17 @@
       - >-
         secrets_encryption_flag_state == 'present'
         or (se_encryptions == ['disabled'] and secrets_encryption_marker.phase == 'enable')
+        or se_removal_tolerate | bool
     fail_msg: >-
       Restart refused. It requires a recorded procedure change, every server in a settled
       rotation stage ({{ secrets_encryption_settled_stages | join(', ') }}; never during
       re-encryption; during the enable restart round a server's status may instead be unavailable),
       and flag_state=absent only before activation: every server Disabled and the last change
-      enable. After rotate-keys there is no in-place rollback; restore the pre-enable snapshot.
-      Last change: {{ secrets_encryption_marker.phase }}; not settled: {{ se_unsettled or 'none' }}.
+      enable, or, in the drop-in removal round, every earlier server's removal completed and the
+      target the next server. After rotate-keys there is no in-place rollback; restore the
+      pre-enable snapshot. Last change: {{ secrets_encryption_marker.phase }}; not settled:
+      {{ se_unsettled or 'none' }}; removal round: next {{ se_removal.next or 'none' }},
+      problems {{ se_removal.problems or 'none' }}.
     quiet: true
 
 - name: Enforce the restart order

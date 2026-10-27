@@ -129,6 +129,7 @@ secrets_encryption_verifier_tokens:
 # restart round that alone may tolerate an unavailable status.
 secrets_encryption_gathered_facts:
   - secrets_encryption_enable_round
+  - secrets_encryption_removal_round
   - secrets_encryption_servers
   - secrets_encryption_status_by_server
   - secrets_encryption_parsed

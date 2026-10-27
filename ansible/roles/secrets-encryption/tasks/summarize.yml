@@ -246,5 +246,62 @@
         and (secrets_encryption_phase | default('')) == 'restart'
         and secrets_encryption_flag_state == 'present' }}
 
+# The drop-in removal round before activation (docs/secrets-encryption.md,
+# "The removal round"). Pure evaluation from recorded state; no variable
+# switches it on. It exists only while the enable restart round (which needs
+# the enable marker) is complete with a consistent ledger and pre-enable
+# checkpoint; completion means every server restarted after its own last
+# drop-in change and recorded a passed post-restart gate (checkpoint_reached).
+# The removed servers are the prefix, in inventory order, whose drop-in is
+# absent and that report Disabled without a configuration file. The removals
+# ran one after another: each began after the previous server's recorded gate,
+# and the first after the recorded gate of every server that still carries the
+# drop-in, so after the enable marker and the completed enable round. Every
+# remaining server still carries the drop-in and reports Disabled, stage start
+# and matching hashes. Anything else is a problem, and an inconsistent round
+# admits no removal.
+- name: Summarize the drop-in removal round
+  vars:
+    se_servers: "{{ groups['servers'] }}"
+    se_er: "{{ secrets_encryption_enable_round }}"
+    se_base: "{{ se_er.complete | bool and se_er.ledger_ok | bool and se_er.checkpoint_ok | bool }}"
+    se_removed: >-
+      {%- set ns = namespace(n=0, open=true) -%}
+      {%- for h in se_servers -%}
+      {%- set s = secrets_encryption_servers[h] -%}
+      {%- if ns.open and not s.dropin_present | bool and s.status.parsed | bool
+             and s.status.encryption == 'disabled-no-config' -%}
+      {%- set ns.n = ns.n + 1 -%}
+      {%- else -%}
+      {%- set ns.open = false -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.n }}
+    se_problems: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- set n = se_removed | int -%}
+      {%- set first = secrets_encryption_servers[se_servers[0]].dropin_change_epoch | int -%}
+      {%- for i in range(1, n) -%}
+      {%- if secrets_encryption_servers[se_servers[i]].dropin_change_epoch | int
+             <= secrets_encryption_servers[se_servers[i - 1]].verified_epoch | int -%}
+      {%- set ns.out = ns.out + [se_servers[i] ~ ' removed before ' ~ se_servers[i - 1] ~ ' passed'] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- for h in se_servers[n:] -%}
+      {%- set s = secrets_encryption_servers[h] -%}
+      {%- if not (s.dropin_present | bool and s.status.encryption == 'disabled' and s.status.stage == 'start'
+                  and s.status.hashes_match | bool and (n == 0 or s.verified_epoch | int < first)) -%}
+      {%- set ns.out = ns.out + [h ~ ' not configured-disabled with its drop-in'] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | join(', ') }}
+  ansible.builtin.set_fact:
+    secrets_encryption_removal_round:
+      active: "{{ se_base | bool and se_removed | int > 0 }}"
+      consistent: "{{ se_base | bool and se_problems == '' }}"
+      removed: "{{ se_servers[:se_removed | int] if se_base | bool else [] }}"
+      next: "{{ se_servers[se_removed | int] if (se_base | bool and se_removed | int < se_servers | length) else '' }}"
+      problems: "{{ se_problems if se_base | bool else '' }}"
+
 - name: Evaluate the common health gate
   ansible.builtin.include_tasks: evaluate.yml
