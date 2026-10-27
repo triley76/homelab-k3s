@@ -45,17 +45,38 @@
       {%- endfor -%}
       {{ ns.out | join(';;') }}
 
+# The enable restart round latches the p0 that enable accepted. enable needs a
+# fresh p0, and the exclusive round refuses any new snapshot, so a round that
+# outlasts the freshness limit would otherwise refuse its own next restart with
+# no way forward. Only the restart of the next server in a consistent enable
+# restart round, with the drop-in requested, may rely on that p0 once it is
+# older than the limit. It must still be the newest Stage 3 snapshot, recorded
+# once as p0 by name and size in well-formed checkpoint records, and older than
+# the enable marker. enable, rotation, snapshots and every other phase keep the
+# freshness limit; preservation is checked unchanged.
 - name: Evaluate snapshot freshness
   vars:
     se_snaps: "{{ secrets_encryption_storage[groups['servers'][0]].stage3_snapshots }}"
     se_newest: "{{ se_snaps | map(attribute='mtime') | map('int') | max if se_snaps | length > 0 else 0 }}"
     se_age: "{{ secrets_encryption_now_epoch | int - se_newest | int }}"
+    se_round: "{{ secrets_encryption_enable_round | default({}) }}"
+    se_p0: "{{ secrets_encryption_p0 | default({}) }}"
+    se_p0_latched: >-
+      {{ (secrets_encryption_phase | default('')) == 'restart'
+      and (secrets_encryption_flag_state | default('present')) == 'present'
+      and se_round.ledger_ok | default(false) | bool and se_round.checkpoint_ok | default(false) | bool
+      and se_round.out_of_order | default('unknown') == '' and inventory_hostname == se_round.next | default('')
+      and se_p0.newest_is_p0 | default(false) | bool and se_p0.newest_recorded | default(false) | bool
+      and not (se_p0.records_malformed | default(true) | bool)
+      and se_newest | int > 0 and se_newest | int < secrets_encryption_marker.epoch | int }}
   ansible.builtin.set_fact:
     secrets_encryption_snapshot_gate:
       newest_epoch: "{{ se_newest | int }}"
       age_seconds: "{{ se_age | int if se_newest | int > 0 else -1 }}"
+      p0_latched: "{{ se_p0_latched | bool }}"
       fresh: >-
-        {{ se_newest | int > 0 and se_age | int >= -60
+        {{ (se_newest | int > 0 and se_age | int >= -60
         and se_age | int <= (secrets_encryption_snapshot_max_age_minutes | int) * 60
         and (not (secrets_encryption_snapshot_after_change | default(false) | bool)
-             or se_newest | int > secrets_encryption_marker.epoch | int) }}
+             or se_newest | int > secrets_encryption_marker.epoch | int))
+        or se_p0_latched | bool }}

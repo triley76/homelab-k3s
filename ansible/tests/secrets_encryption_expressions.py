@@ -154,7 +154,8 @@ require("vars: etcdctl pinned to v3.6.14 with the official SHA-256, as role vars
 require("vars: live hosts are k3s01, k3s02, k3s03", role_vars["secrets_encryption_live_hosts"] == ["k3s01", "k3s02", "k3s03"])
 require("vars: settled stages are start and reencrypt_finished only",
         role_vars["secrets_encryption_settled_stages"] == ["start", "reencrypt_finished"])
-require("vars: no procedure path is rehearsal-approved yet", role_vars["secrets_encryption_rehearsal_approved_paths"] == [])
+require("vars: drop-in removal before activation is the only rehearsal-approved path (three-VM rehearsal, 2026-10-27)",
+        role_vars["secrets_encryption_rehearsal_approved_paths"] == ["flag-removal"])
 require("vars: install-etcdctl is the rehearsal-only phase", role_vars["secrets_encryption_rehearsal_only_phases"] == ["install-etcdctl"])
 require("vars: state files are root-owned (uid 0)", role_vars["secrets_encryption_state_owner_uid"] == 0)
 require("vars: canary values live in a root-only tmpfs directory under /run", role_vars["secrets_encryption_canary_dir"].startswith("/run/"))
@@ -590,7 +591,7 @@ def docs_restore_defined(doc, readme, validation):
 
 require("role: no phase runs secrets-encrypt disable, reencrypt, prepare or rotate, and no rollback phase or playbook exists",
         no_inplace_rollback(task_files, task_text, PLAYBOOK_NAMES, role_vars))
-require("restart.yml and guard.yml: drop-in removal only before activation (marker enable); the only not-yet-approved path",
+require("restart.yml and guard.yml: drop-in removal only before activation (marker enable); the only path that needs rehearsal approval",
         flag_removal_preactivation_only(task_text["restart"], task_text["guard"]))
 require("rotate.yml: the enabling rotation requires the pre-enable snapshot (the rollback boundary) and a consistent ledger",
         rotation_requires_p0(task_files["rotate"]))
@@ -1221,6 +1222,96 @@ structural_mutants += [
     ("the removal round used by the gate", lambda: removal_round_wired(role_vars, task_files["summarize"], dict(task_files, gate=task_files["gate"] + [
         {"name": "use", "ansible.builtin.debug": {"msg": "{{ secrets_encryption_removal_round }}"}}]))),
 ]
+
+
+# Live-readiness review (2026-10-27): drop-in removal before activation is the
+# only rehearsal-approved path, and the guard still refuses any other path live.
+def approval_exact(vars_, guard_text):
+    return (vars_["secrets_encryption_rehearsal_approved_paths"] == ["flag-removal"]
+            and "or se_path in secrets_encryption_rehearsal_approved_paths" in guard_text
+            and "se_path == '' or secrets_encryption_environment == 'rehearsal'" in guard_text)
+
+
+# The p0 latch is evaluated only in checks.yml, and the gate still enforces freshness after the exclusive-round lock.
+def latch_wired(checks_text, gate_tasks):
+    names = [t.get("name") for t in gate_tasks]
+    return (checks_text.count("se_p0_latched") == 3 and "or se_p0_latched | bool }}" in checks_text
+            and not any("p0_latched" in task_text[f] for f in task_text if f != "checks")
+            and names.index("Enforce the exclusive enable restart round") < names.index("Enforce snapshot freshness"))
+
+
+# Phase binding (live-readiness review, 2026-10-27): every guarded play has
+# exactly one committed mapping entry, from its exact name to its own phase.
+GUARDED_FILES = sorted(p.stem for p in ans.glob("*.yml") if "tasks_from: guard.yml" in p.read_text())
+BIND_THAT = ["se_expected in se_allowed", "secrets_encryption_phase | default('') == se_expected"]
+
+
+def play_binding_ok(vars_, defaults_, guard_tasks, books):
+    m = vars_.get("secrets_encryption_play_phases")
+    if not isinstance(m, dict):
+        return False
+    plays_ = {b[0]["name"]: b[0]["vars"]["secrets_encryption_phase"] for b in books.values()}
+    phases = [ph for v in m.values() for ph in (v if isinstance(v, list) else [None])]
+
+    def phase_ok(name, var):
+        v = m.get(name)
+        if not isinstance(v, list) or not v:
+            return False
+        if "{{" in var:  # the canary play: its action selects one of its own phases
+            return var.startswith("canary-{{") and len(v) > 1 and all(str(x).startswith("canary-") for x in v)
+        return v == [var]
+
+    bind = guard_tasks[0] if guard_tasks else {}
+    return (sorted(m) == sorted(plays_) and len(plays_) == len(books)
+            and all(phase_ok(n, v) for n, v in plays_.items())
+            and len(phases) == len(set(phases)) and sorted(phases) == sorted(vars_["secrets_encryption_mutating_phases"])
+            and "secrets_encryption_play_phases" not in defaults_
+            and bind.get("name") == "Bind the phase to the running play"
+            and bind.get("ansible.builtin.assert", {}).get("that") == BIND_THAT
+            and bind.get("vars", {}).get("se_allowed") == "{{ secrets_encryption_play_phases[ansible_play_name] | default([]) }}")
+
+
+def with_phases(fn):
+    m = copy.deepcopy(role_vars["secrets_encryption_play_phases"])
+    fn(m)
+    return dict(role_vars, secrets_encryption_play_phases=m)
+
+
+RESTART_PLAY = "Restart one K3s server for the secrets-encryption procedure"
+require("phase playbooks: exactly the six mutating playbooks import the guard", GUARDED_FILES == sorted(MUTATING))
+require("vars and guard.yml: every guarded play is bound to its own committed phase, first in the guard, before facts",
+        play_binding_ok(role_vars, role_defaults, task_files["guard"], playbooks))
+structural_mutants += [
+    ("a guarded play without a mapping", lambda: play_binding_ok(with_phases(lambda m: m.pop(RESTART_PLAY)), role_defaults,
+                                                                 task_files["guard"], playbooks)),
+    ("a play mapped to another phase", lambda: play_binding_ok(with_phases(lambda m: m.update({RESTART_PLAY: ["restart-x"]})), role_defaults,
+                                                               task_files["guard"], playbooks)),
+    ("a phase mapped twice", lambda: play_binding_ok(with_phases(lambda m: m.update({"Take a Stage 3 on-demand etcd snapshot": ["snapshot", "restart"]})),
+                                                     role_defaults, task_files["guard"], playbooks)),
+    ("a mapping for a play that does not exist", lambda: play_binding_ok(with_phases(lambda m: m.update({"Some other play": ["enable-x"]})),
+                                                                         role_defaults, task_files["guard"], playbooks)),
+    ("an injectable mapping (a default)", lambda: play_binding_ok(role_vars, dict(role_defaults, secrets_encryption_play_phases={}),
+                                                                  task_files["guard"], playbooks)),
+    ("the binding not first in the guard", lambda: play_binding_ok(role_vars, role_defaults, mutate(task_files["guard"], lambda ts: ts.insert(
+        1, ts.pop(0))), playbooks)),
+    ("the binding without the phase equality", lambda: play_binding_ok(role_vars, role_defaults, mutate(task_files["guard"], lambda ts: ts[0][
+        "ansible.builtin.assert"]["that"].pop()), playbooks)),
+]
+require("vars and guard: only flag-removal is rehearsal-approved, and the guard still refuses unapproved paths live",
+        approval_exact(role_vars, task_text["guard"]))
+require("checks.yml: the p0 latch is evaluated only there, and the gate keeps the exclusive-round lock before freshness",
+        latch_wired(task_text["checks"], task_files["gate"]))
+structural_mutants += [
+    ("a second approved path", lambda: approval_exact(dict(role_vars, secrets_encryption_rehearsal_approved_paths=["flag-removal", "reencrypt"]),
+                                                     task_text["guard"])),
+    ("the approval removed", lambda: approval_exact(dict(role_vars, secrets_encryption_rehearsal_approved_paths=[]), task_text["guard"])),
+    ("the guard admitting any path live", lambda: approval_exact(role_vars, task_text["guard"].replace(
+        "se_path == '' or secrets_encryption_environment == 'rehearsal'", "true or secrets_encryption_environment == 'rehearsal'"))),
+    ("the latch not applied to freshness", lambda: latch_wired(task_text["checks"].replace("or se_p0_latched | bool }}", "}}"), task_files["gate"])),
+    ("freshness enforced before the exclusive-round lock", lambda: latch_wired(task_text["checks"], mutate(task_files["gate"], lambda ts: ts.insert(
+        [x.get("name") for x in ts].index("Enforce the exclusive enable restart round"),
+        ts.pop([x.get("name") for x in ts].index("Enforce snapshot freshness")))))),
+]
 for label, check in structural_mutants:
     require(f"mutation (structure): {label} is detected", check() is False)
 
@@ -1757,6 +1848,89 @@ plays.append(play("freshness: a snapshot older than the last change is refused w
 plays.append(play("freshness: a snapshot newer than the last change passes when required",
                   store(storage(stage3=[("stage3-p1-x", 95000)])), checks_tasks, False, [FR],
                   {"secrets_encryption_snapshot_after_change": True}))
+
+# The p0 latch (live-readiness review, 2026-10-27): the exclusive enable round
+# refuses new snapshots, so a round that outlasts the freshness limit must not
+# refuse its own next restart. Marker 90000 (enable), p0 at 89000, now 100000:
+# p0 is 11000 s old, beyond the 7200 s limit.
+LATCH_ROUND = {"active": True, "complete": False, "next": "k3s02", "ledger_ok": True, "checkpoint_ok": True, "out_of_order": ""}
+LATCH_P0 = {"newest_is_p0": True, "newest_recorded": True, "records_malformed": False}
+LATCHED = "secrets_encryption_snapshot_gate.p0_latched | bool"
+
+
+def latch_mocks(round_=None, p0=None, stage3=(("stage3-p0-pre-enable-x", 89000),), marker_epoch=90000):
+    m = store(storage(stage3=list(stage3)))
+    m["secrets_encryption_marker"] = dict(m["secrets_encryption_marker"], epoch=marker_epoch)
+    m["secrets_encryption_enable_round"] = dict(LATCH_ROUND, **(round_ or {}))
+    m["secrets_encryption_p0"] = dict(LATCH_P0, **(p0 or {}))
+    return m
+
+
+LATCH_CASES = {
+    "the next restart of the round with a stale p0": (latch_mocks(), "k3s02", RESTART),
+    "the first restart of the round with a stale p0": (latch_mocks({"next": "k3s01"}), "k3s01", RESTART),
+    "enable with a stale p0": (latch_mocks(), "k3s02", {"secrets_encryption_phase": "enable"}),
+    "rotation with a stale p0": (latch_mocks(), "k3s02", {"secrets_encryption_phase": "rotate-keys"}),
+    "canary controls with a stale p0": (latch_mocks(), "k3s02", {"secrets_encryption_phase": "canary-create-control"}),
+    "drop-in removal with a stale p0": (latch_mocks(), "k3s02", dict(RESTART, secrets_encryption_flag_state="absent")),
+    "a skipped server": (latch_mocks(), "k3s03", RESTART),
+    "a replayed server": (latch_mocks(), "k3s01", RESTART),
+    "a completed round": (latch_mocks({"complete": True, "next": ""}), "k3s02", RESTART),
+    "no active round": (latch_mocks({"active": False, "next": ""}), "k3s02", RESTART),
+    "an inconsistent ledger": (latch_mocks({"ledger_ok": False}), "k3s02", RESTART),
+    "no recorded pre-enable checkpoint": (latch_mocks({"checkpoint_ok": False}), "k3s02", RESTART),
+    "an out-of-order round": (latch_mocks({"out_of_order": "k3s03"}), "k3s02", RESTART),
+    "a newest snapshot that is not p0": (latch_mocks(p0={"newest_is_p0": False}), "k3s02", RESTART),
+    "a p0 without a matching record": (latch_mocks(p0={"newest_recorded": False}), "k3s02", RESTART),
+    "malformed checkpoint records": (latch_mocks(p0={"records_malformed": True}), "k3s02", RESTART),
+    "a p0 newer than the enable marker": (latch_mocks(marker_epoch=80000, stage3=(("stage3-p0-pre-enable-x", 85000),)), "k3s02", RESTART),
+    "no Stage 3 snapshot on the first server": (latch_mocks(stage3=()), "k3s02", RESTART),
+}
+
+
+def latch_scenario(base, label, case, fresh):
+    mocks, host, extra = LATCH_CASES[case]
+    tasks = picks("checks", "Evaluate snapshot and database preservation", "Evaluate snapshot freshness", base=base)
+    checks = [FR, LATCHED] if fresh else [f"not {FR}", f"not {LATCHED}"]
+    return dict(name=f"p0 latch: {label}", mocks=mocks, tasks=tasks, expect_fail=False, checks=checks, extra_vars=extra, host=host)
+
+
+LATCH_ALLOWED = ("the next restart of the round with a stale p0", "the first restart of the round with a stale p0")
+for case in LATCH_CASES:
+    sc = latch_scenario(None, ("latched: " if case in LATCH_ALLOWED else "not latched: ") + case, case, case in LATCH_ALLOWED)
+    plays.append(play(sc["name"], sc["mocks"], sc["tasks"], sc["expect_fail"], sc["checks"], sc["extra_vars"], sc["host"]))
+plays.append(play("p0 latch: a fresh snapshot stays fresh outside the round", store(storage(stage3=[("stage3-p1-x", NOW - 600)])), checks_tasks, False,
+                  [FR, f"not {LATCHED}"], RESTART))
+# The real summaries: marker 40000 (enable), the recorded p0 at 39000, now 100000.
+latch_real = picks("gather", "Reset the parsed status", "Parse the status of each server", "Summarize the gathered state") + checks_tasks
+plays.append(play("p0 latch (gathered state): the round's next server restarts with the stale recorded p0", round_probes(), latch_real, False,
+                  [FR, LATCHED, "secrets_encryption_enable_round.next == 'k3s01'"], RESTART))
+plays.append(play("p0 latch (gathered state): any other server is refused", round_probes(), latch_real, False, [f"not {FR}"], RESTART, host="k3s02"))
+# Phase binding, on the guard task itself: the scenario plays carry the exact play names.
+BIND = "Bind the phase to the running play"
+CANARY_PLAY = "Run the Stage 3 encryption canary"
+BIND_CASES = {
+    "restart as itself": (RESTART_PLAY, {"secrets_encryption_phase": "restart"}, False),
+    "restart presented as enable": (RESTART_PLAY, {"secrets_encryption_phase": "enable"}, True),
+    "canary verify as itself": (CANARY_PLAY, {"secrets_encryption_phase": "canary-verify", "secrets_encryption_canary_action": "verify"}, False),
+    "canary verify presented as cleanup": (CANARY_PLAY, {"secrets_encryption_phase": "canary-cleanup", "secrets_encryption_canary_action": "verify"}, True),
+    "a canary action without a committed phase": (CANARY_PLAY, {"secrets_encryption_phase": "canary-restart",
+                                                                "secrets_encryption_canary_action": "restart"}, True),
+    "an unmapped play": ("phase binding: an unmapped play", {"secrets_encryption_phase": "restart"}, True),
+    "an unmapped play without a phase": ("phase binding: an unmapped play without a phase", {}, True),
+}
+
+
+def bind_scenario(base, case):
+    name, extra, refused = BIND_CASES[case]
+    return dict(name=name, mocks={}, tasks=picks("guard", BIND, base=base), expect_fail=refused and BIND, checks=[], extra_vars=extra)
+
+
+for case in BIND_CASES:
+    sc = bind_scenario(None, case)
+    plays.append(play(sc["name"], sc["mocks"], sc["tasks"], sc["expect_fail"], sc["checks"], sc["extra_vars"]))
+plays.append(play("p0 latch (gathered state): enable is refused with the stale p0", round_probes(marker=None, ledger="20261023T160800Z snapshot k3s01\n"),
+                  latch_real, False, [f"not {FR}"], {"secrets_encryption_phase": "enable"}))
 
 # ---------------------------------------------------------------- snapshot naming and metadata
 snap_label = picks("snapshot", "Require a checkpoint label")
@@ -2816,8 +2990,44 @@ mutants += [
               "{%- elif se_removal_tolerate | bool -%}", "later server with an unparsed status", RP_),
     rm_mutant("the removal round not admitted", "restart", "        or se_removal_tolerate | bool\n", "", "k3s02 after k3s01 completed", False),
 ]
+
+
+def latch_mutant(label, old, new, case):
+    return (f"p0 latch: {label}", [("checks", old, new)], lambda b: latch_scenario(b, case, case, case in LATCH_ALLOWED))
+
+
+mutants += [
+    latch_mutant("for any phase", "(secrets_encryption_phase | default('')) == 'restart'\n      and ", "", "enable with a stale p0"),
+    latch_mutant("for drop-in removal", "and (secrets_encryption_flag_state | default('present')) == 'present'\n      ", "",
+                 "drop-in removal with a stale p0"),
+    latch_mutant("without a consistent ledger", "and se_round.ledger_ok | default(false) | bool and ", "and ", "an inconsistent ledger"),
+    latch_mutant("without the pre-enable checkpoint", " and se_round.checkpoint_ok | default(false) | bool", "", "no recorded pre-enable checkpoint"),
+    latch_mutant("for an out-of-order round", "and se_round.out_of_order | default('unknown') == '' and ", "and ", "an out-of-order round"),
+    latch_mutant("for any server", " and inventory_hostname == se_round.next | default('')", "", "a skipped server"),
+    latch_mutant("when the newest snapshot is not p0", "and se_p0.newest_is_p0 | default(false) | bool and ", "and ", "a newest snapshot that is not p0"),
+    latch_mutant("for an unrecorded p0", " and se_p0.newest_recorded | default(false) | bool", "", "a p0 without a matching record"),
+    latch_mutant("with malformed checkpoint records", "      and not (se_p0.records_malformed | default(true) | bool)\n", "",
+                 "malformed checkpoint records"),
+    latch_mutant("without a snapshot", "and se_newest | int > 0 and se_newest | int < secrets_encryption_marker.epoch | int",
+                 "and se_newest | int < secrets_encryption_marker.epoch | int", "no Stage 3 snapshot on the first server"),
+    latch_mutant("for a p0 newer than the marker", " and se_newest | int < secrets_encryption_marker.epoch | int }}", " }}",
+                 "a p0 newer than the enable marker"),
+    latch_mutant("never applied", "        or se_p0_latched | bool }}", "        }}", "the next restart of the round with a stale p0"),
+]
+# Binding mutants keep the exact play name (the usual "mutant killed:" prefix
+# would make every play unmapped), so they run here, inverted, without a prefix.
+BIND_MUTANTS = [
+    ([("guard", "      - secrets_encryption_phase | default('') == se_expected\n", "")], "restart presented as enable"),
+    ([("guard", "      - se_expected in se_allowed\n", "")], "an unmapped play without a phase"),
+    ([("guard", "else 'canary-' ~ (secrets_encryption_canary_action | default('unset')))", "else se_allowed[0])")], "canary verify as itself"),
+    ([("guard", "secrets_encryption_play_phases[ansible_play_name] | default([]) }}",
+       "secrets_encryption_play_phases[ansible_play_name] | default(['restart']) }}")], "an unmapped play"),
+]
 for label, edits, scenario in mutants:
     add(scenario(mutant_dir(edits)), invert=True, prefix=f"mutant killed: {label}: ")
+for edits, case in BIND_MUTANTS:
+    sc = bind_scenario(mutant_dir(edits), case)
+    plays.append(play(sc["name"], sc["mocks"], sc["tasks"], sc["expect_fail"], sc["checks"], sc["extra_vars"], invert=True))
 cd_mutant = copy.deepcopy(validate_tasks)
 cd_met = cd_mutant[0]["ansible.builtin.set_fact"]["secrets_encryption_expectation"]
 assert len(re.findall(r"\s*and secrets_encryption_marker\.phase == 'enable'\)", cd_met["met"])) == 1
@@ -3049,7 +3259,11 @@ guard_cases = [
     ("restart: exact k3s03 with its own confirmation", "restart", "live", "k3s03", dict(LIVE, secrets_encryption_confirm=C("restart", "k3s03")), True),
     ("restart: confirmation naming another server", "restart", "live", "k3s02", dict(LIVE, secrets_encryption_confirm=C("restart", "k3s01")), False),
     ("restart: range pattern resolving to one host", "restart", "live", "servers[1]", dict(LIVE, secrets_encryption_confirm=C("restart", "k3s02")), False),
-    ("restart: flag removal is not yet rehearsal-approved for live", "restart", "live", "k3s01",
+    ("restart: flag removal is rehearsal-approved for live", "restart", "live", "k3s01",
+     dict(LIVE, secrets_encryption_flag_state="absent", secrets_encryption_confirm=C("restart", "k3s01")), True),
+    ("restart: flag removal live still needs the protected artifacts", "restart", "live", "k3s01",
+     {"secrets_encryption_environment": "live", "secrets_encryption_flag_state": "absent", "secrets_encryption_confirm": C("restart", "k3s01")}, False),
+    ("restart: flag removal live still needs an exact single-host limit", "restart", "live", "k3s01,k3s02",
      dict(LIVE, secrets_encryption_flag_state="absent", secrets_encryption_confirm=C("restart", "k3s01")), False),
     ("restart: flag removal allowed in a rehearsal", "restart", "rehearsal", "s3r01",
      dict(REH, secrets_encryption_flag_state="absent", secrets_encryption_confirm=C("restart", "s3r01")), True),
@@ -3101,15 +3315,53 @@ guard_cases = [
     ("install-etcdctl: allowed in a rehearsal", "install-etcdctl", "rehearsal", "s3r01",
      dict(REH, secrets_encryption_confirm=C("install-etcdctl", "s3r01")), True),
     ("snapshot: exact k3s01", "snapshot", "live", "k3s01", dict(LIVE, secrets_encryption_confirm=C("snapshot", "k3s01")), True),
-    ("restart: flag-removal approval cannot be injected with extra vars", "restart", "live", "k3s01",
-     dict(LIVE, secrets_encryption_flag_state="absent", secrets_encryption_rehearsal_approved_paths=["flag-removal"],
+    ("restart: another approved path cannot be injected with extra vars", "restart", "live", "k3s01",
+     dict(LIVE, secrets_encryption_flag_state="absent", secrets_encryption_rehearsal_approved_paths=["flag-removal", "reencrypt"],
           secrets_encryption_confirm=C("restart", "k3s01")), False),
+    ("restart: the approved paths cannot be emptied with extra vars", "restart", "live", "k3s01",
+     dict(LIVE, secrets_encryption_rehearsal_approved_paths=[], secrets_encryption_confirm=C("restart", "k3s01")), False),
+    # Phase binding (live-readiness review, 2026-10-27): -e secrets_encryption_phase=restart cannot disguise another phase.
+    ("phase binding: snapshot disguised as restart", "snapshot", "live", "k3s01",
+     dict(LIVE, secrets_encryption_phase="restart", secrets_encryption_confirm=C("restart", "k3s01")), False, BIND),
+    ("phase binding: enable disguised as restart", "enable", "live", "k3s01",
+     dict(LIVE, secrets_encryption_phase="restart", secrets_encryption_confirm=C("restart", "k3s01")), False, BIND),
+    ("phase binding: rotate-keys disguised as restart", "rotate-keys", "live", "k3s01",
+     dict(LIVE, secrets_encryption_phase="restart", secrets_encryption_confirm=C("restart", "k3s01")), False, BIND),
+    ("phase binding: canary create-control disguised as restart", "canary", "live", "k3s01",
+     dict(LIVE, secrets_encryption_canary_action="create-control", secrets_encryption_phase="restart",
+          secrets_encryption_confirm=C("restart", "k3s01")), False, BIND),
+    ("phase binding: canary verify disguised as restart", "canary", "live", "k3s01",
+     dict(LIVE, secrets_encryption_canary_action="verify", secrets_encryption_phase="restart",
+          secrets_encryption_confirm=C("restart", "k3s01")), False, BIND),
+    ("phase binding: canary cleanup disguised as restart", "canary", "live", "k3s01",
+     dict(LIVE, secrets_encryption_canary_action="cleanup", secrets_encryption_phase="restart",
+          secrets_encryption_confirm=C("restart", "k3s01")), False, BIND),
+    ("phase binding: etcdctl installation disguised as restart", "install-etcdctl", "rehearsal", "s3r01",
+     dict(REH, secrets_encryption_phase="restart", secrets_encryption_confirm=C("restart", "s3r01")), False, BIND),
+    ("phase binding: restart disguised as enable", "restart", "live", "k3s01",
+     dict(LIVE, secrets_encryption_phase="enable", secrets_encryption_confirm=C("enable", "k3s01")), False, BIND),
+    ("phase binding: canary verify disguised as cleanup", "canary", "live", "k3s01",
+     dict(LIVE, secrets_encryption_canary_action="verify", secrets_encryption_phase="canary-cleanup",
+          secrets_encryption_confirm=C("canary-cleanup", "k3s01")), False, BIND),
+    ("phase binding: a canary action without a committed phase", "canary", "live", "k3s01",
+     dict(LIVE, secrets_encryption_canary_action="restart", secrets_encryption_confirm=C("canary-restart", "k3s01")), False, BIND),
+    ("phase binding: the play name cannot be overridden by extra vars", "restart", "live", "k3s01",
+     dict(LIVE, ansible_play_name="Take a Stage 3 on-demand etcd snapshot", secrets_encryption_phase="snapshot",
+          secrets_encryption_confirm=C("snapshot", "k3s01")), False, BIND),
+    ("phase binding: an injected mapping is refused as a committed value", "canary", "live", "k3s01",
+     dict(LIVE, secrets_encryption_canary_action="verify", secrets_encryption_phase="restart",
+          secrets_encryption_play_phases=dict(role_vars["secrets_encryption_play_phases"], **{"Run the Stage 3 encryption canary": ["restart"]}),
+          secrets_encryption_confirm=C("restart", "k3s01")), False, "Require the committed fixed values"),
+    ("phase binding: canary cleanup as itself passes", "canary", "live", "k3s01",
+     dict(LIVE, secrets_encryption_canary_action="cleanup", secrets_encryption_confirm=C("canary-cleanup", "k3s01")), True),
     ("restart: a reintroduced disable phase cannot be approved by extra vars", "restart", "live", "k3s01",
      dict(LIVE, secrets_encryption_mutating_phases=["disable"], secrets_encryption_confirm=C("restart", "k3s01")), False),
 ]
 TASK_RE = re.compile(r"^TASK \[(?:[^\]]+? : )?(.+?)\] \*+$", re.MULTILINE)
 guard_failures = []
-for label, key, inv_name, limit, extra, expect_pass in guard_cases:
+for case in guard_cases:
+    label, key, inv_name, limit, extra, expect_pass = case[:6]
+    refused_at = case[6] if len(case) > 6 else None  # the guard task that must refuse, where it matters
     book = guard_only[key] if expect_pass else ans / f"{PB_OF[key]}.yml"
     cmd = ["ansible-playbook", "-i", str(inv[inv_name]), str(book), "-e", json.dumps(extra)]
     if limit is not None:
@@ -3120,8 +3372,10 @@ for label, key, inv_name, limit, extra, expect_pass in guard_cases:
         ok = r.returncode == 0 and "GUARD-PASSED" in r.stdout
     else:
         ok = (r.returncode != 0 and "GUARD-PASSED" not in r.stdout and seen and set(seen) <= guard_names
-              and "Gathering Facts" not in r.stdout and ("FAILED!" in r.stdout or re.search(r"^failed: \[", r.stdout, re.MULTILINE)))
-    print(f"{'PASS' if ok else 'FAIL'}  guard: {label} ({'allowed' if expect_pass else 'refused in the guard'}; exit {r.returncode})", flush=True)
+              and "Gathering Facts" not in r.stdout and ("FAILED!" in r.stdout or re.search(r"^failed: \[", r.stdout, re.MULTILINE))
+              and (refused_at is None or seen[-1] == refused_at))
+    print(f"{'PASS' if ok else 'FAIL'}  guard: {label} ({'allowed' if expect_pass else 'refused in the guard'}"
+          f"{' at ' + repr(refused_at) if refused_at else ''}; exit {r.returncode})", flush=True)
     if not ok:
         guard_failures.append(label)
         print(seen, r.stdout[-2500:], r.stderr[-2500:], sep="\n", flush=True)
