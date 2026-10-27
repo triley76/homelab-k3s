@@ -69,7 +69,7 @@ The backup design calls for one key rotation, so that the key in use did not coe
 
 - runs the enabling rotation only after `enable` and the restarts, when every server reports `Disabled` at stage `start` with matching hashes;
 - refuses any further rotation unless `secrets_encryption_additional_rotation_reason` records why it is needed (at least ten characters). An additional rotation is added to the procedure only if the K3s documentation or the rehearsal shows a concrete need, and that need is documented here;
-- requires, for every rotation, a new confirmation naming the current UTC time (`secrets_encryption_rotation_id=YYYYMMDDTHHMMSSZ`, at most 30 minutes old). Each confirmation is recorded in a ledger on the first server before the rotation starts and is never accepted again.
+- requires, for every rotation, a new confirmation naming the current UTC time (`secrets_encryption_confirm=rotate-keys:k3s01:YYYYMMDDTHHMMSSZ`, at most 30 minutes old). Each confirmation is recorded in a ledger on the first server before the rotation starts and is never accepted again.
 
 ## Encoded Procedure
 

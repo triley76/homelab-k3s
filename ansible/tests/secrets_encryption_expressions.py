@@ -8,7 +8,8 @@ Contacts no cluster node, Kubernetes API, etcd or AWS, and downloads nothing.
    restart, the K3s subcommand each phase may use, the exact etcdctl query,
    the installer's check-before-install order, forbidden commands and paths,
    no_log on every task that can carry a canary value, raw etcd record or
-   status output, the pins, and the safe default for fresh builds.
+   status output, the pins, the safe default for fresh builds, and no
+   unquoted comma inside an item of any flow-style argv under ansible/.
 2. The local verifier, imported and run against crafted etcdctl JSON.
 3. ansible-playbook --syntax-check of every playbook and of every role task file.
 4. The real guard: refused invocations run the real phase playbooks and must
@@ -25,6 +26,8 @@ Contacts no cluster node, Kubernetes API, etcd or AWS, and downloads nothing.
    2026-10-23): the exact enable result before the marker and no status read
    afterwards, the round's order, ledger and checkpoint conditions, and the
    post-round Disabled/start/matching-hashes validation, with a stub k3s.
+   Also the service-state probe's exact argv and its parsed start time and
+   restart count, with a stub systemctl (three-VM rehearsal, 2026-10-27).
    Every expected failure names the task that must fail.
 6. Mutation tests: structure predicates re-applied to mutated copies, and
    role scenarios re-run against mutated copies of the task files with the
@@ -1111,6 +1114,54 @@ structural_mutants += [
     ("post-restore encryption-file metadata claimed as compared", lambda: docs_status_current(ROLLBACK_DOC.replace(
         "did not compare their inode or modification time after the restore", "compared their inode and modification time after the restore"),
         README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+]
+
+
+# YAML ends a plain scalar at a comma in a flow sequence, so an unquoted
+# `--opt=a,b` in `argv: [...]` silently becomes several arguments. The three-VM
+# rehearsal (2026-10-27) found systemctl receiving ActiveEnterTimestamp and
+# NRestarts as unit names, which left every server's service state unreadable.
+def flow_argv_commas(texts):
+    """(file, line) of every comma in a flow-style argv that is neither quoted nor followed by a space (an item separator)."""
+    bad = []
+    for name, text in texts.items():
+        for m in re.finditer(r"\bargv:\s*\[", text):
+            i, quote = m.end(), None
+            while i < len(text) and (quote or text[i] != "]"):
+                c = text[i]
+                if quote == '"' and c == "\\":
+                    i += 1
+                elif quote:
+                    quote = None if c == quote else quote
+                elif c in "\"'":
+                    quote = c
+                elif c == "," and text[i + 1:i + 2] not in (" ", "\n"):
+                    bad.append((name, text.count("\n", 0, i) + 1))
+                i += 1
+    return bad
+
+
+SVC_ARGV = ["systemctl", "show", "k3s.service", "--timestamp=unix", "--property=ActiveState,ActiveEnterTimestamp,NRestarts"]
+SVC_QUOTED = '"--property=ActiveState,ActiveEnterTimestamp,NRestarts"'
+SVC_UNQUOTED = "--property=ActiveState,ActiveEnterTimestamp,NRestarts"
+yaml_texts = {str(p.relative_to(ans)): p.read_text() for p in sorted(ans.rglob("*.yml"))}
+
+
+def service_argv(tasks):
+    return next(t["ansible.builtin.command"]["argv"] for t in walk(tasks) if t.get("name") == "Read the K3s service state on every server")
+
+
+require("ansible/: no flow-style argv has an unquoted comma inside an argument (YAML would split it into separate arguments)",
+        flow_argv_commas(yaml_texts) == [])
+require("flow-style argv check: quoted commas and item separators pass, an unquoted comma inside an item is reported",
+        flow_argv_commas({"s": 'argv: [a, "--x=b,c", \'--y=d,e\', "{{ f | default(\'g,h\') }}", "i\\",j"]\n'}) == []
+        and flow_argv_commas({"s": "- x\n  argv: [a, --x=b,c]\n"}) == [("s", 2)])
+require("gather.yml: the service probe passes the property list to systemctl as one argument", service_argv(task_files["gather"]) == SVC_ARGV)
+structural_mutants += [
+    ("the service probe's property list unquoted (flow-style argv check)",
+     lambda: task_text["gather"].count(SVC_QUOTED) != 1 or flow_argv_commas({"gather": task_text["gather"].replace(SVC_QUOTED, SVC_UNQUOTED)}) == []),
+    ("the service probe's property list unquoted (exact argv)",
+     lambda: service_argv(yaml.safe_load(task_text["gather"].replace(SVC_QUOTED, SVC_UNQUOTED))) == SVC_ARGV),
 ]
 for label, check in structural_mutants:
     require(f"mutation (structure): {label} is detected", check() is False)
@@ -2530,6 +2581,50 @@ mutants += [
     ("the round accepting an unrecorded snapshot",
      [("summarize", "\n             and secrets_encryption_p0.p0_records | select('search', key | regex_escape) | list | length > 0", "")],
      lambda b: health_scenario(b, "p0 not recorded", round_probes(checkpoints=""), NOT_PARSED, RESTART)),
+]
+
+# ---------------------------------------------------------------- service probe argv
+# The real service-state task runs against a stub systemctl that records its
+# argv and answers as systemctl does: one block per named unit, holding only
+# the requested properties.
+STUB_SYSTEMCTL = r'''#!/usr/bin/env python3
+import json, os, sys
+a = sys.argv[1:]
+with open(%(log)r, "a") as f:
+    f.write(json.dumps([os.path.basename(sys.argv[0])] + a) + "\n")
+props = [p for x in a if x.startswith("--property=") for p in x[len("--property="):].split(",")]
+unix = "--timestamp=unix" in a
+blocks = []
+for unit in [x for x in a[1:] if not x.startswith("-")]:
+    k3s = unit == "k3s.service"
+    v = {"ActiveState": "active" if k3s else "inactive", "NRestarts": "0",
+         "ActiveEnterTimestamp": ("@50000" if unix else "Mon 2026-10-26 01:00:00 UTC") if k3s else ""}
+    blocks.append("\n".join(f"{p}={v[p]}" for p in props if p in v))
+print("\n\n".join(blocks))
+'''
+
+
+def service_probe_scenario(base, label):
+    d = tmp_root / f"systemctl-{len(plays)}"
+    d.mkdir()
+    log = d / "argv.log"
+    (d / "systemctl").write_text(STUB_SYSTEMCTL % {"log": str(log)})
+    (d / "systemctl").chmod(0o755)
+    probe = pick("gather", "Read the K3s service state on every server", base=base)
+    probe["environment"] = {"PATH": f"{d}:" + "{{ lookup('env', 'PATH') }}"}
+    return dict(name=f"service probe: {label}", mocks={k: v for k, v in probes().items() if k != "secrets_encryption_service_probe"},
+                tasks=[probe] + picks("gather", "Reset the parsed status", "Parse the status of each server", "Summarize the gathered state", base=base),
+                expect_fail=False,
+                checks=[f"lookup('file', {json.dumps(str(log))}).splitlines() | map('from_json') | list == {json.dumps([SVC_ARGV] * 3)}"]
+                + [f"secrets_encryption_servers.{h}.start_epoch == 50000 and secrets_encryption_servers.{h}.nrestarts == 0"
+                   f" and secrets_encryption_servers.{h}.active | bool" for h in SERVERS]
+                + [f"{HP} | length == 0"])
+
+
+add(service_probe_scenario(None, "systemctl receives the property list as one argument and every server's start and restart count parse"))
+mutants += [
+    ("the service probe's property list unquoted", [("gather", SVC_QUOTED, SVC_UNQUOTED)],
+     lambda b: service_probe_scenario(b, "property list unquoted")),
 ]
 for label, edits, scenario in mutants:
     add(scenario(mutant_dir(edits)), invert=True, prefix=f"mutant killed: {label}: ")

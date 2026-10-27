@@ -9,7 +9,7 @@
 # state, and its raw output is hidden and reduced by parse_status.yml.
 - name: Read the K3s service state on every server
   ansible.builtin.command:
-    argv: [systemctl, show, k3s.service, --timestamp=unix, --property=ActiveState,ActiveEnterTimestamp,NRestarts]
+    argv: [systemctl, show, k3s.service, --timestamp=unix, "--property=ActiveState,ActiveEnterTimestamp,NRestarts"]
   delegate_to: "{{ item }}"
   loop: "{{ groups['servers'] }}"
   register: secrets_encryption_service_probe
