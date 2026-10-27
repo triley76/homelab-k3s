@@ -1,0 +1,23 @@
+---
+# Compare a canary Secret's API readback with its local value file, without
+# output. Inputs: se_rb_name, se_rb_file, se_rb_label. Output:
+# secrets_encryption_canary_results['readback_' ~ se_rb_label] = PASS or FAIL.
+# Only cmp's exit status is used; the decoded value goes nowhere but cmp.
+- name: Compare a canary readback without output
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      {{ secrets_encryption_k3s_bin | quote }} kubectl get secret {{ se_rb_name | quote }}
+      --namespace={{ secrets_encryption_canary_namespace | quote }} -o 'jsonpath={.data.value}'
+      | base64 -d | cmp -s - {{ se_rb_file | quote }}
+    executable: /bin/bash
+  register: secrets_encryption_readback_probe
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Record the readback comparison
+  ansible.builtin.set_fact:
+    secrets_encryption_canary_results: >-
+      {{ secrets_encryption_canary_results | default({}) | combine({'readback_' ~ se_rb_label:
+         'PASS' if secrets_encryption_readback_probe.rc | default(1) == 0 else 'FAIL'}) }}

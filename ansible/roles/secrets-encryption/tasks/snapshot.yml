@@ -1,0 +1,176 @@
+---
+# On-demand etcd snapshot on the first server. Creates one new snapshot file
+# (and its ETCDSnapshotFile object); this automation never deletes, prunes or
+# moves a snapshot.
+#
+# Retention: in K3s v1.36 (pkg/etcd/snapshot.go) a successful save is followed
+# by local retention pruning of the files whose names start with the snapshot
+# name, keeping the newest --etcd-snapshot-retention of them. The name used here
+# is unique and no existing file starts with it, so that pruning can only ever
+# see the new file. Whether a CLI save prunes with the CLI name or with the
+# server's configured snapshot name is a rehearsal question, so preservation is
+# checked by metadata before and after, not assumed: every non-scheduled
+# snapshot must keep its size and time, and the protected Stage 2 artifacts are
+# re-checked. Changes among scheduled snapshots (etcd-snapshot-*), which K3s
+# prunes by its own retention, are reported separately and are not Stage 3
+# deletions.
+- name: Require a checkpoint label
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_snapshot_checkpoint is defined
+      - secrets_encryption_snapshot_checkpoint is string
+      - secrets_encryption_snapshot_checkpoint is match('^[a-z0-9]+(-[a-z0-9]+)*$')
+      - secrets_encryption_snapshot_checkpoint | length <= 32
+    fail_msg: >-
+      Set -e secrets_encryption_snapshot_checkpoint=<label>, lowercase letters, digits
+      and single hyphens, at most 32 characters (for example p0-pre-enable).
+    quiet: true
+
+- name: Name the snapshot
+  ansible.builtin.set_fact:
+    secrets_encryption_snapshot_name: >-
+      stage3-{{ secrets_encryption_snapshot_checkpoint }}-{{ '%Y%m%dt%H%M%Sz' | strftime(secrets_encryption_now_epoch | int, utc=true) }}
+
+- name: Require a unique snapshot name
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_snapshot_name is match(secrets_encryption_snapshot_name_pattern)
+      - >-
+        secrets_encryption_storage[inventory_hostname].snapshot_names
+        | select('match', '^' ~ (secrets_encryption_snapshot_name | regex_escape)) | list | length == 0
+    fail_msg: An existing snapshot already starts with {{ secrets_encryption_snapshot_name }}; wait and retry.
+    quiet: true
+
+# A snapshot restores only with the server token in use when it was taken. Its
+# presence is confirmed by lstat alone: no content, checksum or MIME type is read.
+- name: Inspect the server token file without reading it
+  ansible.builtin.stat:
+    path: "{{ secrets_encryption_token_file }}"
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+    follow: false
+  register: secrets_encryption_token_stat
+
+- name: Require the server token file for a restorable checkpoint
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_token_stat.stat.exists | default(false)
+      - secrets_encryption_token_stat.stat.isreg | default(false)
+      - not (secrets_encryption_token_stat.stat.islnk | default(true))
+      - secrets_encryption_token_stat.stat.size | default(0) > 0
+      - secrets_encryption_token_stat.stat.uid | default(-1) == secrets_encryption_state_owner_uid | int
+    fail_msg: >-
+      The server token file is missing, empty, not a root-owned regular file, or a link. Without the
+      token in use when the snapshot is taken, the snapshot cannot be restored. Stop.
+    quiet: true
+
+- name: Record the snapshot metadata before the save
+  ansible.builtin.set_fact:
+    secrets_encryption_snapshot_meta_before: "{{ secrets_encryption_storage[inventory_hostname].snapshot_meta }}"
+
+- name: Take the on-demand etcd snapshot
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_k3s_bin }}", etcd-snapshot, save, --name, "{{ secrets_encryption_snapshot_name }}"]
+  register: secrets_encryption_snapshot_save
+  changed_when: true
+
+- name: List local snapshot files after the snapshot
+  ansible.builtin.find:
+    paths: "{{ secrets_encryption_snapshot_dir }}"
+    file_type: file
+    recurse: false
+    hidden: true
+    get_checksum: false
+  register: secrets_encryption_snapshots_after
+
+- name: Compare the snapshot metadata
+  vars:
+    se_before: "{{ secrets_encryption_snapshot_meta_before }}"
+    se_files: "{{ secrets_encryption_snapshots_after.files | default([]) }}"
+    se_after: >-
+      {{ dict(se_files | map(attribute='path') | map('basename')
+      | zip(se_files | map('dict2items') | map('selectattr', 'key', 'in', ['size', 'mtime']) | map('items2dict'))) }}
+    se_sched: "{{ secrets_encryption_scheduled_snapshot_pattern }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_snapshot_new: "{{ se_after.keys() | reject('in', se_before.keys() | list) | list }}"
+    secrets_encryption_snapshot_protected_changes: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for name, meta in se_before.items() if name is not match(se_sched) -%}
+      {%- if name not in se_after -%}{%- set ns.out = ns.out + [name ~ ': missing'] -%}
+      {%- elif (se_after[name].size | int) != (meta.size | int) or (se_after[name].mtime | int) != (meta.mtime | int) -%}
+      {%- set ns.out = ns.out + [name ~ ': size or time changed'] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | join(';;') }}
+    secrets_encryption_snapshot_scheduled_changes: >-
+      {{ se_before.keys() | select('match', se_sched) | reject('in', se_after.keys() | list) | list }}
+
+- name: Require exactly one new snapshot and no protected change
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_snapshot_protected_changes == ''
+      - secrets_encryption_snapshot_new | length == 1
+      - secrets_encryption_snapshot_new[0] is match('^' ~ (secrets_encryption_snapshot_name | regex_escape) ~ '-')
+    fail_msg: >-
+      Snapshot listing changed unexpectedly: new {{ secrets_encryption_snapshot_new }},
+      non-scheduled snapshots missing or changed {{ secrets_encryption_snapshot_protected_changes }}.
+    quiet: true
+
+# D4: the SHA-256 of the snapshot file is recorded as integrity metadata. The
+# file itself is never read into Ansible or copied.
+- name: Read the new snapshot's metadata and SHA-256
+  ansible.builtin.stat:
+    path: "{{ secrets_encryption_snapshot_dir }}/{{ secrets_encryption_snapshot_new[0] }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+    follow: false
+  register: secrets_encryption_snapshot_stat
+
+- name: Require a non-empty regular snapshot file
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_snapshot_stat.stat.exists
+      - secrets_encryption_snapshot_stat.stat.isreg
+      - not secrets_encryption_snapshot_stat.stat.islnk
+      - secrets_encryption_snapshot_stat.stat.size > 0
+    quiet: true
+
+# The checkpoint record: label, file name, size, SHA-256 and the confirmed
+# presence of the token file (never its content). p0 is only accepted by enable
+# when its record exists and matches the file. Appended with lineinfile, like
+# the ledger, only after gather.yml found the file absent or a root-owned
+# regular file inside the root-only state directory.
+- name: Record the checkpoint metadata
+  ansible.builtin.lineinfile:
+    path: "{{ secrets_encryption_state_dir }}/checkpoints"
+    line: >-
+      {{ secrets_encryption_snapshot_stat.stat.mtime | int }} {{ secrets_encryption_snapshot_checkpoint }}
+      {{ secrets_encryption_snapshot_new[0] }} {{ secrets_encryption_snapshot_stat.stat.size }}
+      {{ secrets_encryption_snapshot_stat.stat.checksum }} token=present
+    create: true
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Gather the state again after the snapshot
+  ansible.builtin.include_tasks: gather.yml
+
+- name: Re-evaluate preservation after the snapshot
+  ansible.builtin.include_tasks: checks.yml
+
+- name: Require preservation after the snapshot
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_preservation_problems | length == 0
+    fail_msg: "Preservation changed during the snapshot: {{ secrets_encryption_preservation_problems.split(';;') }}"
+    quiet: true
+
+- name: Show the snapshot record
+  ansible.builtin.debug:
+    msg:
+      snapshot: "{{ secrets_encryption_snapshot_new[0] }}"
+      size_bytes: "{{ secrets_encryption_snapshot_stat.stat.size }}"
+      mtime_epoch: "{{ secrets_encryption_snapshot_stat.stat.mtime | int }}"
+      sha256: "{{ secrets_encryption_snapshot_stat.stat.checksum }}"
+      scheduled_snapshots_pruned_by_k3s_retention: "{{ secrets_encryption_snapshot_scheduled_changes | length }}"

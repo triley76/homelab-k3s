@@ -1,0 +1,154 @@
+---
+# Pinned, checksum-verified etcdctl and the local verifier, for raw canary
+# verification in a disposable rehearsal environment only (D2). The guard
+# refuses this phase for any inventory that contains a live host name.
+#
+# Order: the pin is asserted; the release is downloaded into a private working
+# directory and its SHA-256 verified by get_url before it is written there; only
+# the etcdctl member is extracted; the extracted path must be a regular file,
+# not a symbolic link, and must run from the working directory reporting exactly
+# the pinned version. Only then is the destination changed. The working
+# directory is removed on success and on failure. Nothing is installed with apt
+# or a shell pipeline.
+- name: Require the reviewed etcdctl pin
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_etcdctl_version == '3.6.14'
+      - secrets_encryption_etcdctl_archive == 'etcd-v3.6.14-linux-amd64.tar.gz'
+      - secrets_encryption_etcdctl_sha256 == 'ffe840ff9295808e88cce2794a18a5ac87f12a5203c8314d0bf6aa119b41bac5'
+      - secrets_encryption_etcdctl_url == 'https://github.com/etcd-io/etcd/releases/download/v3.6.14/etcd-v3.6.14-linux-amd64.tar.gz'
+      - ansible_facts['architecture'] == 'x86_64'
+    quiet: true
+
+- name: Read the installed etcdctl version
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_etcdctl_path }}", version]
+  register: secrets_encryption_etcdctl_current
+  changed_when: false
+  failed_when: false
+
+- name: Install the pinned etcdctl
+  when: >-
+    secrets_encryption_etcdctl_current.rc != 0
+    or secrets_encryption_etcdctl_current.stdout_lines | map('trim')
+    | select('equalto', 'etcdctl version: ' ~ secrets_encryption_etcdctl_version) | list | length != 1
+  block:
+    - name: Create a private working directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: secrets-encryption-etcdctl.
+      register: secrets_encryption_etcdctl_tmp
+
+    - name: Restrict the working directory to root
+      ansible.builtin.file:
+        path: "{{ secrets_encryption_etcdctl_tmp.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Download the pinned etcd release and verify its SHA-256
+      ansible.builtin.get_url:
+        url: "{{ secrets_encryption_etcdctl_url }}"
+        dest: "{{ secrets_encryption_etcdctl_tmp.path }}/{{ secrets_encryption_etcdctl_archive }}"
+        checksum: "sha256:{{ secrets_encryption_etcdctl_sha256 }}"
+        mode: '0600'
+        timeout: 60
+
+    - name: Create the extraction directory
+      ansible.builtin.file:
+        path: "{{ secrets_encryption_etcdctl_tmp.path }}/extract"
+        state: directory
+        mode: '0700'
+
+    - name: Extract etcdctl only
+      ansible.builtin.unarchive:
+        src: "{{ secrets_encryption_etcdctl_tmp.path }}/{{ secrets_encryption_etcdctl_archive }}"
+        dest: "{{ secrets_encryption_etcdctl_tmp.path }}/extract"
+        remote_src: true
+        include:
+          - etcd-v{{ secrets_encryption_etcdctl_version }}-linux-amd64/etcdctl
+
+    - name: Inspect the extracted etcdctl
+      ansible.builtin.stat:
+        path: "{{ secrets_encryption_etcdctl_tmp.path }}/extract/etcd-v{{ secrets_encryption_etcdctl_version }}-linux-amd64/etcdctl"
+        follow: false
+        get_checksum: false
+      register: secrets_encryption_etcdctl_extracted
+
+    - name: Require the extracted etcdctl to be a regular file
+      ansible.builtin.assert:
+        that:
+          - secrets_encryption_etcdctl_extracted.stat.exists
+          - secrets_encryption_etcdctl_extracted.stat.isreg
+          - not secrets_encryption_etcdctl_extracted.stat.islnk
+        fail_msg: The extracted etcdctl is missing, a symbolic link or not a regular file.
+        quiet: true
+
+    - name: Run the extracted etcdctl from the working directory
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_etcdctl_tmp.path }}/extract/etcd-v{{ secrets_encryption_etcdctl_version }}-linux-amd64/etcdctl", version]
+      register: secrets_encryption_etcdctl_extracted_version
+      changed_when: false
+      failed_when: false
+
+    - name: Require the extracted etcdctl to report the pinned version
+      ansible.builtin.assert:
+        that:
+          - secrets_encryption_etcdctl_extracted_version.rc == 0
+          - >-
+            secrets_encryption_etcdctl_extracted_version.stdout_lines | map('trim')
+            | select('equalto', 'etcdctl version: ' ~ secrets_encryption_etcdctl_version) | list | length == 1
+        fail_msg: The extracted etcdctl does not run or does not report the pinned version.
+        quiet: true
+
+    # The first change to the destination.
+    - name: Ensure the tools directory exists
+      ansible.builtin.file:
+        path: "{{ secrets_encryption_tools_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install etcdctl
+      ansible.builtin.copy:
+        src: "{{ secrets_encryption_etcdctl_tmp.path }}/extract/etcd-v{{ secrets_encryption_etcdctl_version }}-linux-amd64/etcdctl"
+        dest: "{{ secrets_encryption_etcdctl_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0755'
+
+  always:
+    - name: Remove the working directory
+      ansible.builtin.file:
+        path: "{{ secrets_encryption_etcdctl_tmp.path }}"
+        state: absent
+      when: secrets_encryption_etcdctl_tmp.path is defined
+
+- name: Verify the installed etcdctl version
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_etcdctl_path }}", version]
+  register: secrets_encryption_etcdctl_installed
+  changed_when: false
+  failed_when: >-
+    secrets_encryption_etcdctl_installed.rc != 0
+    or secrets_encryption_etcdctl_installed.stdout_lines | map('trim')
+    | select('equalto', 'etcdctl version: ' ~ secrets_encryption_etcdctl_version) | list | length != 1
+
+- name: Ensure the tools directory exists for the verifier
+  ansible.builtin.file:
+    path: "{{ secrets_encryption_tools_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install the local verifier
+  ansible.builtin.copy:
+    src: etcd_value_verify.py
+    dest: "{{ secrets_encryption_verifier_path }}"
+    owner: root
+    group: root
+    mode: '0755'

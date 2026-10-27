@@ -1,0 +1,77 @@
+---
+# Tunables for the Stage 3 phases. secrets_encryption_environment has no
+# default: every phase refuses to run until the inventory or command line sets
+# it to "live" or "rehearsal".
+
+# Every mutating phase requires a Stage 3 on-demand snapshot on the first
+# server at most this old. Data-changing phases also require it to be newer than
+# the last recorded procedure change.
+secrets_encryption_snapshot_max_age_minutes: 120
+
+# rotate-keys and reencrypt are polled until the stage settles. K3s re-encrypts
+# about 5 Secrets per second.
+secrets_encryption_reencrypt_timeout_seconds: 1800
+secrets_encryption_poll_delay_seconds: 10
+
+# Waiting for a restarted server.
+secrets_encryption_ready_retries: 60
+secrets_encryption_ready_delay_seconds: 10
+
+# Free space required in the K3s database directory before a snapshot.
+secrets_encryption_min_free_mb: 2048
+
+# Flux Kustomizations that must exist exactly once and be Ready. Rehearsal
+# inventories without Flux set this to [].
+secrets_encryption_expected_kustomizations:
+  - flux-system/flux-system
+  - flux-system/infrastructure-controllers
+  - flux-system/infrastructure-configs
+  - flux-system/monitoring
+  - flux-system/monitoring-configs
+  - flux-system/apps
+
+# HelmReleases: at least this many must exist, and every one must be Ready
+# (MetalLB and kube-prometheus-stack on the live cluster). Rehearsals without
+# Flux set 0.
+secrets_encryption_min_helmreleases: 2
+
+# Monitoring workloads, as in validate-time-sync.yml. Every StatefulSet and
+# DaemonSet in the cluster must be fully ready; these namespaces must also hold
+# at least the given numbers. Rehearsals set [] and 0.
+secrets_encryption_monitoring_namespaces:
+  - monitoring
+  - monitoring-node-exporter
+secrets_encryption_min_monitoring_statefulsets: 2
+secrets_encryption_min_monitoring_daemonsets: 1
+
+# The platform canary Deployment, namespace/name. Rehearsals set "".
+secrets_encryption_canary_deployment: platform-demo/platform-canary
+
+# Chrony must be synchronized on every server, with |offset| below this.
+secrets_encryption_require_chrony: true
+secrets_encryption_max_offset_seconds: 0.1
+
+# Stage 2 recovery artifacts that must exist unchanged at every gate: a mapping
+# of server name to absolute paths (preserved database directories, preserved
+# snapshot files). Required in a live environment. The paths are environment
+# details: set them only in local, uncommitted inventory. Reports show counts,
+# never the paths.
+secrets_encryption_protected_paths: {}
+
+# Raw verification of the canary records with the pinned etcdctl. Approved for
+# rehearsal environments only (D2); the guard refuses it in a live environment.
+secrets_encryption_raw_verification: false
+
+# Restart phase: whether the target server should carry the drop-in. "absent" is
+# a rollback-only state and is refused unless every server reports Disabled.
+secrets_encryption_flag_state: present
+
+# A second rotate-keys after the enabling rotation is refused unless a reason is
+# recorded here. The approved procedure performs exactly one rotation.
+secrets_encryption_additional_rotation_reason: ""
+
+# Validation playbook: fail when the gate or the expected state is not met.
+secrets_encryption_enforce: false
+# Validation playbook: optional expected state, one of not-configured,
+# configured-disabled or enabled.
+secrets_encryption_expect: ""

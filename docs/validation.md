@@ -446,6 +446,70 @@ validate-recovery-tools.yml
 
 `ansible/tests/recovery_tools_expressions.py` checks the `recovery-tools` role and playbook structure. It runs the role's inspection, decision, platform, pin and verification tasks against mocked results. It runs the extracted-binary validation against local stand-in binaries, and checks that nothing reaches the destination unless both pass. It runs the real single-host guard against a throwaway local inventory with real `--limit` values, and the role's own working-directory cleanup locally. It downloads and installs nothing.
 
+The Stage 3 secrets-encryption playbooks were syntax-checked the same way, with ansible-core 2.16.3 and a dummy inventory:
+
+```text
+
+snapshot-etcd.yml
+
+secrets-encryption-enable.yml
+
+secrets-encryption-restart.yml
+
+secrets-encryption-rotate.yml
+
+secrets-encryption-canary.yml
+
+validate-secrets-encryption.yml
+
+install-etcdctl-rehearsal.yml
+
+```
+
+`ansible/tests/secrets_encryption_expressions.py` checks:
+
+- the role and playbook structure;
+- the guard, using the real phase playbooks with real `--limit` values, confirmations and environments. Refused cases must stop inside the guard, before facts or privilege escalation. They include rehearsal-only work against an inventory containing a live host name, not-yet-rehearsal-approved drop-in removal, and injected approvals or rollback phases;
+- the rollback model. No phase runs `secrets-encrypt disable`, `reencrypt`, `prepare` or `rotate`, and no rollback playbook exists. `enable` requires the recorded pre-enable checkpoint p0 (newest Stage 3 snapshot, name and SHA-256 recorded, token presence confirmed by `lstat` only, taken by the last accepted invocation), and the enabling rotation requires it too. `rotate-keys` is never a plaintext rollback, and `disable` is not accepted or used. `Disabled` is still parsed for diagnosis, but `configured-disabled` validation passes only before activation. After activation the only rollback is a snapshot restore of p0, a documented manual procedure that rolls back all Kubernetes and etcd state after p0 and requires a written operator impact acknowledgment;
+- status parsing, which fails closed, and the narrowly defined `unavailable` status that only the enable restart round tolerates;
+- the health, preservation and snapshot gates;
+- every phase decision, including the fixed restart order and confirmation replay;
+- the corrected step 1: the exact `enable` result before the marker, no status read afterwards, and the enable restart round. That round must be strictly ordered and not replayed, and requires a consistent marker, ledger and pre-enable checkpoint. It ends with a required `Disabled`/`start`/matching-hashes status before rotation;
+- the exclusive enable restart round. While it is incomplete, the next restart is the only phase admitted, even when status is readable and settled. Every other phase, including enforced validation, is refused until all three servers are durably verified after the converged status check. Inconsistent ledger, marker or checkpoint evidence fails closed;
+- mutation tests: each reintroduced defect must change the outcome of the regression test it targets;
+- state-directory and ledger link safety;
+- the etcdctl installer's check-before-install order;
+- the exact single-key raw canary verification pipeline, with a stub etcdctl;
+- the canary lifecycle, with a stub k3s;
+- that no canary value, raw etcd record, hash-mismatch node name or protected path appears in the output.
+
+The required disposable k3d rehearsal **passed on 2026-10-26 (run 8)**, after earlier attempts that each led to a correction:
+
+- **2026-10-23:** stopped at step 1. After `k3s secrets-encrypt enable`, `k3s secrets-encrypt status` failed on every server until restarts, which the encoded procedure did not allow for.
+- **2026-10-24:** stopped after `k3s01`'s restart. Status then became readable and settled on every server, so a gate that relied on the unavailable status no longer blocked checkpoint p1 mid-round.
+- **2026-10-25 and 2026-10-26:** passed enablement, the exclusive restart round, rotation, the second restart round and the encrypted canary checks. They stopped at the rollback re-encryption: K3s `v1.36.4+k3s1` rejects `reencrypt` for secretbox ("use rotate-keys instead"), and `rotate-keys` always re-encrypts.
+- **2026-10-26 (complete lifecycle):** passed every forward step through the post-encryption checkpoint. It stopped at the restore: the reset, delivered as configuration-file fields followed by an ordinary start of the S1 container, did not complete within 600 seconds.
+- **2026-10-26 (run 8, passed):**
+  - every forward phase passed, including all 11 p0 negative checks and exactly one rotation;
+  - the explicit p0 restore passed, with exit status 0, the documented message at ERROR level and the reset flag;
+  - S1 recovered as a healthy single member, then S2 and S3 rejoined one at a time to 3/3 healthy etcd;
+  - the restored p0 controls matched byte-for-byte, the post-p0 canaries were absent, and the restored Secret was plaintext in raw etcd;
+  - the lifecycle audit and teardown passed;
+  - the Flux and workload acceptance checks were not applicable in disposable k3d and are not claimed as passed;
+  - during the planned concurrent stop, S1 exited 1 while S2 and S3 exited 143. The cause was not determined, and it remains an open observation.
+- **2026-10-26 (restore-mechanism diagnostic, not a complete rehearsal):** the explicit `k3s server --cluster-reset --cluster-reset-restore-path=<p0>` restored p0 and exited 0, with the documented message at ERROR level and the reset flag present. S1 was recovered with its network identity, and S2 and S3 rejoined one at a time. The generated encryption files stayed on disk while the status returned to not-configured.
+
+All findings are corrected and statically re-tested:
+
+- phase transitions are gated by the durable state of the enable restart round, not by status readability;
+- the in-place rollback is removed;
+- after activation, the only rollback is a snapshot restore of the pre-enable checkpoint;
+- the restore is delivered by explicit invocation, accepted only with exit status 0, the documented message and the reset flag, and judged by status, readbacks and raw records rather than by the retained encryption files; the k3d rehearsal reproduces it with an auxiliary runner and a controlled network handoff that are rehearsal tooling only.
+
+The three-VM rehearsal **passed on 2026-10-27** at commit `825b09b`, under systemd: both cycles, the p2 and p0 restores, and the ordered drop-in removal. It found and corrected two repository defects: the service probe's split property argument (`0dea720`) and the removal round refused after its first server (`825b09b`). See the [three-VM record](secrets-encryption.md#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed).
+
+Passing the static tests is not Stage 3 completion, and neither are the rehearsals: the live rollout is not approved and not performed, and Stage 3 is not complete or applied to the real cluster. See [secrets-encryption.md](secrets-encryption.md#rollback).
+
 The recovery-tools role has not been run against a node. Downloading, checksum verification against the real archive, installation, the server's `age --version` result and idempotence on a real node remain to be shown by a separately approved live run. See [recovery-tools.md](recovery-tools.md).
 
 ### Packer

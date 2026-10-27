@@ -14,6 +14,32 @@
     group: root
     mode: '0755'
 
+- name: Check for an existing k3s binary
+  ansible.builtin.stat:
+    path: "{{ k3s_server_binary_path }}"
+    get_checksum: false
+  register: k3s_server_binary
+
+- name: Check for existing k3s data
+  ansible.builtin.stat:
+    path: "{{ k3s_server_data_dir }}"
+    get_checksum: false
+  register: k3s_server_data
+
+# Fresh builds and replacement joins only: the drop-in must exist before K3s
+# first starts. Skipped by default, and always skipped where the K3s binary or
+# K3s data exists, so an installed server never gains or loses it here.
+- name: Install the secrets-encryption drop-in before K3s first starts
+  ansible.builtin.include_role:
+    name: secrets-encryption
+    tasks_from: dropin.yml
+  vars:
+    secrets_encryption_dropin_state: present
+  when:
+    - k3s_secrets_encryption_enabled | bool
+    - not k3s_server_binary.stat.exists
+    - not k3s_server_data.stat.exists
+
 - name: Configure initial k3s server
   ansible.builtin.template:
     src: config-init.yaml.j2

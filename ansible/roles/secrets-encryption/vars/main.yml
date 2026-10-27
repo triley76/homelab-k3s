@@ -1,0 +1,197 @@
+---
+# Fixed values of the Stage 3 secrets-encryption procedure. They are role vars,
+# not defaults, so inventory cannot override them by accident. See
+# docs/secrets-encryption.md for the sources.
+
+# The only K3s release this procedure was written and reviewed for. Every phase
+# refuses to run if a server reports anything else.
+secrets_encryption_supported_k3s_version: v1.36.4+k3s1
+
+# Approved provider (D1). K3s writes "k8s:enc:secretbox:v1:<key name>:" in front
+# of each stored value and reports the key type as XSalsa20-POLY1305.
+secrets_encryption_provider: secretbox
+secrets_encryption_expected_prefix: "k8s:enc:secretbox:v1:"
+secrets_encryption_expected_key_type: XSalsa20-POLY1305
+
+secrets_encryption_k3s_bin: /usr/local/bin/k3s
+
+# K3s loads /etc/rancher/k3s/config.yaml.d/*.yaml after config.yaml, in
+# alphabetical order. The drop-in carries the two critical server arguments.
+secrets_encryption_dropin_path: /etc/rancher/k3s/config.yaml.d/20-secrets-encryption.yaml
+
+# Metadata written by this role: the last procedure change, per-server drop-in
+# change times, the rotation ledger and the preservation baselines. It holds no
+# key material, Secret value or token.
+secrets_encryption_state_dir: /var/lib/homelab-secrets-encryption
+
+# Read only as directory listings and, for new Stage 3 snapshots, as file
+# metadata and SHA-256 (D4). Nothing in them is ever removed or moved.
+secrets_encryption_snapshot_dir: /var/lib/rancher/k3s/server/db/snapshots
+secrets_encryption_db_dir: /var/lib/rancher/k3s/server/db
+# Scheduled snapshots are pruned by K3s's own retention; they are excluded from
+# the preservation baseline. Everything else is tracked.
+secrets_encryption_scheduled_snapshot_pattern: '^etcd-snapshot-'
+secrets_encryption_snapshot_name_pattern: '^stage3-[a-z0-9]+(-[a-z0-9]+)*$'
+
+# p0, the pre-enable checkpoint and the only rollback after activation: the
+# snapshot taken with this checkpoint label, recorded (name, size, SHA-256) in
+# the checkpoints state file, and the newest Stage 3 snapshot when enable runs.
+secrets_encryption_p0_checkpoint: p0-pre-enable
+
+# The server token file. A snapshot restores only with the token in use when it
+# was taken, so every checkpoint confirms that this file exists, by lstat only:
+# its content is never read, displayed, copied or hashed.
+secrets_encryption_token_file: /var/lib/rancher/k3s/server/token
+
+# The live cluster. Rehearsal inventories must not use these names.
+secrets_encryption_live_hosts:
+  - k3s01
+  - k3s02
+  - k3s03
+
+# Rotation stages that K3s v1.36 can report (pkg/secretsencrypt/config.go).
+secrets_encryption_known_stages:
+  - start
+  - prepare
+  - rotate
+  - rotate_keys
+  - reencrypt_request
+  - reencrypt_active
+  - reencrypt_finished
+# Stages at rest, in which a restart or a further step may begin. Every other
+# stage is a transition in progress or the legacy prepare/rotate procedure.
+secrets_encryption_settled_stages:
+  - start
+  - reencrypt_finished
+
+# The phases that change the cluster, and the order in which their markers are
+# written to the state directory.
+secrets_encryption_change_phases:
+  - enable
+  - rotate-keys
+
+# Rollback model (docs/secrets-encryption.md, "Rollback"). With the pinned
+# secretbox provider, K3s v1.36.4+k3s1 rejects `secrets-encrypt reencrypt` ("does
+# not support secretbox key type", pkg/server/handlers/secrets-encrypt.go;
+# observed in the k3d rehearsal of 2026-10-26), and `rotate-keys` always writes
+# an encrypting configuration, so neither converts Secrets back to plaintext.
+# There is therefore no in-place rollback after activation (rotate-keys): the
+# rollback boundary is the verified pre-enable snapshot (checkpoint p0), restored
+# with K3s's embedded-etcd restore procedure, which this automation does not run.
+# These secrets-encrypt subcommands are never run by any phase:
+secrets_encryption_unsupported_rollback_commands:
+  - disable
+  - reencrypt
+  - prepare
+  - rotate
+
+# Pinned etcdctl for raw verification of the canary records (D2), from the etcd
+# release that K3s v1.36.4+k3s1 embeds (go.etcd.io/etcd v3.6.14). Installed only
+# in a rehearsal environment; see install-etcdctl-rehearsal.yml.
+secrets_encryption_etcdctl_version: 3.6.14
+secrets_encryption_etcdctl_archive: etcd-v3.6.14-linux-amd64.tar.gz
+secrets_encryption_etcdctl_url: https://github.com/etcd-io/etcd/releases/download/v3.6.14/etcd-v3.6.14-linux-amd64.tar.gz
+secrets_encryption_etcdctl_sha256: ffe840ff9295808e88cce2794a18a5ac87f12a5203c8314d0bf6aa119b41bac5
+secrets_encryption_tools_dir: /usr/local/lib/homelab-secrets-encryption
+secrets_encryption_etcdctl_path: /usr/local/lib/homelab-secrets-encryption/etcdctl
+secrets_encryption_verifier_path: /usr/local/lib/homelab-secrets-encryption/etcd_value_verify.py
+secrets_encryption_tools_owner: root
+# Client credentials that K3s documents for etcdctl. Passed to etcdctl by path;
+# never read by this role.
+secrets_encryption_etcd_tls_dir: /var/lib/rancher/k3s/server/tls/etcd
+
+# Canary objects. Fixed names make cleanup deterministic after an interruption.
+secrets_encryption_canary_namespace: default
+secrets_encryption_canary_label: homelab.dev/stage3-encryption-canary
+secrets_encryption_canary_pre_secret: stage3-canary-pre-encryption
+secrets_encryption_canary_post_secret: stage3-canary-post-encryption
+secrets_encryption_canary_control_configmap: stage3-canary-plaintext-control
+# Disposable canary values live only here: tmpfs, root-only, gone on reboot.
+secrets_encryption_canary_dir: /run/homelab-secrets-encryption-canary
+
+# Tokens the local verifier may print. Anything else is reported as FAIL-UNEXPECTED.
+secrets_encryption_verifier_tokens:
+  - PASS
+  - FAIL-JSON
+  - FAIL-MISSING
+  - FAIL-MULTIPLE
+  - FAIL-KEY
+  - FAIL-EMPTY
+  - FAIL-OVERSIZE
+  - FAIL-PREFIX
+  - FAIL-MALFORMED
+  - FAIL-ENCRYPTED
+  - FAIL-USAGE
+
+# Facts the gates build from what they read on the servers. The guard refuses a
+# run in which any of them is already defined (extra vars or inventory), so that
+# no injected value can stand in for gathered state, for example the enable
+# restart round that alone may tolerate an unavailable status.
+secrets_encryption_gathered_facts:
+  - secrets_encryption_enable_round
+  - secrets_encryption_removal_round
+  - secrets_encryption_servers
+  - secrets_encryption_status_by_server
+  - secrets_encryption_parsed
+  - secrets_encryption_marker
+  - secrets_encryption_ledger_events
+  - secrets_encryption_ledger_malformed
+  - secrets_encryption_used_confirmations
+  - secrets_encryption_storage
+  - secrets_encryption_now_epoch
+  - secrets_encryption_health_problems
+  - secrets_encryption_report
+  - secrets_encryption_checkpoint_records
+  - secrets_encryption_p0
+
+# Owner required of the state directory and its files (root on every server).
+secrets_encryption_state_owner_uid: 0
+secrets_encryption_state_files:
+  - last-change
+  - dropin-change
+  - restart-verified
+  - preservation-baseline
+  - confirmations
+  - checkpoints
+
+# The mutating phases and their confirmation. Every invocation needs
+# -e secrets_encryption_confirm=<phase>:<target host>:<UTC time YYYYMMDDTHHMMSSZ>,
+# at most this many minutes old. Each value is recorded on the first server
+# before the phase acts and is never accepted again, for any phase or host.
+secrets_encryption_mutating_phases:
+  - snapshot
+  - enable
+  - restart
+  - rotate-keys
+  - canary-create-control
+  - canary-verify
+  - canary-cleanup
+  - install-etcdctl
+secrets_encryption_confirm_max_age_minutes: 30
+
+# Phases that only a rehearsal environment may run. The guard refuses them for
+# any inventory containing a live host name, whatever environment is declared.
+secrets_encryption_rehearsal_only_phases:
+  - install-etcdctl
+
+# Procedure paths that still depend on rehearsal answers (docs/secrets-encryption.md,
+# "Rehearsal questions"). In a live environment each one fails with "not yet
+# rehearsal-approved" until a reviewed change lists it here, citing the
+# rehearsal record. Rehearsal environments may run them to produce that record.
+# Allowed entry: flag-removal (drop-in removal before activation only).
+secrets_encryption_rehearsal_approved_paths: []
+
+# Gate defaults that a live environment may not relax: the guard requires their
+# committed values whenever secrets_encryption_environment is live.
+secrets_encryption_live_fixed_defaults:
+  - secrets_encryption_snapshot_max_age_minutes
+  - secrets_encryption_min_free_mb
+  - secrets_encryption_expected_kustomizations
+  - secrets_encryption_min_helmreleases
+  - secrets_encryption_monitoring_namespaces
+  - secrets_encryption_min_monitoring_statefulsets
+  - secrets_encryption_min_monitoring_daemonsets
+  - secrets_encryption_canary_deployment
+  - secrets_encryption_require_chrony
+  - secrets_encryption_max_offset_seconds
+  - secrets_encryption_raw_verification

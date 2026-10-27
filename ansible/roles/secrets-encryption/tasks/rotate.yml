@@ -1,0 +1,125 @@
+---
+# `k3s secrets-encrypt rotate-keys` on S1. In K3s v1.36 the handler adds a new
+# key of the configured provider, makes it active, re-encrypts every Secret
+# synchronously (about 5 per second) and removes the retired key, ending in
+# stage reencrypt_finished. This is the step that activates encryption for new
+# writes and rewrites existing Secrets. The servers are then restarted in order.
+#
+# The approved procedure performs exactly one rotation: the one that follows
+# enable. The guard and gate require a fresh confirmation that is consumed
+# before anything runs, so repeating the same variables never rotates again.
+# After a rotation the state is Enabled/reencrypt_finished, from which only an
+# additional rotation could start, and that is refused unless a reason is
+# recorded and separately approved for this confirmation.
+#
+# The enabling rotation is the point of no in-place return. With secretbox, K3s
+# v1.36.4+k3s1 offers no way back to plaintext (reencrypt is rejected for
+# secretbox; rotate-keys always writes an encrypting configuration), so the only
+# rollback afterwards is restoring the pre-enable snapshot (checkpoint p0). The
+# enabling rotation therefore also requires that snapshot to exist on the first
+# server with a consistent ledger. rotate-keys is never a plaintext rollback.
+- name: Decide the rotation purpose
+  vars:
+    se_all: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | list }}"
+    se_encryptions: "{{ se_all | map(attribute='status') | map(attribute='encryption') | unique | list }}"
+    se_stages: "{{ se_all | map(attribute='status') | map(attribute='stage') | unique | list }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_rotation_purpose: >-
+      {{ 'enabling' if (secrets_encryption_marker.phase == 'enable' and se_encryptions == ['disabled'] and se_stages == ['start'])
+      else 'additional' if (secrets_encryption_marker.phase == 'rotate-keys' and se_encryptions == ['enabled']
+                            and se_stages == ['reencrypt_finished'])
+      else 'refuse' }}
+
+- name: Enforce the rotation preconditions
+  vars:
+    se_all: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | list }}"
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_rotation_purpose in ['enabling', 'additional']
+      - >-
+        secrets_encryption_rotation_purpose == 'enabling'
+        or ((secrets_encryption_additional_rotation_reason | trim | length) >= 10
+            and (secrets_encryption_additional_rotation_approval | default('')) == 'additional-rotation:' ~ secrets_encryption_confirm_id)
+      - se_all | selectattr('checkpoint_reached', 'equalto', false) | list | length == 0
+      - se_all | selectattr('dropin_present', 'equalto', false) | list | length == 0
+      - se_all | map(attribute='status') | selectattr('hashes_match', 'equalto', false) | list | length == 0
+      - >-
+        secrets_encryption_rotation_purpose != 'enabling'
+        or (secrets_encryption_enable_round.checkpoint_ok | bool and secrets_encryption_enable_round.ledger_ok | bool)
+    fail_msg: >-
+      Rotation refused. It requires: after enable, every server restarted in order with the
+      drop-in, its post-restart gate passed, reporting Disabled at stage start with matching
+      hashes, and the pre-enable snapshot (checkpoint p0, the only rollback after activation)
+      present on the first server with a consistent ledger; or, for an additional rotation, every server Enabled at reencrypt_finished and
+      verified after the last rotation, a recorded secrets_encryption_additional_rotation_reason,
+      and -e secrets_encryption_additional_rotation_approval=additional-rotation:<this confirmation's time>.
+      Purpose: {{ secrets_encryption_rotation_purpose }}; state: {{ secrets_encryption_report.encryption }}.
+    quiet: true
+
+# The CLI waits up to 90 seconds. If it returns early (for example on a timeout
+# with many Secrets), the stage is polled below; the result is never assumed.
+- name: Run secrets-encrypt rotate-keys on the first server
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, rotate-keys]
+  register: secrets_encryption_rotate_result
+  changed_when: true
+  failed_when: false
+
+- name: Wait for re-encryption to finish
+  ansible.builtin.command:
+    argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, status]
+  register: secrets_encryption_rotate_wait
+  until: >-
+    secrets_encryption_rotate_wait.rc == 0
+    and secrets_encryption_rotate_wait.stdout_lines | map('trim') | select('equalto', 'Encryption Status: Enabled') | list | length == 1
+    and secrets_encryption_rotate_wait.stdout_lines | map('trim') | select('equalto', 'Current Rotation Stage: reencrypt_finished') | list | length == 1
+  retries: "{{ ((secrets_encryption_reencrypt_timeout_seconds | int) / (secrets_encryption_poll_delay_seconds | int)) | round(0, 'ceil') | int }}"
+  delay: "{{ secrets_encryption_poll_delay_seconds }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Parse the status after rotation
+  ansible.builtin.include_tasks: parse_status.yml
+  vars:
+    secrets_encryption_status_input: "{{ secrets_encryption_rotate_wait }}"
+
+- name: Require encryption with the approved provider
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_parsed.parsed | bool
+      - secrets_encryption_parsed.encryption == 'enabled'
+      - secrets_encryption_parsed.stage == 'reencrypt_finished'
+      - secrets_encryption_parsed.active_key_type == secrets_encryption_expected_key_type
+    fail_msg: >-
+      Rotation did not reach Enabled / reencrypt_finished with a {{ secrets_encryption_expected_key_type }}
+      active key (now {{ secrets_encryption_parsed.encryption }} / {{ secrets_encryption_parsed.stage }} /
+      {{ secrets_encryption_parsed.active_key_type }}). Do NOT restart any server; see the rollback table.
+    quiet: true
+
+- name: Read the time after rotation
+  ansible.builtin.command:
+    argv: [date, +%s]
+  register: secrets_encryption_change_time
+  changed_when: false
+
+- name: Record the rotation change
+  ansible.builtin.copy:
+    dest: "{{ secrets_encryption_state_dir }}/last-change"
+    content: "{{ secrets_encryption_change_time.stdout | trim }} rotate-keys\n"
+    owner: root
+    group: root
+    mode: '0600'
+    follow: false
+
+- name: Show the rotation result
+  ansible.builtin.debug:
+    msg:
+      purpose: "{{ secrets_encryption_rotation_purpose }}"
+      cli_reported_success: "{{ secrets_encryption_rotate_result.rc == 0 and secrets_encryption_rotate_result.stdout | trim == 'keys rotated, reencryption finished' }}"
+      encryption: "{{ secrets_encryption_parsed.encryption }}"
+      stage: "{{ secrets_encryption_parsed.stage }}"
+      active_key_type: "{{ secrets_encryption_parsed.active_key_type }}"
+      active_key_name: "{{ secrets_encryption_parsed.active_key_name }}"
+      key_count: "{{ secrets_encryption_parsed.key_count }}"
+      next: Restart each server in order (k3s01, k3s02, k3s03) using secrets-encryption-restart.yml.

@@ -1,0 +1,311 @@
+---
+# Restart one server after a recorded procedure change ("restart all servers"
+# in the K3s procedure), with the drop-in in the requested state.
+#
+# One fixed order: the inventory order of the servers group, which a live
+# environment requires to be exactly k3s01, k3s02, k3s03. A server may restart
+# only when every server before it has reached the checkpoint of the last
+# change: restarted after it, with the requested drop-in state, and its
+# post-restart gate passed and recorded (restart-verified).
+#
+# A restart is required when the target's K3s started before the later of the
+# last procedure change and its own last drop-in change, or when this run
+# changes its drop-in. Otherwise nothing is restarted (idempotent), and only the
+# post-restart gate and its record are repeated.
+#
+# The first round after enable (the enable restart round, summarize.yml) is
+# stricter: the target must be the next server in the order, never one that
+# already passed or one after it, and the marker, ledger and pre-enable
+# checkpoint must be consistent. Status is unavailable during that round
+# (observed in the k3d rehearsal), so the run on the last server requires every
+# server to report Disabled, start and matching hashes before the round counts
+# as complete.
+- name: Enforce the restart preconditions
+  vars:
+    se_all: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | list }}"
+    se_encryptions: "{{ se_all | map(attribute='status') | map(attribute='encryption') | unique | list }}"
+    se_tolerate: "{{ secrets_encryption_enable_round.tolerate_unavailable_status | bool }}"
+    # Only the next server of an active, consistent drop-in removal round, in a
+    # removal run, accepts the servers before it reporting Disabled without a
+    # configuration file: their own removal completed (summarize.yml).
+    se_removal: "{{ secrets_encryption_removal_round }}"
+    se_removal_tolerate: >-
+      {{ secrets_encryption_flag_state == 'absent' and (secrets_encryption_phase | default('')) == 'restart'
+      and se_removal.consistent | bool and inventory_hostname == se_removal.next }}
+    se_unsettled: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for h in groups['servers'] -%}
+      {%- set st = secrets_encryption_servers[h].status -%}
+      {%- if st.parsed | bool and st.stage in secrets_encryption_settled_stages -%}
+      {%- elif se_tolerate | bool and (st.unavailable | default(false) | bool
+               or (st.parsed | bool and st.encryption == 'disabled-no-config')) -%}
+      {%- elif se_removal_tolerate | bool and h in se_removal.removed -%}
+      {%- else -%}
+      {%- set ns.out = ns.out + [h] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | join(', ') }}
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_marker.present | bool
+      - se_unsettled == ''
+      - secrets_encryption_flag_state in ['present', 'absent']
+      - >-
+        secrets_encryption_flag_state == 'present'
+        or (se_encryptions == ['disabled'] and secrets_encryption_marker.phase == 'enable')
+        or se_removal_tolerate | bool
+    fail_msg: >-
+      Restart refused. It requires a recorded procedure change, every server in a settled
+      rotation stage ({{ secrets_encryption_settled_stages | join(', ') }}; never during
+      re-encryption; during the enable restart round a server's status may instead be unavailable),
+      and flag_state=absent only before activation: every server Disabled and the last change
+      enable, or, in the drop-in removal round, every earlier server's removal completed and the
+      target the next server. After rotate-keys there is no in-place rollback; restore the
+      pre-enable snapshot. Last change: {{ secrets_encryption_marker.phase }}; not settled:
+      {{ se_unsettled or 'none' }}; removal round: next {{ se_removal.next or 'none' }},
+      problems {{ se_removal.problems or 'none' }}.
+    quiet: true
+
+- name: Enforce the restart order
+  vars:
+    se_index: "{{ groups['servers'].index(inventory_hostname) }}"
+    se_before: "{{ groups['servers'][:se_index | int] }}"
+    se_pending: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for h in se_before -%}
+      {%- set s = secrets_encryption_servers[h] -%}
+      {%- if not (s.checkpoint_reached | bool and (s.dropin_present | bool) == (secrets_encryption_flag_state == 'present')) -%}
+      {%- set ns.out = ns.out + [h] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | join(', ') }}
+  ansible.builtin.assert:
+    that:
+      - se_pending == ''
+    fail_msg: >-
+      Restart order is {{ groups['servers'] | join(', ') }}. {{ inventory_hostname }} must wait until
+      {{ se_pending }} restarted after the last change with flag_state={{ secrets_encryption_flag_state }}
+      and passed its post-restart gate.
+    quiet: true
+
+- name: Enforce the enable restart round
+  vars:
+    se_round: "{{ secrets_encryption_enable_round }}"
+  ansible.builtin.assert:
+    that:
+      - se_round.ledger_ok | bool
+      - se_round.checkpoint_ok | bool
+      - se_round.out_of_order == ''
+      - not (se_round.complete | bool)
+      - inventory_hostname == se_round.next
+    fail_msg: >-
+      The first restart round after enable runs strictly in the order {{ groups['servers'] | join(', ') }},
+      once per server. It requires the enable marker with a matching ledger (a snapshot, then enable, on
+      {{ groups['servers'][0] }}, and no later change), a Stage 3 snapshot older than the enable marker,
+      and no restart, drop-in or verification after enable on any server after the next one.
+      Next in the order: {{ se_round.next or 'none (round complete)' }}; ledger consistent: {{ se_round.ledger_ok }};
+      pre-enable checkpoint: {{ se_round.checkpoint_ok }}; out of order: {{ se_round.out_of_order or 'none' }}.
+    quiet: true
+  when:
+    - secrets_encryption_marker.phase == 'enable'
+    - secrets_encryption_flag_state == 'present'
+
+- name: Record the pre-restart restart counters
+  ansible.builtin.set_fact:
+    secrets_encryption_nrestarts_before: >-
+      {{ dict(groups['servers'] | zip(groups['servers'] | map('extract', secrets_encryption_servers) | map(attribute='nrestarts'))) }}
+
+- name: Apply the requested drop-in state
+  ansible.builtin.include_tasks: dropin.yml
+  vars:
+    secrets_encryption_dropin_state: "{{ secrets_encryption_flag_state }}"
+
+- name: Read the time of the drop-in change
+  ansible.builtin.command:
+    argv: [date, +%s]
+  register: secrets_encryption_dropin_time
+  changed_when: false
+  when: secrets_encryption_dropin_changed | bool
+
+- name: Record the drop-in change
+  ansible.builtin.copy:
+    dest: "{{ secrets_encryption_state_dir }}/dropin-change"
+    content: "{{ secrets_encryption_dropin_time.stdout | trim }}\n"
+    owner: root
+    group: root
+    mode: '0600'
+    follow: false
+  when: secrets_encryption_dropin_changed | bool
+
+- name: Decide the restart
+  ansible.builtin.set_fact:
+    secrets_encryption_restart_required: >-
+      {{ (secrets_encryption_dropin_changed | bool)
+      or not (secrets_encryption_servers[inventory_hostname].restarted_since_change | bool) }}
+
+- name: Report that no restart is needed
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} already runs with the current configuration; no restart."
+  when: not secrets_encryption_restart_required | bool
+
+- name: Restart and wait for the server
+  when: secrets_encryption_restart_required | bool
+  block:
+    # The only K3s restart in this automation: explicit, one server per run.
+    - name: Restart K3s on the target server
+      ansible.builtin.systemd_service:
+        name: k3s.service
+        state: restarted
+
+    - name: Wait for k3s.service to be active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, k3s.service]
+      register: secrets_encryption_wait_active
+      until: secrets_encryption_wait_active.stdout | trim == 'active'
+      retries: "{{ secrets_encryption_ready_retries }}"
+      delay: "{{ secrets_encryption_ready_delay_seconds }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Wait for the local API to be ready
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_k3s_bin }}", kubectl, get, --raw, /readyz]
+      register: secrets_encryption_wait_readyz
+      until: secrets_encryption_wait_readyz.rc == 0 and secrets_encryption_wait_readyz.stdout | trim == 'ok'
+      retries: "{{ secrets_encryption_ready_retries }}"
+      delay: "{{ secrets_encryption_ready_delay_seconds }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Wait for the local etcd to be ready
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_k3s_bin }}", kubectl, get, --raw, /readyz/etcd]
+      register: secrets_encryption_wait_etcd
+      until: secrets_encryption_wait_etcd.rc == 0 and secrets_encryption_wait_etcd.stdout | trim == 'ok'
+      retries: "{{ secrets_encryption_ready_retries }}"
+      delay: "{{ secrets_encryption_ready_delay_seconds }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Wait for the node to be Ready
+      ansible.builtin.command:
+        argv:
+          - "{{ secrets_encryption_k3s_bin }}"
+          - kubectl
+          - get
+          - node
+          - "{{ inventory_hostname }}"
+          - -o
+          - 'jsonpath={.status.conditions[?(@.type=="Ready")].status}'
+      register: secrets_encryption_wait_node
+      until: secrets_encryption_wait_node.rc == 0 and secrets_encryption_wait_node.stdout | trim == 'True'
+      retries: "{{ secrets_encryption_ready_retries }}"
+      delay: "{{ secrets_encryption_ready_delay_seconds }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Require the restarted server to be ready
+      ansible.builtin.assert:
+        that:
+          - secrets_encryption_wait_active.stdout | trim == 'active'
+          - secrets_encryption_wait_readyz.stdout | trim == 'ok'
+          - secrets_encryption_wait_etcd.stdout | trim == 'ok'
+          - secrets_encryption_wait_node.stdout | trim == 'True'
+        fail_msg: >-
+          {{ inventory_hostname }} did not become ready after the restart. Stop. Do not
+          restart another server; see the rollback table in docs/secrets-encryption.md.
+        quiet: true
+
+- name: Gather the cluster state after the restart
+  ansible.builtin.include_tasks: gather.yml
+
+- name: Require a healthy cluster and no unplanned restarts
+  vars:
+    se_after: >-
+      {{ dict(groups['servers'] | zip(groups['servers'] | map('extract', secrets_encryption_servers) | map(attribute='nrestarts'))) }}
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_report.health_problems | length == 0
+      - secrets_encryption_servers[inventory_hostname].restarted_since_change | bool
+      - (secrets_encryption_servers[inventory_hostname].dropin_present | bool) == (secrets_encryption_flag_state == 'present')
+      - se_after == secrets_encryption_nrestarts_before
+    fail_msg: >-
+      After the restart: health {{ secrets_encryption_report.health_problems }};
+      automatic restart counters before {{ secrets_encryption_nrestarts_before }}, after {{ se_after }}. Stop.
+    quiet: true
+
+# The enable restart round ends on its last server. Status must now be readable
+# on every server and show the identity configuration (Disabled, stage start)
+# with matching hashes. Until it does, the last server is not recorded as
+# verified: the round stays incomplete, this run can be repeated, and p1,
+# rotation and every other phase stay refused by the fail-closed status gate.
+- name: Validate the status after the enable restart round
+  when:
+    - secrets_encryption_marker.phase == 'enable'
+    - secrets_encryption_flag_state == 'present'
+    - inventory_hostname == groups['servers'][-1]
+  block:
+    - name: Wait for a readable status on every server after the enable restart round
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, status]
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['servers'] }}"
+      register: secrets_encryption_round_status
+      until: >-
+        secrets_encryption_round_status.rc == 0
+        and secrets_encryption_round_status.stdout_lines | map('trim') | select('equalto', 'Encryption Status: Disabled') | list | length == 1
+        and secrets_encryption_round_status.stdout_lines | map('trim') | select('equalto', 'Current Rotation Stage: start') | list | length == 1
+        and secrets_encryption_round_status.stdout_lines | map('trim') | select('equalto', 'Server Encryption Hashes: All hashes match') | list | length == 1
+      retries: "{{ secrets_encryption_ready_retries }}"
+      delay: "{{ secrets_encryption_ready_delay_seconds }}"
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Reset the status parsed after the enable restart round
+      ansible.builtin.set_fact:
+        secrets_encryption_status_by_server: {}
+
+    - name: Parse the status after the enable restart round
+      ansible.builtin.include_tasks: parse_status.yml
+      loop: "{{ secrets_encryption_round_status.results }}"
+      loop_control:
+        loop_var: secrets_encryption_status_input
+        label: "{{ secrets_encryption_status_input.item }}"
+
+    - name: Require Disabled, start and matching hashes on every server after the enable restart round
+      vars:
+        se_not_ready: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for h in groups['servers'] -%}
+          {%- set p = secrets_encryption_status_by_server[h] | default({}) -%}
+          {%- if not (p.parsed | default(false) | bool and p.encryption | default('') == 'disabled'
+                      and p.stage | default('') == 'start' and p.hashes_match | default(false) | bool) -%}
+          {%- set ns.out = ns.out + [h] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ ns.out | join(', ') }}
+      ansible.builtin.assert:
+        that:
+          - se_not_ready == ''
+        fail_msg: >-
+          After the enable restart round every server must report Disabled, stage start and matching
+          hashes. Not yet: {{ se_not_ready }}. {{ inventory_hostname }} is not recorded as verified;
+          checkpoint p1 and rotation stay refused. Repeat this run when the status is readable.
+        quiet: true
+
+# The next server in the order may restart only after this record exists.
+- name: Read the time of the passed post-restart gate
+  ansible.builtin.command:
+    argv: [date, +%s]
+  register: secrets_encryption_verified_time
+  changed_when: false
+
+- name: Record the passed post-restart gate
+  ansible.builtin.copy:
+    dest: "{{ secrets_encryption_state_dir }}/restart-verified"
+    content: "{{ secrets_encryption_verified_time.stdout | trim }}\n"
+    owner: root
+    group: root
+    mode: '0600'
+    follow: false

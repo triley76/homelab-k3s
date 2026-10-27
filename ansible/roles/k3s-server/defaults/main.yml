@@ -1,0 +1,11 @@
+---
+# Whether a newly installed server starts with secrets encryption at rest
+# (secretbox; see docs/secrets-encryption.md). Honored only while K3s is absent
+# from the server: on an existing server this role never writes or removes the
+# drop-in, whatever this says.
+#
+# Keep false until the live Stage 3 procedure has completed. After it, every
+# server must carry the same critical secrets-encryption arguments, so a fresh
+# build or a replacement join must set this to true, or K3s refuses the join
+# with "critical configuration value mismatch".
+k3s_secrets_encryption_enabled: false

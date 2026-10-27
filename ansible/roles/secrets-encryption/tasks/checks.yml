@@ -1,0 +1,61 @@
+---
+# Read-only evaluation of preservation and snapshot freshness, from the state
+# collected by gather.yml.
+#
+# Nothing is ever removed by this automation. The checks are defensive:
+#  - every protected Stage 2 artifact (secrets_encryption_protected_paths) must
+#    exist, keep its type, and, for files, keep its size and modification time
+#    from the first baseline;
+#  - every on-demand snapshot and database directory recorded in the baseline
+#    must still exist. Scheduled snapshots (etcd-snapshot-*) are excluded
+#    because K3s prunes them by its own retention; that is not Stage 3 deletion.
+- name: Evaluate snapshot and database preservation
+  ansible.builtin.set_fact:
+    secrets_encryption_preservation_problems: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for name in groups['servers'] -%}
+      {%- set st = secrets_encryption_storage[name] -%}
+      {%- set wanted = (secrets_encryption_protected_paths | default({}, true))[name] | default([]) -%}
+      {%- for p in wanted -%}
+      {%- set m = st.protected[p] | default({}) -%}
+      {%- if not m.exists | default(false) -%}
+      {%- set ns.out = ns.out + [name ~ ': protected artifact #' ~ loop.index ~ ' missing'] -%}
+      {%- elif m.islnk | default(true) or not (m.isdir | default(false) or m.isreg | default(false)) -%}
+      {%- set ns.out = ns.out + [name ~ ': protected artifact #' ~ loop.index ~ ' is not a plain file or directory'] -%}
+      {%- elif st.baseline is mapping and st.baseline.protected is defined and st.baseline.protected[p] is defined -%}
+      {%- set b = st.baseline.protected[p] -%}
+      {%- if (b.isdir | default(false)) != (m.isdir | default(false))
+             or (m.isreg | default(false) and ((b.size | default(-1) | int) != (m.size | int) or (b.mtime | default(-1) | int) != (m.mtime | int))) -%}
+      {%- set ns.out = ns.out + [name ~ ': protected artifact #' ~ loop.index ~ ' changed since the baseline'] -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if st.baseline is not none -%}
+      {%- if st.baseline is not mapping or st.baseline.snapshots is not defined or st.baseline.db_dirs is not defined -%}
+      {%- set ns.out = ns.out + [name ~ ': preservation baseline malformed'] -%}
+      {%- else -%}
+      {%- for f in st.baseline.snapshots if f not in st.snapshot_names -%}
+      {%- set ns.out = ns.out + [name ~ ': snapshot missing since baseline: ' ~ f] -%}
+      {%- endfor -%}
+      {%- for d in st.baseline.db_dirs if d not in st.db_dirs -%}
+      {%- set ns.out = ns.out + [name ~ ': database directory missing since baseline: ' ~ d] -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out | join(';;') }}
+
+- name: Evaluate snapshot freshness
+  vars:
+    se_snaps: "{{ secrets_encryption_storage[groups['servers'][0]].stage3_snapshots }}"
+    se_newest: "{{ se_snaps | map(attribute='mtime') | map('int') | max if se_snaps | length > 0 else 0 }}"
+    se_age: "{{ secrets_encryption_now_epoch | int - se_newest | int }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_snapshot_gate:
+      newest_epoch: "{{ se_newest | int }}"
+      age_seconds: "{{ se_age | int if se_newest | int > 0 else -1 }}"
+      fresh: >-
+        {{ se_newest | int > 0 and se_age | int >= -60
+        and se_age | int <= (secrets_encryption_snapshot_max_age_minutes | int) * 60
+        and (not (secrets_encryption_snapshot_after_change | default(false) | bool)
+             or se_newest | int > secrets_encryption_marker.epoch | int) }}

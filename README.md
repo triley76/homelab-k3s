@@ -81,6 +81,7 @@ The addresses above use the RFC 5737 documentation range and are examples rather
 | Flux Git source reconciliation | Validated |
 | Flux Kustomization reconciliation | Validated |
 | Serial Chrony rollout and enforced one-hour stability window | Validated |
+| Kubernetes Secrets encryption at rest (secretbox) | Implemented and statically tested; passed the required disposable k3d rehearsal, including the pre-enable snapshot restore; the three-VM rehearsal passed on 2026-10-27 under systemd, including both restores and the ordered drop-in removal; not approved for or applied to the live cluster |
 | GitOps platform-service expansion | In progress |
 
 The current Kubernetes baseline is pinned to **K3s v1.36.4+k3s1**. Flux **2.9.5** has been bootstrapped and validated against the V2 cluster.
@@ -149,6 +150,20 @@ Before K3s is installed, the `time-sync` role replaces `systemd-timesyncd` with 
 
 The `recovery-tools` role installs a pinned `age` release (v1.3.2, checksum-verified, not from apt) on the first server only, for the encrypted recovery material of the backup design. On an existing cluster it is installed with `configure-recovery-tools.yml --limit k3s01`, which needs separate approval and has not yet been run against a node; see [docs/recovery-tools.md](docs/recovery-tools.md).
 
+The `secrets-encryption` role and its phase playbooks encode the K3s `v1.36.4+k3s1` procedure for enabling Secrets encryption at rest on the existing cluster:
+
+- `enable`, a restart of each server, `rotate-keys` (which activates encryption and rewrites every existing Secret) and a second restart of each server;
+- each step a separate, single-server, confirmed invocation behind health, preservation and snapshot gates.
+
+It is statically tested and passed the required disposable k3d rehearsal on 2026-10-26, including the restore of the pre-enable snapshot. Earlier k3d rehearsals stopped four times, and each led to a correction:
+
+- at step 1, because `secrets-encrypt status` is unavailable between `enable` and the first restart;
+- after the first restart, because status then became readable before the ordered restart round had completed;
+- at the rollback re-encryption, because K3s rejects `reencrypt` for the secretbox provider;
+- at the snapshot restore, because a reset delivered through configuration-file fields did not complete. A focused diagnostic then restored the snapshot with the explicit `k3s server --cluster-reset` invocation.
+
+The procedure now gates every phase on the durable state of that round. With secretbox there is no in-place rollback after activation: the only rollback is a snapshot restore of the pre-enable checkpoint, a documented manual procedure that rolls back all Kubernetes and etcd state after that checkpoint. Passing the static tests is not completion, and neither are the rehearsals: the three-VM rehearsal passed on 2026-10-27, but the live rollout is not approved and has not been performed, and `site.yml` does not use it; see [docs/secrets-encryption.md](docs/secrets-encryption.md).
+
 ## GitOps Boundary
 
 This repository is responsible for **constructing the Kubernetes infrastructure**:
@@ -176,6 +191,7 @@ The GitOps foundation has been validated. Networking services, ingress, persiste
 |   |-- architecture.md      Detailed platform architecture
 |   |-- build.md             Reproducible build procedure
 |   |-- recovery-tools.md    Pinned age installation for recovery operations
+|   |-- secrets-encryption.md  Secrets encryption at rest (Stage 3) procedure
 |   |-- time-synchronization.md  Chrony configuration and per-node rollout
 |   |-- validation.md        Validation and failure-test evidence
 |   `-- decisions/           Architecture Decision Records

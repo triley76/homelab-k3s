@@ -1,0 +1,40 @@
+---
+# Install or remove the secrets-encryption drop-in on the current host. This
+# only writes a file: K3s reads it at its next start, and no task here restarts
+# anything. Callers set secrets_encryption_dropin_state to present or absent.
+- name: Require a drop-in state
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_dropin_state in ['present', 'absent']
+    quiet: true
+
+- name: Ensure the K3s configuration drop-in directory exists
+  ansible.builtin.file:
+    path: "{{ secrets_encryption_dropin_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: secrets_encryption_dropin_state == 'present'
+
+- name: Install the secrets-encryption drop-in
+  ansible.builtin.template:
+    src: secrets-encryption.yaml.j2
+    dest: "{{ secrets_encryption_dropin_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  register: secrets_encryption_dropin_installed
+  when: secrets_encryption_dropin_state == 'present'
+
+- name: Remove the secrets-encryption drop-in
+  ansible.builtin.file:
+    path: "{{ secrets_encryption_dropin_path }}"
+    state: absent
+  register: secrets_encryption_dropin_removed
+  when: secrets_encryption_dropin_state == 'absent'
+
+- name: Record whether the drop-in changed
+  ansible.builtin.set_fact:
+    secrets_encryption_dropin_changed: >-
+      {{ (secrets_encryption_dropin_installed is changed) or (secrets_encryption_dropin_removed is changed) }}

@@ -1,0 +1,108 @@
+---
+# Step 2 of the K3s "Enable Secrets Encryption on an Existing Cluster" HA
+# procedure: `k3s secrets-encrypt enable` on S1. On a cluster without an
+# encryption configuration K3s writes an identity-only configuration: nothing is
+# encrypted and no Secret is rewritten. Restarts follow, one server at a time,
+# through secrets-encryption-restart.yml.
+#
+# Observed in the k3d rehearsal on v1.36.4+k3s1: after enable, and before any
+# restart, `k3s secrets-encrypt status` fails on every server (the server
+# reports a missing encryption-hash annotation). Status is therefore not a
+# postcondition of this phase. The only accepted result is the command's exit
+# status 0 with exactly "secrets-encryption enabled"; the change is recorded
+# only after that. Status is required again, and must show Disabled, start and
+# matching hashes, once the first restart round has completed (restart.yml).
+- name: Decide whether enable is required
+  vars:
+    se_states: "{{ groups['servers'] | map('extract', secrets_encryption_servers) | map(attribute='status') | list }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_enable_decision: >-
+      {{ 'run' if (se_states | map(attribute='encryption') | unique | list == ['disabled-no-config']
+                   and not secrets_encryption_marker.present | bool)
+      else 'done' if (secrets_encryption_marker.phase == 'enable'
+                      and se_states | map(attribute='encryption') | reject('in', ['disabled', 'disabled-no-config']) | list | length == 0
+                      and secrets_encryption_servers[groups['servers'][0]].status.encryption == 'disabled')
+      else 'refuse' }}
+
+- name: Enforce the enable preconditions
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_enable_decision in ['run', 'done']
+      - >-
+        secrets_encryption_enable_decision == 'done'
+        or groups['servers'] | map('extract', secrets_encryption_servers) | selectattr('dropin_present') | list | length == 0
+    fail_msg: >-
+      Enable is allowed only when every server reports "Disabled, no configuration file found",
+      no drop-in exists and no Stage 3 change is recorded. Current state:
+      {{ secrets_encryption_report.encryption }}; last change {{ secrets_encryption_marker.phase }}.
+    quiet: true
+
+# p0 (docs/secrets-encryption.md, "The pre-enable checkpoint (p0)"): the newest
+# Stage 3 snapshot on the first server must be a p0-pre-enable snapshot whose
+# checkpoint record (name, size, SHA-256, token presence) matches it, and the
+# snapshot must be the last accepted invocation before this one. Its freshness
+# was already enforced by the gate.
+- name: Require the recorded pre-enable checkpoint
+  ansible.builtin.assert:
+    that:
+      - secrets_encryption_enable_decision == 'done' or secrets_encryption_p0.ok | bool
+    fail_msg: >-
+      Enable requires the pre-enable checkpoint: take a fresh snapshot with
+      secrets_encryption_snapshot_checkpoint={{ secrets_encryption_p0_checkpoint }} immediately before
+      enable. Newest Stage 3 snapshot: {{ secrets_encryption_p0.newest | default('none', true) }};
+      p0 label {{ secrets_encryption_p0.newest_is_p0 }}, recorded {{ secrets_encryption_p0.newest_recorded }},
+      last invocation was the snapshot {{ secrets_encryption_p0.last_event_snapshot }},
+      malformed records {{ secrets_encryption_p0.records_malformed }}.
+    quiet: true
+
+- name: Report that enable has already been applied
+  ansible.builtin.debug:
+    msg: "secrets-encrypt enable was already applied; nothing to do. Continue with the restarts."
+  when: secrets_encryption_enable_decision == 'done'
+
+- name: Enable secrets encryption with an identity configuration
+  when: secrets_encryption_enable_decision == 'run'
+  block:
+    # Failures are decided by the next task, so that any exit status or output
+    # other than the documented one stops before the change is recorded.
+    - name: Run secrets-encrypt enable on the first server
+      ansible.builtin.command:
+        argv: ["{{ secrets_encryption_k3s_bin }}", secrets-encrypt, enable]
+      register: secrets_encryption_enable_result
+      changed_when: true
+      failed_when: false
+
+    - name: Require the documented enable result
+      ansible.builtin.assert:
+        that:
+          - secrets_encryption_enable_result.rc is defined
+          - secrets_encryption_enable_result.rc == 0
+          - secrets_encryption_enable_result.stdout_lines | default([]) == ['secrets-encryption enabled']
+        fail_msg: >-
+          secrets-encrypt enable did not exit 0 with exactly "secrets-encryption enabled". No change
+          was recorded. Stop and investigate; do not restart any server.
+        quiet: true
+
+    - name: Read the time after enable
+      ansible.builtin.command:
+        argv: [date, +%s]
+      register: secrets_encryption_change_time
+      changed_when: false
+
+    - name: Record the enable change
+      ansible.builtin.copy:
+        dest: "{{ secrets_encryption_state_dir }}/last-change"
+        content: "{{ secrets_encryption_change_time.stdout | trim }} enable\n"
+        owner: root
+        group: root
+        mode: '0600'
+        follow: false
+
+    - name: Show the next step after enable
+      ansible.builtin.debug:
+        msg:
+          enable: secrets-encryption enabled
+          status: >-
+            Not read. Before the first restart round, secrets-encrypt status is expected to fail on
+            every server; it is required again after the round.
+          next: Restart each server with the drop-in, k3s01 first, using secrets-encryption-restart.yml.

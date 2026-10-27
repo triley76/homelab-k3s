@@ -1,0 +1,5 @@
+---
+# Paths whose presence marks an installed K3s server. While either exists, the
+# role never writes or removes the secrets-encryption drop-in.
+k3s_server_binary_path: /usr/local/bin/k3s
+k3s_server_data_dir: /var/lib/rancher/k3s

@@ -1,0 +1,55 @@
+---
+# Raw check of one deliberately created canary record with the pinned etcdctl.
+# Inputs: se_raw_key (one of the three fixed canary keys), se_raw_mode
+# (encrypted or plaintext), se_raw_label. Output:
+# secrets_encryption_canary_results['raw_' ~ se_raw_label].
+#
+# etcdctl requests exactly that one key (no --prefix, --from-key or range end)
+# from the local member only, with K3s's documented etcd client certificates,
+# a bounded dial and command timeout, and an overall time limit. Its JSON
+# response goes straight into the local verifier, which requires exactly one
+# record with exactly that key and prints a single token. The record is never
+# displayed, stored in a fact or written to a file, and the task output is
+# hidden. Only an allowlisted token is recorded.
+- name: Require one of the fixed canary keys
+  vars:
+    se_keys:
+      - /registry/secrets/{{ secrets_encryption_canary_namespace }}/{{ secrets_encryption_canary_pre_secret }}
+      - /registry/secrets/{{ secrets_encryption_canary_namespace }}/{{ secrets_encryption_canary_post_secret }}
+      - /registry/configmaps/{{ secrets_encryption_canary_namespace }}/{{ secrets_encryption_canary_control_configmap }}
+  ansible.builtin.assert:
+    that:
+      - se_raw_key in se_keys
+      - se_raw_mode in ['encrypted', 'plaintext']
+    fail_msg: Raw verification reads only the fixed canary keys, in encrypted or plaintext mode.
+    quiet: true
+
+- name: Verify the stored form of one canary record
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      ETCDCTL_API=3 timeout 30
+      {{ secrets_encryption_etcdctl_path | quote }}
+      --endpoints=https://127.0.0.1:2379
+      --cacert={{ (secrets_encryption_etcd_tls_dir ~ '/server-ca.crt') | quote }}
+      --cert={{ (secrets_encryption_etcd_tls_dir ~ '/client.crt') | quote }}
+      --key={{ (secrets_encryption_etcd_tls_dir ~ '/client.key') | quote }}
+      --dial-timeout=5s --command-timeout=15s
+      get --write-out=json -- {{ se_raw_key | quote }}
+      | python3 -I {{ secrets_encryption_verifier_path | quote }}
+      {{ se_raw_mode | quote }} {{ secrets_encryption_expected_prefix | quote }} {{ se_raw_key | quote }}
+    executable: /bin/bash
+  register: secrets_encryption_raw_probe
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Record the raw verification token
+  vars:
+    se_out: "{{ secrets_encryption_raw_probe.stdout | default('') | trim }}"
+  ansible.builtin.set_fact:
+    secrets_encryption_canary_results: >-
+      {{ secrets_encryption_canary_results | default({}) | combine({'raw_' ~ se_raw_label:
+         'PASS' if (secrets_encryption_raw_probe.rc | default(1) == 0 and se_out == 'PASS')
+         else se_out if (se_out in secrets_encryption_verifier_tokens and se_out != 'PASS')
+         else 'FAIL-UNEXPECTED'}) }}
