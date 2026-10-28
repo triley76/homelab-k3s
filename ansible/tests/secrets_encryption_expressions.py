@@ -718,6 +718,20 @@ require("docs: k3d and three-VM rehearsals recorded as passed (three-VM record s
         docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC, ARCH_DOC))
 require("docs: restore impact and acknowledgment, p0 definition, official restore sequence with S2/S3, acceptance criteria, disable not used",
         docs_restore_defined(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC))
+KEY_MATERIAL = ("### Key material and the off-node recovery copy", "## Fresh Builds and Replacement Joins")
+
+
+def docs_key_recovery_aligned(doc):
+    """The key-recovery section matches the merged home-cluster encryption-config helper (pull request #21, 3bb8199): its
+    comparisons report MATCH, DIFFER or ERROR, and it never records the source or plaintext size."""
+    sec = doc_section(doc, *KEY_MATERIAL)
+    return (sec != "" and "`MATCH`, `DIFFER` or `ERROR`" in sec and "never report the plaintext's size or hash" in sec
+            and "pull request #21 (commit `3bb8199`)" in sec
+            and not re.search(r"MISMATCH|source file's size|(source|plaintext)( file)?'?s? size and", sec))
+
+
+require("docs: the key-recovery section matches the home-cluster encryption-config helper (MATCH, DIFFER or ERROR; no source size)",
+        docs_key_recovery_aligned(ROLLBACK_DOC))
 require("gate.yml: every check before any write",
         order_ok("gate", ["Gather the cluster state", "Evaluate preservation and snapshot freshness", "Enforce the common health gate",
                           "Enforce the exclusive enable restart round", "Enforce snapshot and database preservation", "Enforce snapshot freshness", "Refuse a confirmation that was already used",
@@ -1147,6 +1161,12 @@ structural_mutants += [
     ("post-restore encryption-file metadata claimed as compared", lambda: docs_status_current(ROLLBACK_DOC.replace(
         "did not compare their inode or modification time after the restore", "compared their inode and modification time after the restore"),
         README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the key-recovery comparison reported as MATCH or MISMATCH", lambda: docs_key_recovery_aligned(ROLLBACK_DOC.replace(
+        "`MATCH`, `DIFFER` or `ERROR`", "`MATCH` or `MISMATCH`"))),
+    ("the key-recovery record holding the source file's size", lambda: docs_key_recovery_aligned(ROLLBACK_DOC.replace(
+        "the ciphertext's size and SHA-256, and the object key", "the source file's size and mode, the ciphertext's size and SHA-256, and the object key"))),
+    ("the key-recovery section without the merged helper reference", lambda: docs_key_recovery_aligned(ROLLBACK_DOC.replace(
+        "pull request #21 (commit `3bb8199`)", "a future pull request"))),
 ]
 
 
