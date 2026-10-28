@@ -169,6 +169,19 @@ secrets_encryption_mutating_phases:
   - install-etcdctl
 secrets_encryption_confirm_max_age_minutes: 30
 
+# The phase each guarded play may run, keyed by its exact play name. The guard
+# binds secrets_encryption_phase to ansible_play_name, a magic variable that
+# extra vars and inventory cannot override, so no run can present one playbook
+# as another phase. Only the canary play has several phases, chosen by its
+# action. Committed: the guard refuses any override of this mapping.
+secrets_encryption_play_phases:
+  Take a Stage 3 on-demand etcd snapshot: [snapshot]
+  Enable secrets encryption with an identity configuration: [enable]
+  Restart one K3s server for the secrets-encryption procedure: [restart]
+  Rotate secrets-encryption keys and re-encrypt every Secret: [rotate-keys]
+  Run the Stage 3 encryption canary: [canary-create-control, canary-verify, canary-cleanup]
+  Install the pinned etcdctl for a Stage 3 rehearsal: [install-etcdctl]
+
 # Phases that only a rehearsal environment may run. The guard refuses them for
 # any inventory containing a live host name, whatever environment is declared.
 secrets_encryption_rehearsal_only_phases:
@@ -179,7 +192,13 @@ secrets_encryption_rehearsal_only_phases:
 # rehearsal-approved" until a reviewed change lists it here, citing the
 # rehearsal record. Rehearsal environments may run them to produce that record.
 # Allowed entry: flag-removal (drop-in removal before activation only).
-secrets_encryption_rehearsal_approved_paths: []
+# flag-removal: approved by the three-VM rehearsal of 2026-10-27 at 825b09b
+# (docs/secrets-encryption.md, "Three-VM rehearsal record"), where the ordered
+# removal round completed from its recorded prefix. Its ordered-round,
+# recorded-prefix, health, confirmation, inventory and environment gates apply
+# unchanged.
+secrets_encryption_rehearsal_approved_paths:
+  - flag-removal
 
 # Gate defaults that a live environment may not relax: the guard requires their
 # committed values whenever secrets_encryption_environment is live.

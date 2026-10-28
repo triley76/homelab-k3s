@@ -7,6 +7,7 @@ The automation for enabling Kubernetes Secrets encryption at rest is **implement
 - **The required disposable k3d rehearsal passed on 2026-10-26** (see the [run-8 record](#k3d-rehearsal-record-2026-10-26-run-8-passed)). Every forward phase and the explicit p0 restore passed every [acceptance criterion](#k3d-required-before-merge). Earlier attempts stopped at step 1 (2026-10-23), after `k3s01`'s restart (2026-10-24), at the in-place rollback that K3s rejects for secretbox (2026-10-25 and 2026-10-26), and at a reset delivered through configuration-file fields (2026-10-26).
 - **The three-VM rehearsal passed on 2026-10-27** at commit `825b09b` (see the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed)). It covered both cycles, the p2 and p0 restores and the ordered drop-in removal under systemd, after two repository defects found during it were corrected.
 - **The live rollout is not approved and not performed.**
+- **The live behavioral reference is the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed).** The 2026-10-27 systemd rehearsal is authoritative for the live sequence and the expected status at each step. The k3d records remain historical evidence; in particular, k3d's readable status on every server after S1 alone is **not** a live expectation (under systemd, each server's status changed only with its own restart).
 - **Stage 3 is not complete** and has not been applied to the real cluster. A passing static test run is not completion. The rehearsals establish readiness for review only.
 - It has **not** been run against the live cluster.
 - Nothing in this repository has changed the live cluster's encryption state, which remains disabled.
@@ -92,7 +93,7 @@ There is no in-place rollback step after step 3; see [Rollback](#rollback). The 
   - the target and every later server still carry the drop-in, last changed and verified before the first removal, and report `Disabled`, stage `start` and matching hashes.
 
   Any other mixed state admits no restart. That includes a missing or out-of-sequence record, a later server without its drop-in, a target already without configuration, and a removal run on any other server. The tolerance never applies to `flag_state=present`, to the enable restart round or after `rotate-keys`. A removal interrupted after the target's drop-in change but before its recorded gate leaves the round inconsistent and needs manual investigation.
-- **Approval:** it is not part of the K3s procedure and is not yet rehearsal-approved. In a live environment, the guard refuses it with "not yet rehearsal-approved" until a reviewed change adds `flag-removal` to `secrets_encryption_rehearsal_approved_paths`, citing a rehearsal record. An extra-vars override of that list is refused, like every other committed value.
+- **Approval:** it is not part of the K3s procedure. The three-VM rehearsal of 2026-10-27 completed it in order from its recorded prefix, and `flag-removal` is listed in `secrets_encryption_rehearsal_approved_paths`, its only entry, so the guard admits it live. Every other gate applies unchanged: the removal round's order and recorded-prefix rules, health, snapshot freshness, a single-use confirmation, the exact live inventory and `secrets_encryption_environment=live`. An extra-vars override of the approved list is refused, like every other committed value.
 
 **Restart order.** The documentation's HA tabs say "restart all servers" for steps 2 and 4 without an order, and "S1 first, then S2 and S3" for key rotation and disable. The automation uses one fixed order for every restart round, `k3s01`, `k3s02`, `k3s03`, which is the inventory order the live guard requires. Each server is refused until every server before it has restarted after the last change and passed its post-restart gate.
 
@@ -119,6 +120,12 @@ The k3d rehearsal showed that `k3s secrets-encrypt status` fails on every server
   A readable status during the round is parsed and checked like any other: it must be settled and may not report `Enabled`. It does not count towards completion.
 - **How it ends.** In the run that restarts `k3s03`, after its post-restart gate, status must be readable on every server and parse as `Disabled`, stage `start`, with matching hashes. It is polled for up to `secrets_encryption_ready_retries` × `secrets_encryption_ready_delay_seconds`. Only then is `k3s03` recorded as verified. The round is complete when all three servers have a durable `restart-verified` record after the `enable` marker, in order. If the convergence check fails, the round stays incomplete: `k3s03` can be re-run, and every other phase stays refused.
 - **After completion.** Checkpoint p1, rotation and the other phases become eligible under their normal prerequisites. While the marker is still `enable`, they also require the round's ledger, pre-enable checkpoint and order evidence to be consistent. Interrupted or inconsistent evidence fails closed, for example a ledger that records `rotate-keys` while the marker still says `enable` because a rotation stopped before recording its change. Such a state needs manual investigation; the automation offers no way forward from it.
+- **The p0 latch.** `enable` requires p0 to be at most 120 minutes old, and the round refuses every new snapshot, so a round that outlasted that limit would refuse its own next restart with no way forward. Once `enable` is accepted, the round latches that p0. The restart of the next server in a consistent round, with the drop-in requested, passes the freshness check with the latched p0 even when it is older than the limit, provided that p0:
+  - is still the newest Stage 3 snapshot on the first server;
+  - is recorded exactly once as p0, by name and size, in well-formed checkpoint records;
+  - predates the `enable` marker.
+
+  Preservation, health and every other condition apply unchanged. The latch never applies to `enable`, rotation, snapshots, canary or validation phases, drop-in removal, a skipped or replayed server, an inconsistent round, or a completed round; those keep the 120-minute limit.
 - **No option.** The exception is computed from recorded state. There is no variable that turns it on, and the guard refuses any attempt to inject the round, the parsed status or the gathered server state as extra variables.
 
 ## Implementation
@@ -158,6 +165,7 @@ The provider is `secretbox` (decision D1): Kubernetes rates `aescbc` as weak bec
 Each mutating playbook is one play on `servers` with `serial: 1`, `any_errors_fatal: true`, `max_fail_percentage: 0` and **no automatic fact gathering**. It runs, in this order:
 
 1. **Guard**, imported as the first pre-task with privilege escalation off. Every check runs on the controller, so a refused invocation stops before facts, privilege escalation, downloads or any other task. It refuses unless all of the following hold:
+   - **Phase:** the phase is bound to the running play. `secrets_encryption_play_phases` (committed in the role's `vars`) maps each guarded play's exact name to its own phase, and the guard compares it with `ansible_play_name`, a magic variable that extra vars and inventory cannot override. An unmapped play, a canary action without a committed phase, or a phase supplied on the command line, such as `-e secrets_encryption_phase=restart`, is refused before anything else is checked.
    - **Limit:** `--limit` is exactly one inventory host name: no pattern, group, list, regex or exclusion, even one that resolves to a single host. Phases on the first server require that host to be `groups['servers'][0]`.
    - **Confirmation:** `secrets_encryption_confirm` is `<phase>:<target host>:<UTC time YYYYMMDDTHHMMSSZ>`, at most 30 minutes old and not in the future. A value for another phase or another host is refused. The phases are `snapshot`, `enable`, `restart`, `rotate-keys`, `canary-create-control`, `canary-verify`, `canary-cleanup` and `install-etcdctl`. There is no `disable` or rollback re-encryption phase; any other phase name is refused.
    - **Environment:** `secrets_encryption_environment` is declared. `live` is accepted only with the exact inventory `k3s01`, `k3s02`, `k3s03`, in that order. `rehearsal` is accepted only with three servers and no live host name anywhere in the inventory.
@@ -172,7 +180,7 @@ Each mutating playbook is one play on `servers` with `serial: 1`, `any_errors_fa
    - **Cluster:** exactly the three servers are nodes, each once, Ready and without memory, disk or PID pressure, and exactly those three carry the etcd role. The six Flux Kustomizations are present once and Ready, and every Kustomization present is Ready. At least two HelmReleases exist, all Ready. Every Deployment, StatefulSet and DaemonSet is fully ready; the monitoring namespaces hold their StatefulSets and DaemonSets; `platform-demo/platform-canary` is fully available.
    - **Fail closed:** empty, missing, null, duplicated or unparsable results are failures.
    - **Preservation:** every protected Stage 2 artifact exists and is unchanged, and no recorded on-demand snapshot or database directory has disappeared (see [Snapshots and preservation](#snapshots-and-preservation)).
-   - **Snapshot:** a Stage 3 snapshot on the first server is at most 120 minutes old. For rotate, it must also be newer than the last recorded change. `enable` additionally requires the newest one to be the recorded pre-enable checkpoint p0, taken by the last accepted invocation. The enabling rotation requires that recorded p0, the only rollback after activation, with a consistent ledger (see [The pre-enable checkpoint](#the-pre-enable-checkpoint-p0)).
+   - **Snapshot:** a Stage 3 snapshot on the first server is at most 120 minutes old. Only the next restart of an active enable restart round may instead rely on [the p0 latch](#between-enable-and-the-first-restart-round). For rotate, it must also be newer than the last recorded change. `enable` additionally requires the newest one to be the recorded pre-enable checkpoint p0, taken by the last accepted invocation. The enabling rotation requires that recorded p0, the only rollback after activation, with a consistent ledger (see [The pre-enable checkpoint](#the-pre-enable-checkpoint-p0)).
    - **Replay:** the confirmation was never used before.
 
    Then the gate writes, and nothing else:
@@ -313,6 +321,7 @@ Prerequisites:
 1. Both rehearsals have passed and are recorded, with their answers to the [rehearsal questions](#rehearsal-questions).
 2. This branch is merged.
 3. The live run is separately approved.
+4. The off-node encryption-key recovery copy can be made and verified: the `home-cluster` recovery helper for the encryption configuration is implemented and reviewed (see [Key material](#key-material-and-the-off-node-recovery-copy)). Until then, step 3 (`rotate-keys`) must not run.
 
 Run from `ansible/`. `secrets_encryption_protected_paths` must be set in local, uncommitted inventory: the absolute paths of the preserved Stage 2 database directories and snapshot files on each server.
 
@@ -355,12 +364,15 @@ ansible-playbook secrets-encryption-restart.yml --limit k3s03 $E -e "$(c restart
 ansible-playbook validate-secrets-encryption.yml -e secrets_encryption_enforce=true -e secrets_encryption_expect=enabled
 ansible-playbook secrets-encryption-canary.yml --limit k3s01 $E -e secrets_encryption_canary_action=verify -e "$(c canary-verify k3s01)"
 ansible-playbook snapshot-etcd.yml --limit k3s01 $E -e "$(c snapshot k3s01)" -e secrets_encryption_snapshot_checkpoint=p2-post-encryption
+
+# 5. The off-node encryption-key recovery copy: the home-cluster helper (see Key material).
+#    The rollout is not complete until the copy is made and verified.
 ```
 
 Also confirm that existing Secrets still decrypt, without printing any of them:
 
 - `helm list -A` succeeds;
-- Flux reconciles;
+- read-only Flux status: `flux get kustomizations -A` and `flux get helmreleases -A` (or `k3s kubectl get kustomizations.kustomize.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io -A`) report every object Ready. Do not run `flux reconcile`: a reconciliation is a change and needs its own approval;
 - the Grafana login works.
 
 The restart order is fixed: `k3s01`, `k3s02`, `k3s03`.
@@ -380,7 +392,8 @@ Stop immediately, and do not run another step, if:
 - a Flux Kustomization or HelmRelease is not Ready;
 - the LAN canary monitor records failures;
 - a canary check fails;
-- any result differs from the rehearsal record;
+- any result differs from the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed), the live behavioral reference;
+- the encryption-key recovery copy cannot be made and verified: the rollout is then not complete (see [Key material](#key-material-and-the-off-node-recovery-copy));
 - any unplanned host change happens during the window (the Stage 2 incident followed a host swap-state change).
 
 ## Rollback
@@ -405,8 +418,8 @@ In-place conversion back to plaintext **is not supported** by the tested combina
 | Point reached | Rollback | Snapshot restore |
 | --- | --- | --- |
 | Before step 1 | Nothing to undo | No |
-| Step 1 done, or step 2 incomplete | Stop. The automation offers no live path: the exclusive enable round admits only the next restart. Data is unchanged (nothing is encrypted). | No |
-| Step 2 complete (`Disabled`, `start`), before step 3 | Drop-in removal in the fixed order (`flag_state=absent`), refused live until rehearsal-approved. Nothing is encrypted yet. | No |
+| Step 1 done, or step 2 incomplete | Stop. The automation offers no live path: the exclusive enable round admits only the next restart, which [the p0 latch](#between-enable-and-the-first-restart-round) keeps available beyond the 120-minute limit. Data is unchanged (nothing is encrypted). | No |
+| Step 2 complete (`Disabled`, `start`), before step 3 | Drop-in removal in the fixed order (`flag_state=absent`), through the ordered removal round; approved for live by the three-VM rehearsal. Nothing is encrypted yet. | No |
 | Step 3 running (`reencrypt_active`) | **Wait** for `reencrypt_finished`. Never restart during re-encryption. If it is stuck, stop; do not improvise. | Only if Secrets become unreadable |
 | Step 3 done, restarts incomplete | Go forward: finish the restarts in order | No |
 | Step 4 complete, or any time after step 3 | **Controlled cluster restore of the pre-enable snapshot (p0).** There is no in-place rollback. | **Yes. This is the rollback.** |
@@ -463,7 +476,7 @@ This automation does not run it. It is the K3s embedded-etcd restore for HA clus
    - `k3s secrets-encrypt status` reports `Disabled, no configuration file found` on all three servers, as before `enable`;
    - the drop-in is absent on all three servers;
    - the pre-enable plaintext controls are readable and unchanged; the post-enable canaries are absent;
-   - Flux and every HelmRelease reconcile;
+   - every Flux Kustomization and HelmRelease reports Ready (read-only status; no `flux reconcile`);
    - `validate-secrets-encryption.yml -e secrets_encryption_enforce=true -e secrets_encryption_expect=not-configured` passes.
 9. *(Project.)* **Afterwards:** this role's state directory is host data and is not rolled back. Its markers describe changes that no longer exist in etcd, so it is moved aside (preserved) before any new Stage 3 attempt, which starts again at step 0. The same applies to the retained encryption configuration and state files (see below). The snapshot files taken after p0 stay on disk and are protected as before; p1 contains plaintext Secrets, later ones contain encrypted Secrets.
 
@@ -514,10 +527,20 @@ k3d servers are containers whose main process is K3s. There is no systemd, and a
 
 The rehearsal harness also captures Docker events with two collectors (servers and runner by name; helpers by label), proves both collectors and the etcd member and endpoint-health queries before any shutdown, and reports every runner exit status as a number.
 
-**Key material:**
+### Key material and the off-node recovery copy
 
-- **Where it lives:** the encryption configuration travels in K3s bootstrap data, which is encrypted with the server token. A snapshot restored with the matching token is therefore expected to bring its encryption keys with it. p0 predates the encryption configuration, so restoring it needs no key. The rehearsal must confirm both points before Stage 3 decides whether the configuration needs its own `age`-encrypted recovery copy.
-- **If every copy is lost:** every Secret encrypted under the lost key is lost.
+- **What holds the key.** The secretbox key exists only in the encryption configuration that `rotate-keys` writes. That is `/var/lib/rancher/k3s/server/cred/encryption-config.json`, identical on every server after the second restart round (K3s's `All hashes match` confirms they agree), and the copy K3s keeps in its bootstrap data in etcd, encrypted with the server token. `encryption-state.json` holds the rotation stage and a hash, not the key.
+- **What the rehearsals showed, and did not.** p0 predates the encryption configuration, so restoring it needs no key. The three-VM p2 restore decrypted p2's Secrets, but it ran on servers whose encryption files stayed on disk with unchanged inode, size and modification time. It does **not** show that a snapshot and the token restore the key onto servers that lost those files; that path is untested.
+- **What must survive the loss of all three servers:**
+  1. a post-activation snapshot (p2 or later) held off the node, under Stage 4;
+  2. the server token in use when that snapshot was taken, from the `home-cluster` recovery material;
+  3. an independent copy of `encryption-config.json`, so that recovery does not depend on the untested bootstrap path.
+
+  Without the key, every Secret encrypted under it is lost, whatever snapshots survive.
+- **When the copy is made.** Once, after step 4's restart round, the enforced `enabled` validation and p2. No further rotation is approved, so the key does not change afterwards. Any later approved rotation needs a new verified copy before it counts as complete.
+- **Who makes it (a `home-cluster` dependency).** The copy is encrypted with `age` v1.3.2 on `k3s01` to the recovery recipients, by the `home-cluster` recovery-material helpers that already handle the server token (see [recovery-tools.md](recovery-tools.md)). This repository has no helper for the encryption configuration, and none is added here. The helper and its verification are implemented and reviewed in `home-cluster` before step 3 runs live.
+- **How it is verified, without displaying key material.** The plaintext is never printed, logged, copied to the controller or held in an Ansible fact. The record holds metadata only: the source file's size and mode, the ciphertext's size, and its SHA-256 at the source and at the off-node destination, which must match. A decryption test by the holder of a recovery identity proves that the ciphertext decrypts to bytes identical to the servers' file, recording only `MATCH` or `MISMATCH`; its exact method is part of the `home-cluster` helper's review.
+- **If the copy cannot be completed.** Stop. The rollout is **not complete**: do not declare it complete, do not upload any snapshot off the node, and do not rotate again. The cluster keeps running encrypted, with the key on all three servers and in etcd. Resolve the problem and make the copy; restoring p0 instead is a separate decision with its own approval.
 
 ## Fresh Builds and Replacement Joins
 
@@ -770,7 +793,7 @@ Three disposable Ubuntu VMs (`s3r01`, `s3r02`, `s3r03`, 4 GB and 2 vCPU each), f
 - **Stop:** all three servers stopped concurrently.
 - **Reset:** the explicit foreground reset on S1 exited 0 after 4 seconds, logged the documented message at ERROR level, and left the reset flag. All three [acceptance criteria](#accepting-the-reset) held.
 - **Rejoin:** S1 started normally (1/1), then S2 and S3 rejoined, each after its database directory was moved aside and preserved (2/2, 3/3).
-- **Keys:** status `Enabled`, `reencrypt_finished`, matching hashes on all three. A Secret written before p2 matched its pre-p2 API and raw-record digests, and its raw record was still Secretbox-encrypted. The snapshot brought its encryption keys with it.
+- **Keys:** status `Enabled`, `reencrypt_finished`, matching hashes on all three. A Secret written before p2 matched its pre-p2 API and raw-record digests, and its raw record was still Secretbox-encrypted. The servers kept their encryption files on disk, so this shows decryption with the restored data and the retained files, not that a snapshot alone restores the key (see [Key material](#key-material-and-the-off-node-recovery-copy)).
 - **Rollback of later writes:** a Secret created after p2 was absent from the API and from raw etcd.
 - **Encryption files and drop-ins:** inode, size and modification time unchanged. Enforced `enabled` validation passed.
 
@@ -821,22 +844,22 @@ Every refusal stopped before any restart, and none changed anything other than i
 
 **Evidence:** `stage3-vm-rehearsal-evidence-20261027.tar.gz`, 208 files, 132,209 bytes, SHA-256 `078219c49d7572bab3f128cefd6496f3e94536349fb97490e8c83c549bf2ab80`. It holds metadata only and was scanned for secret material before it was saved. It is retained in private, unsynchronized local operator storage outside the repository.
 
-The Flux and workload acceptance checks were **not applicable** in this rehearsal (the gate relaxations above) and are not claimed as passed. The rehearsal **is not approval**: the live rollout still needs its own approval, and drop-in removal stays refused live until a reviewed change lists it in `secrets_encryption_rehearsal_approved_paths`.
+The Flux and workload acceptance checks were **not applicable** in this rehearsal (the gate relaxations above) and are not claimed as passed. The rehearsal **is not approval**: the live rollout still needs its own approval. Drop-in removal before activation was approved for live separately, by the reviewed change that lists it in `secrets_encryption_rehearsal_approved_paths`.
 
 ### Rehearsal questions
 
-1. Does `k3s secrets-encrypt enable` work on an existing `v1.36.4+k3s1` cluster without encryption configuration? What does `status` show after it, and after the first restart of each server? *Partly observed:* `enable` exits 0 with the exact documented output. `status` then fails on every server until `k3s01` restarts with the drop-in. After that single restart it is readable on every server as `Disabled`, `start`, with matching hashes. *Observed in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed), under systemd:* status was unreadable on every server until the first server restarted. Each server then reported `Disabled`, `start` only after its own restart, and until then the others reported `Disabled, no configuration file found`. Hashes matched only after all three had restarted.
+1. Does `k3s secrets-encrypt enable` work on an existing `v1.36.4+k3s1` cluster without encryption configuration? What does `status` show after it, and after the first restart of each server? *Partly observed (k3d, historical; not the live expectation):* `enable` exits 0 with the exact documented output. `status` then fails on every server until `k3s01` restarts with the drop-in. After that single restart it is readable on every server as `Disabled`, `start`, with matching hashes. *Observed in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed), under systemd:* status was unreadable on every server until the first server restarted. Each server then reported `Disabled`, `start` only after its own restart, and until then the others reported `Disabled, no configuration file found`. Hashes matched only after all three had restarted.
 2. Does `secretbox` as the configured provider work with the existing-cluster path (does `rotate-keys` generate an `XSalsa20-POLY1305` key)? *Observed (three-VM):* yes. One `rotate-keys` ended `Enabled`, `reencrypt_finished`, with an `XSalsa20-POLY1305` key.
 3. Does the order of the "restart all servers" steps matter, and does a peer report matching hashes only after its own restart? *Observed (three-VM):* in both rounds, hashes matched only after every server had restarted, and each peer's own status changed only with its own restart. The fixed order was enforced; out-of-order, skipped and replayed restarts were refused.
 4. Does `rotate-keys` finish within the CLI's 90-second timeout for this cluster's Secret count? If not, does the server finish on its own, as the polling assumes? *Observed (three-VM, few Secrets):* the rotation run reached `reencrypt_finished` without hitting a timeout. The CLI's own duration was not measured, so behavior for a larger Secret count stays open.
 5. Which stage does `status` report after `disable`, and is it settled? *Observed:* `Disabled`, `reencrypt_finished`, settled. `disable` is no longer part of the procedure (see [Rollback](#rollback)).
-6. Is removing the drop-in safe at the one point where the automation allows it (step 2 complete, before step 3)? *Observed (three-VM):* the removal itself was safe: every server stayed healthy, and nothing restarted unplanned. The first implementation refused the second server and was corrected in `825b09b`. The round then resumed from its recorded prefix and completed, ending `Disabled, no configuration file found` on all three with the controls unchanged. Listing it in `secrets_encryption_rehearsal_approved_paths` for live use remains a separate reviewed decision.
-7. Does the pre-enable snapshot p0 restore with the matching token, through the official HA sequence, onto servers whose drop-in has been moved aside? Must the encryption configuration file be moved aside first? Do S2 and S3 rejoin after their database directories are moved aside? After the restore, are the plaintext controls back byte-for-byte, the post-enable canaries absent and the status not-configured? Does a post-rotation snapshot restore with its encryption keys? *Observed in disposable k3d (restore diagnostic and run 8, after a real rotation):* the explicit reset restores p0, S2 and S3 rejoin, the plaintext controls return byte-for-byte, the post-enable canaries are absent, and the status returns to not-configured with the encryption files retained, so they need not be moved aside for the restore itself. *Observed in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed), under systemd:* the same sequence restored p0 with every acceptance criterion, and the retained encryption files kept their inode, size and modification time. A post-rotation snapshot (p2) restored **with its encryption keys**: a Secret written before p2 read back and stayed encrypted, and a later Secret was rolled back.
+6. Is removing the drop-in safe at the one point where the automation allows it (step 2 complete, before step 3)? *Observed (three-VM):* the removal itself was safe: every server stayed healthy, and nothing restarted unplanned. The first implementation refused the second server and was corrected in `825b09b`. The round then resumed from its recorded prefix and completed, ending `Disabled, no configuration file found` on all three with the controls unchanged. It is listed in `secrets_encryption_rehearsal_approved_paths` for live use.
+7. Does the pre-enable snapshot p0 restore with the matching token, through the official HA sequence, onto servers whose drop-in has been moved aside? Must the encryption configuration file be moved aside first? Do S2 and S3 rejoin after their database directories are moved aside? After the restore, are the plaintext controls back byte-for-byte, the post-enable canaries absent and the status not-configured? Does a post-rotation snapshot restore with its encryption keys? *Observed in disposable k3d (restore diagnostic and run 8, after a real rotation):* the explicit reset restores p0, S2 and S3 rejoin, the plaintext controls return byte-for-byte, the post-enable canaries are absent, and the status returns to not-configured with the encryption files retained, so they need not be moved aside for the restore itself. *Observed in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed), under systemd:* the same sequence restored p0 with every acceptance criterion, and the retained encryption files kept their inode, size and modification time. A post-rotation snapshot (p2) restored: a Secret written before p2 read back and stayed encrypted, and a later Secret was rolled back, with the servers' encryption files retained. Whether a snapshot alone restores the key onto servers without those files remains open (see [Key material](#key-material-and-the-off-node-recovery-copy)).
 8. Do pods keep running across `systemctl restart k3s`? Does `NRestarts` stay unchanged on a manual restart, as the post-restart gate assumes? *Observed (three-VM):* At every post-operation health check, the workload pods were Running. The K3s service NRestarts value remained 0 through all planned restarts and both restores.
 9. Does the status text match the parser exactly, including the key-name format? *Observed (three-VM):* yes. Every readable status parsed, including the `XSalsa20-POLY1305` key lines; only the documented unavailable result occurred during the enable round.
 10. Do the raw positive controls behave as designed: plaintext ConfigMap, plaintext pre-encryption Secret, then encrypted post-encryption and rewritten Secrets? Does `etcdctl get --write-out=json` on v3.6.14 return exactly the fields the verifier expects? *Observed (three-VM):* yes, both. The plaintext controls, the encrypted post-encryption Secret and the rewritten pre-encryption Secret all verified as designed with the pinned etcdctl v3.6.14.
 11. Does `k3s etcd-snapshot save --name <name>` from the CLI apply retention with the CLI's name, or with the server's configured snapshot name? Does it prune anything else, locally or (if configured) in S3? Snapshot S3 upload is assumed not configured before Stage 4. *Partly observed (three-VM):* every snapshot passed the preservation checks, so no recorded snapshot disappeared. Which name retention uses was not examined and stays open.
-12. Which rollback paths behave as documented? *Answered for secretbox:* the documented in-place rollback (disable, restarts, `reencrypt --force --skip`) does not work. `reencrypt` is rejected, so it was removed. Drop-in removal before activation completed in the three-VM rehearsal (question 6), and the snapshot restore passed under systemd (question 7). Whether drop-in removal may be listed in `secrets_encryption_rehearsal_approved_paths` remains a reviewed decision.
+12. Which rollback paths behave as documented? *Answered for secretbox:* the documented in-place rollback (disable, restarts, `reencrypt --force --skip`) does not work. `reencrypt` is rejected, so it was removed. Drop-in removal before activation completed in the three-VM rehearsal (question 6), and the snapshot restore passed under systemd (question 7). Drop-in removal is listed there for live use.
 
 ## Tests
 

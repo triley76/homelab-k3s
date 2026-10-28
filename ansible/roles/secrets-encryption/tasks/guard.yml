@@ -7,6 +7,32 @@
 # Each phase playbook sets secrets_encryption_phase and secrets_encryption_target
 # ("first" or "single") in its play vars.
 
+# The phase comes from the play that runs, never from the operator. Extra vars
+# outrank play vars, so without this binding a run could present one playbook
+# as another phase (for example -e secrets_encryption_phase=restart) and be
+# admitted as that phase by every later check. ansible_play_name is a magic
+# variable that extra vars and inventory cannot override. The canary play is
+# the only one with several phases; its action selects one of them.
+- name: Bind the phase to the running play
+  vars:
+    se_allowed: "{{ secrets_encryption_play_phases[ansible_play_name] | default([]) }}"
+    se_expected: >-
+      {{ (se_allowed[0] if se_allowed | length == 1
+          else 'canary-' ~ (secrets_encryption_canary_action | default('unset')))
+         if se_allowed | length > 0 else '' }}
+  ansible.builtin.assert:
+    that:
+      # An unmapped play, or a canary action without a committed phase, has no expected phase.
+      - se_expected in se_allowed
+      - secrets_encryption_phase | default('') == se_expected
+    fail_msg: >-
+      This play may run only as its own committed phase. Play '{{ ansible_play_name }}' expects phase
+      {{ se_expected if se_expected in se_allowed else 'none (unmapped play or unknown canary action)' }};
+      secrets_encryption_phase is {{ secrets_encryption_phase | default('unset') }}. Do not set
+      secrets_encryption_phase on the command line.
+    quiet: true
+  run_once: true
+
 # The limit must be exactly one inventory host name: an omitted limit, a
 # pattern, a group, a list, a regex or an exclusion is refused, even when it
 # would resolve to the right host alone.
