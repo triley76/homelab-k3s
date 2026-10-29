@@ -508,7 +508,19 @@ All findings are corrected and statically re-tested:
 
 The three-VM rehearsal **passed on 2026-10-27** at commit `825b09b`, under systemd: both cycles, the p2 and p0 restores, and the ordered drop-in removal. It found and corrected two repository defects: the service probe's split property argument (`0dea720`) and the removal round refused after its first server (`825b09b`). See the [three-VM record](secrets-encryption.md#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed).
 
-Passing the static tests is not Stage 3 completion, and neither are the rehearsals: the live rollout is not approved and not performed, and Stage 3 is not complete or applied to the real cluster. See [secrets-encryption.md](secrets-encryption.md#rollback).
+Passing the static tests is not Stage 3 completion, and neither are the rehearsals. Completion was established on the live servers, as recorded below.
+
+### Stage 3 live rollout
+
+The live rollout ran on 2026-10-28 and 2026-10-29, at `09ce4af` for Step 0 and the start of Step 1, and at `7fd364f` afterwards. See the [live rollout record](secrets-encryption.md#live-rollout-record-2026-10-28-to-2026-10-29-complete).
+
+**Final state:** `Enabled`, `reencrypt_finished` and matching hashes on all three servers, with no health or preservation problems. Canary readbacks matched. p2 is recorded, and the off-node encryption-configuration copy passed all four checks.
+
+**Two repository corrections came from it:**
+- **The post-restart counter check (`6cfa7fd`).** systemd resets `NRestarts` on an explicit restart.
+- **The documented Secret-decode window after `rotate-keys`**, with the prompt second restart round.
+
+**Not shown:** a live restore, or raw etcd encryption of any live record. Raw checks are refused live by design.
 
 The recovery-tools role has not been run against a node. Downloading, checksum verification against the real archive, installation, the server's `age --version` result and idempotence on a real node remain to be shown by a separately approved live run. See [recovery-tools.md](recovery-tools.md).
 

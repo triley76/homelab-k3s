@@ -680,10 +680,24 @@ STALE_STATUS = re.compile(
     r"not yet passed a rehearsal|has not yet passed a rehearsal|implemented and statically tested only|It is statically tested only|"
     r"complete rehearsal with the corrected restore has \*\*not\*\* run|complete rehearsal has not been run with the corrected restore|"
     r"three-VM rehearsal is still pending|three-VM rehearsal pending|recorded as an open observation for the three-VM rehearsal")
+# The live rollout (2026-10-28 to 2026-10-29) is recorded as performed. A claim that it was not is stale; a claim the
+# live record does not support (a live restore, raw etcd checks run live, plaintext proven absent) is an overclaim.
+LIVE_STALE = re.compile(
+    r"live rollout is not approved|not approved and not performed|not approved for or applied to the live cluster|"
+    r"has \*\*not\*\* been run against the live cluster|not been approved for or applied to the live cluster|"
+    r"encryption state, which remains disabled|Stage 3 is not complete\*\* and has not been applied|"
+    r"stored in etcd without encryption at rest|Live Rollout \(Not Yet Approved\)", re.I)
 OVERCLAIM = re.compile(
-    r"live (rollout|procedure) (was|has been) (passed|performed|completed|applied)|live (rollout|procedure) (passed|succeeded)|"
-    r"live rollout (is|was|has been) (now )?approved|"
-    r"Stage 3 (is|was|has been) (now )?(complete|completed|applied)\b(?! only)", re.I)
+    r"(?<!no )live restore (was|has been) (performed|rehearsed|passed)|restored? (was|has been) rehearsed on the live|"
+    r"raw (etcd )?(checks?|verification) (was|were|has been|have been) (run|performed|passed) (live|on the live)|"
+    r"plaintext (is|was) (proven )?absent from etcd|no plaintext remains", re.I)
+LIVE_RECORD = ("### Live rollout record (2026-10-28 to 2026-10-29: complete)", "## Rollback")
+LIVE_FACTS = ("`09ce4af`", "`6cfa7fd`", "`7fd364f`", "`9f46215`", "`stage3-p0-pre-enable-20261028t213918z-k3s01-1793223582`",
+              "`stage3-p1-pre-rotate-20261029t135952z-k3s01-1793282417`", "`stage3-p2-post-encryption-20261029t144551z-k3s01-1793285175`",
+              "`6f7a54c20814228a0640029f9bb9e21f6f2db06c6770f7a8d7c11b44b532dab6`",
+              "`c9f0e9c3ee4c967fd7de8b71234ab70d716835cab85c885da61f9a69ce0baffc`",
+              "Raw etcd checks were **not run**", "no live restore was performed", "systemd reset its `NRestarts` from 59 to 0")
+DECODE_WINDOW = ("### After rotate-keys: the Secret-decode window", "### Stop conditions")
 THREE_VM_RECORD = ("### Three-VM rehearsal record (2026-10-27, commit 825b09b: passed)", "### Rehearsal questions")
 THREE_VM_FACTS = ("825b09b2b9bfffef1e227a843600a83665664d99", "0dea72001a3c757bc946e3f7259a9595ab242806",
                   "`stage3-vm-rehearsal-evidence-20261027.tar.gz`, 208 files, 132,209 bytes, SHA-256 "
@@ -694,17 +708,28 @@ SENSITIVE_IN_RECORD = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|\b(?:[0-9a-
 
 def docs_status_current(doc, readme, validation, arch):
     """Both rehearsals recorded as passed: k3d (run 8) and three-VM (825b09b, with both corrections, the evidence and no host
-    addresses, MAC addresses or workstation paths); the live rollout neither approved nor performed; Stage 3 neither complete nor
-    applied. No stale "not passed" or "pending" claim, no overclaim; S1's k3d exit 1 recorded with the systemd result."""
+    addresses, MAC addresses or workstation paths). The live rollout (2026-10-28 to 2026-10-29) recorded as complete, in a
+    sanitized record with its commits, checkpoints, evidence manifests, the counter defect and the claims it does not make; the
+    post-rotation Secret-decode window in the procedure and its stop conditions; every summary current. No stale "not passed",
+    "pending" or "not performed" claim and no overclaim; S1's k3d exit 1 recorded with the systemd result."""
     texts = (doc, readme, validation, arch)
     s1_obs = doc_section(doc, "**S1 shutdown observation:**", "**Encryption files:** see")
     record = doc_section(doc, *THREE_VM_RECORD)
+    live = doc_section(doc, *LIVE_RECORD)
+    window = doc_section(doc, *DECODE_WINDOW)
     return (
         not any(STALE_STATUS.search(x) for x in texts) and not any(OVERCLAIM.search(x) for x in texts)
+        and not any(LIVE_STALE.search(x) for x in texts)
         and "**The required disposable k3d rehearsal passed on 2026-10-26**" in doc
         and "### k3d rehearsal record (2026-10-26, run 8: passed)" in doc
-        and "**The three-VM rehearsal passed on 2026-10-27**" in doc and "**The live rollout is not approved and not performed.**" in doc
-        and "**Stage 3 is not complete** and has not been applied to the real cluster" in doc
+        and "**The three-VM rehearsal passed on 2026-10-27**" in doc
+        and "**The live rollout ran from 2026-10-28 to 2026-10-29 and reached every completion condition**" in doc
+        and live != "" and all(x in live for x in LIVE_FACTS) and not SENSITIVE_IN_RECORD.search(live)
+        and window != "" and "`Internal error occurred: no matching prefix found`" in window and "without the 10-minute waits" in window
+        and "returns to Ready by itself, with no `flux reconcile`" in window
+        and "except the [decode window](#after-rotate-keys-the-secret-decode-window)" in doc
+        and "### Stage 3 live rollout" in validation and "Active on the live cluster since 2026-10-29" in readme
+        and "encrypted at rest with secretbox since 2026-10-29" in arch
         and record != "" and all(x in record for x in THREE_VM_FACTS) and not SENSITIVE_IN_RECORD.search(record)
         and "rehearsal **passed on 2026-10-26 (run 8)**" in validation and "three-VM rehearsal **passed on 2026-10-27**" in validation
         and "passed the required disposable k3d rehearsal" in readme and "three-VM rehearsal passed on 2026-10-27" in readme
@@ -717,7 +742,7 @@ def docs_status_current(doc, readme, validation, arch):
         and "not applicable** in disposable k3d and are not claimed as passed" in doc)
 
 
-require("docs: k3d and three-VM rehearsals recorded as passed (three-VM record sanitized, with both corrections and the evidence); live rollout not approved or performed; Stage 3 not complete; no stale or overclaimed status; S1's k3d exit 1 recorded with the systemd result",
+require("docs: k3d and three-VM rehearsals recorded as passed (three-VM record sanitized, with both corrections and the evidence); live rollout recorded as complete in a sanitized record; post-rotation decode window in the procedure; no stale or overclaimed status; S1's k3d exit 1 recorded with the systemd result",
         docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC, ARCH_DOC))
 require("docs: restore impact and acknowledgment, p0 definition, official restore sequence with S2/S3, acceptance criteria, disable not used",
         docs_restore_defined(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC))
@@ -1129,8 +1154,30 @@ structural_mutants += [
         "passed the required disposable k3d rehearsal, including", "not yet passed a rehearsal, including", 1), VALIDATION_DOC, ARCH_DOC)),
     ("a stale claim that the three-VM rehearsal is pending", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT,
         VALIDATION_DOC + "\nThe three-VM rehearsal is still pending.\n", ARCH_DOC)),
-    ("a claim that the live rollout is approved", lambda: docs_status_current(
-        ROLLBACK_DOC + "\nThe live rollout is approved.\n", README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a stale claim that the live rollout is not approved", lambda: docs_status_current(
+        ROLLBACK_DOC + "\nThe live rollout is not approved.\n", README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the live rollout record removed", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        LIVE_RECORD[0], "### Live rollout notes"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the live record without the counter defect", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "systemd reset its `NRestarts` from 59 to 0", "the restart was slow"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the live record without the p2 manifest", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "`6f7a54c20814228a0640029f9bb9e21f6f2db06c6770f7a8d7c11b44b532dab6`", "(kept by the operator)"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the live record claiming raw checks", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "Raw etcd checks were **not run**", "Raw etcd checks were run live"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a live restore claimed", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT,
+        VALIDATION_DOC + "\nA live restore was performed from p2.\n", ARCH_DOC)),
+    ("a host address in the live record", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        LIVE_RECORD[0] + "\n", LIVE_RECORD[0] + "\n\nThe first server was 192.0.2.41.\n"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a workstation path in the live record", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        LIVE_RECORD[0] + "\n", LIVE_RECORD[0] + "\n\nEvidence in /home/operator/evidence.\n"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the decode window dropped from the procedure", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        DECODE_WINDOW[0], "### After rotate-keys"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the second round still waiting 10 minutes per server", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "without the 10-minute waits", "with a 10-minute wait after each"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a manual reconcile allowed after the round", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "returns to Ready by itself, with no `flux reconcile`", "is reconciled with `flux reconcile`"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the decode-window stop exception dropped", lambda: docs_status_current(ROLLBACK_DOC.replace(
+        "except the [decode window](#after-rotate-keys-the-secret-decode-window)", "always"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
     ("the three-VM record removed", lambda: docs_status_current(ROLLBACK_DOC.replace(
         THREE_VM_RECORD[0], "### Three-VM rehearsal notes"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
     ("the three-VM record without the evidence hash", lambda: docs_status_current(ROLLBACK_DOC.replace(
@@ -1149,10 +1196,12 @@ structural_mutants += [
         THREE_VM_RECORD[0] + "\n", THREE_VM_RECORD[0] + "\n\nKept in C:\\evidence.\n"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
     ("the systemd stop result dropped", lambda: docs_status_current(ROLLBACK_DOC.replace(
         "**It did not reproduce under systemd:**", "It is unexplained:"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
-    ("a claim that the live rollout was performed", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC,
-        ARCH_DOC + "\nThe live rollout has been performed.\n")),
-    ("a claim that Stage 3 is complete", lambda: docs_status_current(ROLLBACK_DOC.replace(
-        "**Stage 3 is not complete** and has not been applied", "**Stage 3 is complete** and has been applied"), README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("a stale architecture claim of no encryption at rest", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC,
+        ARCH_DOC + "\nKubernetes Secrets are stored in etcd without encryption at rest.\n")),
+    ("a stale claim that Stage 3 is not complete", lambda: docs_status_current(
+        ROLLBACK_DOC + "\n- **Stage 3 is not complete** and has not been applied to the real cluster.\n", README_TEXT, VALIDATION_DOC, ARCH_DOC)),
+    ("the README live status dropped", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT.replace(
+        "Active on the live cluster since 2026-10-29", "Pending on the live cluster"), VALIDATION_DOC, ARCH_DOC)),
     ("the three-VM rehearsal no longer recorded as passed", lambda: docs_status_current(ROLLBACK_DOC, README_TEXT, VALIDATION_DOC,
         ARCH_DOC.replace("three-VM rehearsal passed on 2026-10-27", "three-VM rehearsal follows"))),
     ("S1's exit 1 called expected", lambda: docs_status_current(ROLLBACK_DOC.replace(
