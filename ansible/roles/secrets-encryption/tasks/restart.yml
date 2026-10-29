@@ -219,19 +219,30 @@
 - name: Gather the cluster state after the restart
   ansible.builtin.include_tasks: gather.yml
 
+# NRestarts is systemd's count of automatic restarts (Restart=). An explicit
+# restart resets it, so after this run's restart the target's counter must be
+# exactly 0: any higher value is an automatic restart since. Every other
+# counter, and the target's on a run without a restart, must be unchanged.
+# (Live, 2026-10-28: k3s01 restarted healthy, 59 -> 0, and the old
+# unchanged-everywhere rule refused it; every rehearsal counter had been 0.)
 - name: Require a healthy cluster and no unplanned restarts
   vars:
     se_after: >-
       {{ dict(groups['servers'] | zip(groups['servers'] | map('extract', secrets_encryption_servers) | map(attribute='nrestarts'))) }}
+    se_expected: >-
+      {{ secrets_encryption_nrestarts_before | combine({inventory_hostname: 0})
+         if secrets_encryption_restart_required | bool else secrets_encryption_nrestarts_before }}
   ansible.builtin.assert:
     that:
       - secrets_encryption_report.health_problems | length == 0
       - secrets_encryption_servers[inventory_hostname].restarted_since_change | bool
       - (secrets_encryption_servers[inventory_hostname].dropin_present | bool) == (secrets_encryption_flag_state == 'present')
-      - se_after == secrets_encryption_nrestarts_before
+      - se_after == se_expected
     fail_msg: >-
       After the restart: health {{ secrets_encryption_report.health_problems }};
-      automatic restart counters before {{ secrets_encryption_nrestarts_before }}, after {{ se_after }}. Stop.
+      automatic restart counters before {{ secrets_encryption_nrestarts_before }}, expected {{ se_expected }}
+      ({{ inventory_hostname ~ ' reset by this restart' if secrets_encryption_restart_required | bool else 'no restart in this run' }}),
+      after {{ se_after }}. Stop.
     quiet: true
 
 # The enable restart round ends on its last server. Status must now be readable
