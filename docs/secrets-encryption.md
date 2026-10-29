@@ -2,18 +2,21 @@
 
 ## Status
 
-The automation for enabling Kubernetes Secrets encryption at rest is **implemented, statically tested, and rehearsed on a disposable k3d cluster and on three disposable VMs under systemd**:
+Kubernetes Secrets encryption at rest is **active on the live cluster**. The automation was implemented, statically tested, rehearsed on a disposable k3d cluster and on three disposable VMs under systemd, and then run on the live servers:
 
+- **The live rollout ran from 2026-10-28 to 2026-10-29 and reached every completion condition** (see the [live rollout record](#live-rollout-record-2026-10-28-to-2026-10-29-complete)). All three servers report `Enabled`, `reencrypt_finished` and matching hashes. The p2 snapshot is recorded, and the off-node encryption-configuration recovery copy passed all four checks.
+- **Two live findings changed this repository.** The post-restart counter check was corrected in `6cfa7fd` (merged in `7fd364f`), and the window after `rotate-keys` in which unrestarted servers cannot decode Secrets is now part of the [procedure](#live-rollout).
 - **The required disposable k3d rehearsal passed on 2026-10-26** (see the [run-8 record](#k3d-rehearsal-record-2026-10-26-run-8-passed)). Every forward phase and the explicit p0 restore passed every [acceptance criterion](#k3d-required-before-merge). Earlier attempts stopped at step 1 (2026-10-23), after `k3s01`'s restart (2026-10-24), at the in-place rollback that K3s rejects for secretbox (2026-10-25 and 2026-10-26), and at a reset delivered through configuration-file fields (2026-10-26).
 - **The three-VM rehearsal passed on 2026-10-27** at commit `825b09b` (see the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed)). It covered both cycles, the p2 and p0 restores and the ordered drop-in removal under systemd, after two repository defects found during it were corrected.
-- **The live rollout is not approved and not performed.**
-- **The live behavioral reference is the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed).** The 2026-10-27 systemd rehearsal is authoritative for the live sequence and the expected status at each step. The k3d records remain historical evidence; in particular, k3d's readable status on every server after S1 alone is **not** a live expectation (under systemd, each server's status changed only with its own restart).
-- **Stage 3 is not complete** and has not been applied to the real cluster. A passing static test run is not completion. The rehearsals establish readiness for review only.
-- It has **not** been run against the live cluster.
-- Nothing in this repository has changed the live cluster's encryption state, which remains disabled.
+- **The behavioral references are the [live rollout record](#live-rollout-record-2026-10-28-to-2026-10-29-complete) and the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed).** Where they differ, the live record wins. The k3d records remain historical evidence; in particular, k3d's readable status on every server after S1 alone is **not** a live expectation (under systemd, each server's status changed only with its own restart).
+- A passing static test run is not completion. Neither are the rehearsals: completion was established on the live servers.
+- **Still open:**
+  - the template flip for fresh builds ([Fresh Builds and Replacement Joins](#fresh-builds-and-replacement-joins));
+  - the cleanup of the Stage 3 state directories;
+  - any restore rehearsal from the off-node recovery material. None was performed.
 - [`site.yml`](../ansible/site.yml) does not run any of it.
 
-Statements about K3s behavior below are the documented or source-code behavior of K3s `v1.36.4+k3s1`, except where they are marked as observed in a rehearsal record. Behavior under systemd is as observed in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed); the live servers themselves have not been exercised.
+Statements about K3s behavior below are the documented or source-code behavior of K3s `v1.36.4+k3s1`, except where they are marked as observed in a rehearsal or in the live record. Behavior under systemd is as observed in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed) and on the live servers.
 
 Stage 3 is the prerequisite stage of the backup and disaster-recovery design in the companion `home-cluster` repository: no etcd snapshot may leave the cluster until Secrets are encrypted at rest. That design also fixes the rehearsal requirement, the single key rotation and the recovery-material question answered below.
 
@@ -314,9 +317,9 @@ Raw verification **does not** examine historical revisions, free pages, snapshot
 - After a reboot, the pre-encryption canary can no longer be compared, so `create-control` refuses it until cleanup has run.
 - Deleted canary values remain in etcd history and in later snapshots until compaction and overwrite. That is harmless, because they are random.
 
-## Live Rollout (Not Yet Approved)
+## Live Rollout
 
-Prerequisites:
+Performed on 2026-10-28 and 2026-10-29; see the [live rollout record](#live-rollout-record-2026-10-28-to-2026-10-29-complete). This section is the procedure, corrected with what the live run found. Prerequisites for any repeat:
 
 1. Both rehearsals have passed and are recorded, with their answers to the [rehearsal questions](#rehearsal-questions).
 2. This branch is merged.
@@ -325,11 +328,13 @@ Prerequisites:
 
 Run from `ansible/`. `secrets_encryption_protected_paths` must be set in local, uncommitted inventory: the absolute paths of the preserved Stage 2 database directories and snapshot files on each server.
 
-Every command needs a new confirmation naming its phase, its host and the current UTC time; `c` below builds one. After every restart:
+Every command needs a new confirmation naming its phase, its host and the current UTC time; `c` below builds one. After every restart in the enable restart round:
 
 - wait at least 10 minutes;
 - run `validate-secrets-encryption.yml` and `validate-time-sync.yml -e time_sync_enforce_acceptance=true`;
 - keep the LAN canary monitor running throughout.
+
+The second restart round, after `rotate-keys`, is different; see [After rotate-keys](#after-rotate-keys-the-secret-decode-window).
 
 During the enable restart round, `validate-secrets-encryption.yml` reports `enable_round_blocking: true`, and with `secrets_encryption_enforce=true` it fails, until the `k3s03` restart has completed with the converged status. The status it reports during the round may be unavailable (`unavailable: true`) or already readable. Neither means the round is complete.
 
@@ -353,7 +358,9 @@ ansible-playbook secrets-encryption-restart.yml --limit k3s02 $E -e "$(c restart
 ansible-playbook secrets-encryption-restart.yml --limit k3s03 $E -e "$(c restart k3s03)"
 ansible-playbook validate-secrets-encryption.yml -e secrets_encryption_enforce=true -e secrets_encryption_expect=configured-disabled
 
-# 2-3. Activation and rewrite (the one rotation)
+# 2-3. Activation and rewrite (the one rotation). From rotate-keys until each server
+#      restarts, Secrets cannot be decoded through that server: run the three
+#      restarts promptly, without the 10-minute waits (see After rotate-keys).
 ansible-playbook snapshot-etcd.yml --limit k3s01 $E -e "$(c snapshot k3s01)" -e secrets_encryption_snapshot_checkpoint=p1-pre-rotate
 ansible-playbook secrets-encryption-rotate.yml --limit k3s01 $E -e "$(c rotate-keys k3s01)"
 ansible-playbook secrets-encryption-restart.yml --limit k3s01 $E -e "$(c restart k3s01)"
@@ -377,6 +384,26 @@ Also confirm that existing Secrets still decrypt, without printing any of them:
 
 The restart order is fixed: `k3s01`, `k3s02`, `k3s03`.
 
+### After rotate-keys: the Secret-decode window
+
+*Observed live (2026-10-29), not in either rehearsal:* `rotate-keys` rewrites every Secret with the new secretbox key on `k3s01`, but `k3s02` and `k3s03` keep the previous configuration in memory until they restart. Until then, any Secret read served by an unrestarted server fails with `Internal error occurred: no matching prefix found`. The Flux `GitRepository` then reports `AuthenticationFailed`, because it cannot read its credentials Secret, and stays NotReady. In the live run that lasted from 14:02:35 UTC, 17 seconds after the `rotate-keys` run ended, until `k3s03` decoded Secrets again after its restart at 14:29:50 UTC. Workloads stayed Ready and the LAN canary recorded no failures. Neither rehearsal could show it: the three-VM rehearsal had no Flux, and its readbacks went through S1.
+
+Restarting the remaining servers closes the window, so the second restart round runs promptly:
+
+1. Run `restart` for `k3s01`, `k3s02` and `k3s03` in order, without the 10-minute waits.
+2. Each restart still requires:
+   - exactly one controlled restart, with the target's `NRestarts` at 0 and every peer counter unchanged;
+   - service, local API, local etcd and node readiness, the full etcd mesh, workloads, storage and the LAN canary;
+   - that server's own local API now decoding the canary Secret (`k3s kubectl get secret stage3-canary-pre-encryption -n default -o name` on that server, name only).
+3. During the round, and only then, two failures are tolerated:
+   - the decode failure above, on servers not yet restarted;
+   - `GitRepository` NotReady with that same decode failure as its reason.
+   Any other failure is a stop condition.
+4. After `k3s03`:
+   - every local API decodes the canary Secret;
+   - the `GitRepository` returns to Ready by itself, with no `flux reconcile`.
+   Then observe for at least 10 minutes, with repeated health checks, and run `validate-secrets-encryption.yml` and `validate-time-sync.yml -e time_sync_enforce_acceptance=true`. Only then go on to the enforced `enabled` validation.
+
 ### Stop conditions
 
 Stop immediately, and do not run another step, if:
@@ -388,13 +415,63 @@ Stop immediately, and do not run another step, if:
 - any server reports `Disabled` after `rotate-keys` (no supported phase creates that state);
 - a status is not parsed (other than the `unavailable` result that the [enable restart round](#between-enable-and-the-first-restart-round) tolerates), a stage is unexpected, or hashes do not match where the table above expects them to;
 - re-encryption does not finish within its timeout;
-- any API error reads a Secret;
-- a Flux Kustomization or HelmRelease is not Ready;
+- any API error reads a Secret, except the [decode window](#after-rotate-keys-the-secret-decode-window) on servers not yet restarted after `rotate-keys`;
+- a Flux Kustomization or HelmRelease is not Ready, or a GitRepository is not Ready for any reason other than that window;
 - the LAN canary monitor records failures;
 - a canary check fails;
-- any result differs from the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed), the live behavioral reference;
+- any result differs from the [live rollout record](#live-rollout-record-2026-10-28-to-2026-10-29-complete) or, where that record is silent, from the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed);
 - the encryption-key recovery copy cannot be made and verified: the rollout is then not complete (see [Key material](#key-material-and-the-off-node-recovery-copy));
 - any unplanned host change happens during the window (the Stage 2 incident followed a host swap-state change).
+
+### Live rollout record (2026-10-28 to 2026-10-29: complete)
+
+Live servers `k3s01`, `k3s02` and `k3s03`: K3s `v1.36.4+k3s1`, embedded etcd, Flux, a MetalLB-exposed platform canary. Every phase ran from committed playbooks with exact single-host limits and a fresh, single-use confirmation, approved step by step by the repository owner. An external LAN monitor fetched the platform canary once per second throughout each window. It saw a single replica throughout, so it shows reachability only, not load distribution.
+
+This record contains no host addresses, MAC addresses, workstation paths, protected paths, key names, version IDs, bucket names or account identifiers. Sanitized evidence is kept outside this repository, identified by directory name and the SHA-256 of its `SHA256SUMS` manifest.
+
+| Window (UTC) | Step | Result |
+| --- | --- | --- |
+| 2026-10-28 20:30 | Approved host change before the window: swap disabled on `k3s01` at runtime only (`swapoff -a`), because `verify` refuses active swap. It returns after a reboot, so a reboot invalidates the preflight | Swap off; cluster healthy |
+| 2026-10-28 21:35–21:39 | Step 0 on `09ce4af`: enforced `not-configured`, baseline, canary controls, p0 `stage3-p0-pre-enable-20261028t213918z-k3s01-1793223582` | Passed |
+| 2026-10-28 22:07–22:10 | `enable` on `k3s01` passed. **The `k3s01` restart then failed its own post-restart counter assertion**: `k3s01` restarted healthy, but systemd reset its `NRestarts` from 59 to 0 on the explicit restart, and the check required every counter unchanged. The rehearsal counters had all been 0. Stopped mid-round; nothing retried | Repository defect; corrected in `6cfa7fd` (pull request #7, merged in `7fd364f`) |
+| 2026-10-29 01:25–01:58 | Enable round resumed on `7fd364f`. The repeated `k3s01` run restarted nothing and recorded its checkpoint. `k3s02` (141 to 0) and `k3s03` (0 to 0) restarted once each. Enforced `configured-disabled` passed. The owner waived p0's 120-minute age limit for this continuation; p0 remained the newest checkpoint | Passed |
+| 2026-10-29 13:45 | Read-only continuity gate: no reboots, no restarts, swap off, controls and p0 intact, `configured-disabled` enforced | Passed |
+| 2026-10-29 13:59–14:02 | p1 `stage3-p1-pre-rotate-20261029t135952z-k3s01-1793282417`; `rotate-keys` began 57 seconds after p1. Result: purpose `enabling`, the CLI reported success, `Enabled`, `reencrypt_finished`, one `XSalsa20-POLY1305` (secretbox) key | Passed |
+| 2026-10-29 14:02–14:30 | **[Secret-decode window](#after-rotate-keys-the-secret-decode-window)**: unrestarted servers could not decode Secrets, and the Flux `GitRepository` was NotReady. With scoped waivers, the second round ran promptly: `k3s01` 14:21:58, `k3s02` 14:25:26, `k3s03` 14:27:52, each one restart with `NRestarts` 0 and peers unchanged, and its own local API decoding Secrets afterwards. The `GitRepository` was Ready again at 14:30:12 without reconciliation | Passed; procedure corrected |
+| 2026-10-29 14:30–14:42 | One post-round observation (717 s, four repeated health, decode and state checks), report validation, enforced time synchronization | Passed |
+| 2026-10-29 14:44–14:47 | Enforced `enabled` validation: `Enabled`, `reencrypt_finished`, matching hashes and reached checkpoints on all three servers, with no health or preservation problems. Canary `verify`: `readback_pre` and `readback_post` matched, and its built-in cleanup removed every canary and the value directory. Raw etcd checks were **not run**; they are refused live by design (D2). p2 `stage3-p2-post-encryption-20261029t144551z-k3s01-1793285175`, with baseline, p0, p1 and p2 all intact and recorded | Passed |
+| 2026-10-29 15:30–16:50 | Off-node encryption-configuration recovery copy, made with the `home-cluster` helpers at `9f46215`, as described under [Key material](#key-material-and-the-off-node-recovery-copy). Upload, exact-version download `MATCH` and decryption comparison `MATCH` on `k3s01`; inventory updated; Recovery A and B verified | Passed |
+
+**Afterwards:** all three servers have the drop-in and `encryption-config.json` (`600 root:root`). Every restart was planned and every `NRestarts` is 0. Flux, workloads and storage were healthy at every gate.
+
+**LAN canary:** no failures in any window. Requests answered: 7,089 and 2,066 for the two enable-round windows, 2,971 for the activation.
+
+**Deviations, all approved in advance:**
+- **The per-node 10-minute waits in the second round** were consolidated into one post-round observation. The procedure above now prescribes this.
+- **The Secret-decode and `GitRepository` tolerance** was scoped to unrestarted servers during that round.
+- **The p0 age waiver.**
+- **The ConfigMap control:** live `verify` does not compare it, so it was checked by a read-only API readback immediately before `verify`.
+- **Operator tooling, not repository defects:** the operator's own evidence tooling produced three false stops, and none changed the cluster:
+  - an extractor that missed the rotation result;
+  - a loop variable reused after `k3s01`'s restart;
+  - a health check run from the wrong working directory.
+
+**Evidence (outside this repository):**
+
+| Directory | `SHA256SUMS` SHA-256 |
+| --- | --- |
+| `k3s01-swapoff-20261028T203053Z` | `b4cc4d14bc0687cd5c40ee81b4bae05c306ffc307e76e5393baedf78555938b3` |
+| `stage3-step0-20261028T213518Z` | `d7b93b6d4344e05dc382b2b6d7609b89dfbf18ee1b306c27eeef91fb70fc218a` |
+| `stage3-step1-halt-20261028T221038Z` | `36a91fa094a8b28e2c7dd12abf8adbe077eda28b45e6d21d2b0eb28fc40ef159` |
+| `stage3-step1-complete-20261029T015733Z` | `2a1e1995ac80ba7ec8f27767ceb4cb4a57d99c3a8c98e6cacf6aeb36d4f406fb` |
+| `morning-gate-20261029T134636Z` | `8c8938d68cbf8f13c30a85e6edaf329e487e2bfc4cb2f2538dd30d7022102d8d` |
+| `stage3-activation-p2-20261029T144755Z` | `6f7a54c20814228a0640029f9bb9e21f6f2db06c6770f7a8d7c11b44b532dab6` |
+| `stage3-encryption-config-recovery-copy-20261029T165000Z` | `c9f0e9c3ee4c967fd7de8b71234ab70d716835cab85c885da61f9a69ce0baffc` |
+
+**What this record does not show:**
+- that any snapshot or the recovery material restores the encrypted cluster: no live restore was performed;
+- the absence of plaintext from etcd history, free pages or older snapshots;
+- raw etcd encryption of any live record.
 
 ## Rollback
 
@@ -538,7 +615,11 @@ The rehearsal harness also captures Docker events with two collectors (servers a
 
   Without the key, every Secret encrypted under it is lost, whatever snapshots survive.
 - **When the copy is made.** Once, after step 4's restart round, the enforced `enabled` validation and p2. No further rotation is approved, so the key does not change afterwards. Any later approved rotation needs a new verified copy before it counts as complete.
-- **Who makes it (a `home-cluster` dependency).** The copy is encrypted with `age` v1.3.2 on `k3s01` to the committed recovery recipient, by the `home-cluster` recovery-material helpers that already handle the server token (see [recovery-tools.md](recovery-tools.md)). This repository has no helper for the encryption configuration, and none is added here. The helper's `encryption-config` item was merged into `home-cluster` `main` in pull request #21 (commit `3bb8199`), with its procedure and timing in that repository's runbook `docs/runbooks/encrypted-recovery-material.md`. It is tested with synthetic data only and has not been run against the live cluster.
+- **Who makes it (a `home-cluster` dependency).** The copy is encrypted with `age` v1.3.2 on `k3s01` to the committed recovery recipient, by the `home-cluster` recovery-material helpers that already handle the server token (see [recovery-tools.md](recovery-tools.md)). This repository has no helper for the encryption configuration, and none is added here. The helper's `encryption-config` item was merged into `home-cluster` `main` in pull request #21 (commit `3bb8199`), with its procedure and timing in that repository's runbook `docs/runbooks/encrypted-recovery-material.md`. It was run against the live cluster on 2026-10-29, at `home-cluster` `9f46215`; that repository's validation record holds the result. The [live rollout record](#live-rollout-record-2026-10-28-to-2026-10-29-complete) summarizes it.
+- **The live copy (2026-10-29).** Made after the second restart round, the enforced `enabled` validation and p2:
+  - object `recovery/encryption-config/2026-10-29.age`, 472 bytes of ciphertext;
+  - source check PASS; exact-version download `MATCH`; controlled decryption on `k3s01` `MATCH`;
+  - recovery-copy status `verified`, recorded in the updated recovery-material inventory, which was copied to Recovery A and Recovery B.
 - **How it is verified, without displaying key material.** The plaintext is never printed, logged, copied to the controller or held in an Ansible fact. The helpers report metadata only: the source check (a nonempty regular `root:root` file at exactly the expected path, its mode with no group or other access, and a `root:root` credential directory that group and others cannot write to), the ciphertext's size and SHA-256, and the object key. They never report the plaintext's size or hash, and the object's version ID is kept in a private receipt, never printed. Two comparisons follow, each reporting only `MATCH`, `DIFFER` or `ERROR`: the ciphertext downloaded from the off-node destination by that exact version against the uploaded one, and a controlled decryption on `k3s01` with a recovery identity, whose output is compared with the servers' file inside a private tmpfs. The copy is verified only when both report `MATCH`; `DIFFER` or `ERROR` stops the procedure.
 - **If the copy cannot be completed.** Stop. The rollout is **not complete**: do not declare it complete, do not upload any snapshot off the node, and do not rotate again. The cluster keeps running encrypted, with the key on all three servers and in etcd. Resolve the problem and make the copy; restoring p0 instead is a separate decision with its own approval.
 
@@ -556,8 +637,8 @@ The rehearsal harness also captures Docker events with two collectors (servers a
 
 **Timing of the flip:**
 
-- **Leave it false until the live procedure has completed.** Today's servers run without the flag, so a server built with it could not join them.
-- **Set it to true in the follow-up template-flip PR afterwards.** Otherwise a rebuilt or replacement server could not join the encrypted cluster.
+- **It was left false until the live procedure completed**, because the servers ran without the flag and a server built with it could not have joined them. The live procedure completed on 2026-10-29.
+- **Set it to true in the follow-up template-flip PR, not yet made.** Until then, a rebuilt or replacement server built from this repository could not join the encrypted cluster.
 
 `site.yml` is unchanged by Stage 3.
 
@@ -889,6 +970,7 @@ The test contacts no node, API, etcd or AWS, and downloads nothing. It runs in s
   - the retained encryption files are not treated as proof of active encryption; status, readbacks and raw records decide;
   - the k3d restore records S1's network identity, refuses before shutdown when it cannot be rebuilt, checks that the address is free before the runner attaches and before S1 reconnects, keeps S1's container and volumes, stops the servers concurrently with a bound, uses two event collectors, and reports numeric exit statuses;
   - this document records the unsupported in-place conversion, that `disable` is not accepted or used, the full-state impact of a restore with its operator acknowledgment, the p0 definition, the official restore sequence including S2 and S3, the restore acceptance criteria and that static tests are not Stage 3 completion, and names no R1 or R3 playbook;
+  - the live rollout record is sanitized and complete, with its commits, checkpoints, evidence manifests, the counter defect and the claims it does not make. The post-rotation Secret-decode window is part of the procedure and its stop conditions. No document still calls the rollout unperformed or Secrets unencrypted, and none claims a live restore or live raw checks;
 - the exact `enable` result checked before the marker is written;
 - the post-round status validation before the `k3s03` restart is recorded as verified;
 - the `unavailable` status tolerated only inside the enable restart round, with no variable that enables it;

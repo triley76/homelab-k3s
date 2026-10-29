@@ -344,7 +344,12 @@ The design intentionally uses an odd number of server nodes to support etcd quor
 
 The validation performed for this project includes a controlled failure of one server. It should not be interpreted as validation of arbitrary multi-node failure scenarios.
 
-Kubernetes Secrets are currently stored in etcd without encryption at rest. The `secrets-encryption` role encodes the K3s procedure that enables secretbox encryption on the existing servers one step and one server at a time. It is statically tested and passed the required disposable k3d rehearsal, including a restore of the pre-enable etcd snapshot, which is the only rollback after activation because secretbox has no in-place one. The three-VM rehearsal passed on 2026-10-27 under systemd, including both restores; the procedure has not been approved for or applied to the live cluster. See [Secrets Encryption at Rest](secrets-encryption.md).
+Kubernetes Secrets are stored in etcd encrypted at rest with secretbox since 2026-10-29. The `secrets-encryption` role encodes the K3s procedure that enabled it on the existing servers, one step and one server at a time.
+- **Before the live run**, it was statically tested and passed the required disposable k3d rehearsal, including a restore of the pre-enable etcd snapshot. That restore is the only rollback after activation, because secretbox has no in-place one.
+- **The three-VM rehearsal passed on 2026-10-27** under systemd, including both restores.
+- **The live rollout** ran on 2026-10-28 and 2026-10-29, including the verified off-node copy of the key.
+
+See [Secrets Encryption at Rest](secrets-encryption.md).
 
 ## Kubernetes API High Availability
 
