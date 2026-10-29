@@ -28,6 +28,9 @@ Contacts no cluster node, Kubernetes API, etcd or AWS, and downloads nothing.
    post-round Disabled/start/matching-hashes validation, with a stub k3s.
    Also the service-state probe's exact argv and its parsed start time and
    restart count, with a stub systemctl (three-VM rehearsal, 2026-10-27).
+   Also the post-restart counter rule (live, 2026-10-28): a restart by the
+   run resets the target's NRestarts to exactly 0, every other counter and
+   the target's on a run without a restart stay unchanged.
    Every expected failure names the task that must fail.
 6. Mutation tests: structure predicates re-applied to mutated copies, and
    role scenarios re-run against mutated copies of the task files with the
@@ -2965,6 +2968,88 @@ add(service_probe_scenario(None, "systemctl receives the property list as one ar
 mutants += [
     ("the service probe's property list unquoted", [("gather", SVC_QUOTED, SVC_UNQUOTED)],
      lambda b: service_probe_scenario(b, "property list unquoted")),
+]
+
+# ---------------------------------------------------------------- the post-restart restart counters
+# Live Stage 3, 2026-10-28: an explicit restart resets systemd's NRestarts. k3s01
+# restarted healthy (59 -> 0) and the unchanged-counter rule refused it; every
+# rehearsal counter had been 0. The real decision and post-restart assertion run
+# with a stand-in for the restart and the gathered state after it.
+NR = "Require a healthy cluster and no unplanned restarts"
+
+
+def counter_scenario(base, label, before, after, fail, host="k3s01", restarted=False, dropin_changed=False):
+    """before/after: NRestarts of k3s01..k3s03. restarted: the target already ran with the current configuration."""
+    def servers(counts, target_restarted):
+        return {h: srv("disabled", "start", dropin=True, nrestarts=n, restarted=target_restarted if h == host else True)
+                for h, n in zip(SERVERS, counts)}
+    stand_in = {"name": "stand-in for the restart and the state gathered after it",
+                "ansible.builtin.set_fact": {"secrets_encryption_servers": servers(after, True)}}
+    tasks = (picks("restart", "Record the pre-restart restart counters", "Decide the restart", base=base) + [stand_in]
+             + picks("restart", NR, base=base))
+    mocks = {"secrets_encryption_servers": servers(before, restarted), "secrets_encryption_dropin_changed": dropin_changed,
+             "secrets_encryption_report": {"health_problems": []}}
+    checks = [f"(secrets_encryption_restart_required | bool) == {dropin_changed or not restarted}"]
+    return dict(name=f"restart counters: {label}", mocks=mocks, tasks=tasks, expect_fail=fail and NR, checks=checks, extra_vars=RESTART,
+                host=host)
+
+
+IDEM = {"restarted": True}
+COUNTER_CASES = {
+    # A restart by this run: the target's counter is reset to exactly 0, the others are unchanged.
+    "a controlled restart resets the target's nonzero counter to 0": ((59, 141, 0), (0, 141, 0), False, {}),
+    "a controlled restart with a drop-in change resets the target's counter": ((0, 141, 0), (0, 0, 0), False,
+                                                                               {"host": "k3s02", "dropin_changed": True}),
+    "a controlled restart of a server whose counter was 0 leaves it 0": ((0, 0, 0), (0, 0, 0), False, {"host": "k3s03"}),
+    "another server's counter rising after a controlled restart fails": ((59, 141, 0), (0, 142, 0), True, {}),
+    "another server's counter reset after a controlled restart fails": ((59, 141, 0), (0, 0, 0), True, {"host": "k3s02", "dropin_changed": True}),
+    "the target's counter above 0 after a controlled restart fails": ((59, 141, 0), (1, 141, 0), True, {}),
+    "the target's counter above its earlier value after a controlled restart fails": ((59, 141, 0), (60, 141, 0), True, {}),
+    "the target's counter rising from 0 after a controlled restart fails": ((0, 141, 0), (0, 141, 1), True, {"host": "k3s03"}),
+    "an unreadable target counter after a controlled restart fails": ((59, 141, 0), (-1, 141, 0), True, {}),
+    # No restart by this run (idempotent): every counter is unchanged.
+    "an idempotent run with every counter unchanged passes": ((0, 141, 0), (0, 141, 0), False, IDEM),
+    "an idempotent run keeps a nonzero target counter": ((5, 141, 0), (5, 141, 0), False, IDEM),
+    "an idempotent run with the target's counter rising fails": ((5, 141, 0), (6, 141, 0), True, IDEM),
+    "an idempotent run with the target's counter reset fails": ((5, 141, 0), (0, 141, 0), True, IDEM),
+    "an idempotent run with another server's counter changed fails": ((0, 141, 0), (0, 142, 0), True, IDEM),
+}
+for case, (before, after, fail, kw) in COUNTER_CASES.items():
+    add(counter_scenario(None, case, before, after, fail, **kw))
+
+
+def counter_mutant(label, old, new, case):
+    before, after, fail, kw = COUNTER_CASES[case]
+    return (f"restart counters: {label}", [("restart", old, new)], lambda b: counter_scenario(b, case, before, after, fail, **kw))
+
+
+RESET = "combine({inventory_hostname: 0})"
+mutants += [
+    counter_mutant("every counter unchanged after a controlled restart (the live defect)", RESET, "combine({})",
+                   "a controlled restart resets the target's nonzero counter to 0"),
+    counter_mutant("the target's counter ignored after a controlled restart", RESET, "combine({inventory_hostname: se_after[inventory_hostname]})",
+                   "the target's counter above 0 after a controlled restart fails"),
+    counter_mutant("the target's counter only required not to rise", RESET,
+                   "combine({inventory_hostname: [se_after[inventory_hostname], secrets_encryption_nrestarts_before[inventory_hostname]] | min})",
+                   "the target's counter above 0 after a controlled restart fails"),
+    counter_mutant("the other servers' counters ignored", "      - se_after == se_expected\n",
+                   "      - se_after[inventory_hostname] == se_expected[inventory_hostname]\n",
+                   "another server's counter rising after a controlled restart fails"),
+    counter_mutant("the other servers' counters ignored (idempotent run)", "      - se_after == se_expected\n",
+                   "      - se_after[inventory_hostname] == se_expected[inventory_hostname]\n",
+                   "an idempotent run with another server's counter changed fails"),
+    counter_mutant("the counter check removed", "      - se_after == se_expected\n", "", "the target's counter above 0 after a controlled restart fails"),
+    counter_mutant("the reset expected without a restart", "\n         if secrets_encryption_restart_required | bool else secrets_encryption_nrestarts_before",
+                   "", "an idempotent run with the target's counter reset fails"),
+    counter_mutant("the counters ignored on an idempotent run", "else secrets_encryption_nrestarts_before }}", "else se_after }}",
+                   "an idempotent run with the target's counter rising fails"),
+    counter_mutant("the reset expected only without a restart", "if secrets_encryption_restart_required | bool else secrets_encryption_nrestarts_before",
+                   "if not (secrets_encryption_restart_required | bool) else secrets_encryption_nrestarts_before",
+                   "a controlled restart resets the target's nonzero counter to 0"),
+    counter_mutant("the reset expected only after a drop-in change",
+                   "if secrets_encryption_restart_required | bool else secrets_encryption_nrestarts_before",
+                   "if secrets_encryption_dropin_changed | bool else secrets_encryption_nrestarts_before",
+                   "a controlled restart resets the target's nonzero counter to 0"),
 ]
 
 
