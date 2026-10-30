@@ -11,6 +11,7 @@
 
 - name: Initialize first k3s server
   hosts: servers[0]
+  any_errors_fatal: true
   become: true
   vars:
     k3s_mode: init

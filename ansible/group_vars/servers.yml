@@ -1,0 +1,11 @@
+---
+# Fresh builds and replacement joins start K3s with secrets encryption at rest
+# (secretbox): enabled explicitly for the committed servers group. See
+# docs/secrets-encryption.md (Fresh Builds and Replacement Joins).
+#
+# The k3s-server role refuses to run unless this is a real boolean with the same
+# value on every server. It is honored only while K3s is absent from a server;
+# an installed server never gains or loses the drop-in. false is accepted only
+# for a peer rebuilt after a pre-encryption (p0) restore: k3s_mode join, with
+# -e k3s_pre_encryption_restore_ack=pre-encryption-restore.
+k3s_secrets_encryption_enabled: true
