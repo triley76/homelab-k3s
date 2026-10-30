@@ -13,7 +13,8 @@ Kubernetes Secrets encryption at rest is **active on the live cluster**. The aut
 - **Still open:**
   - the template flip for fresh builds ([Fresh Builds and Replacement Joins](#fresh-builds-and-replacement-joins));
   - the cleanup of the Stage 3 state directories;
-  - any restore rehearsal from the off-node recovery material. None was performed.
+  - any restore rehearsal from the off-node recovery material. None was performed;
+  - Stage 4's scheduled K3s snapshot uploads. The [interim manual p2 copy](#key-material-and-the-off-node-recovery-copy) of 2026-10-30 is not Stage 4.
 - [`site.yml`](../ansible/site.yml) does not run any of it.
 
 Statements about K3s behavior below are the documented or source-code behavior of K3s `v1.36.4+k3s1`, except where they are marked as observed in a rehearsal or in the live record. Behavior under systemd is as observed in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed) and on the live servers.
@@ -609,7 +610,7 @@ The rehearsal harness also captures Docker events with two collectors (servers a
 - **What holds the key.** The secretbox key exists only in the encryption configuration that `rotate-keys` writes. That is `/var/lib/rancher/k3s/server/cred/encryption-config.json`, identical on every server after the second restart round (K3s's `All hashes match` confirms they agree), and the copy K3s keeps in its bootstrap data in etcd, encrypted with the server token. `encryption-state.json` holds the rotation stage and a hash, not the key.
 - **What the rehearsals showed, and did not.** p0 predates the encryption configuration, so restoring it needs no key. The three-VM p2 restore decrypted p2's Secrets, but it ran on servers whose encryption files stayed on disk with unchanged inode, size and modification time. It does **not** show that a snapshot and the token restore the key onto servers that lost those files; that path is untested.
 - **What must survive the loss of all three servers:**
-  1. a post-activation snapshot (p2 or later) held off the node, under Stage 4;
+  1. a post-activation snapshot (p2 or later) held off the node. Until Stage 4's scheduled uploads exist, this is the interim manual p2 copy below;
   2. the server token in use when that snapshot was taken, from the `home-cluster` recovery material;
   3. an independent copy of `encryption-config.json`, so that recovery does not depend on the untested bootstrap path.
 
@@ -620,6 +621,12 @@ The rehearsal harness also captures Docker events with two collectors (servers a
   - object `recovery/encryption-config/2026-10-29.age`, 472 bytes of ciphertext;
   - source check PASS; exact-version download `MATCH`; controlled decryption on `k3s01` `MATCH`;
   - recovery-copy status `verified`, recorded in the updated recovery-material inventory, which was copied to Recovery A and Recovery B.
+- **The interim p2 snapshot copy (2026-10-30, a `home-cluster` dependency).** p2 itself, selected from its single Stage 3 checkpoint record, was preserved once off the node by the `home-cluster` helpers at `39776b6` (pull request #25). That repository's validation record holds the result:
+  - object `recovery/stage3-p2-snapshot/2026-10-29.age`, 10152584 bytes of ciphertext, uploaded once;
+  - source check PASS; exact-version download `MATCH`; controlled decryption on `k3s01` `MATCH` against the checkpoint-bound p2, which was unchanged afterwards;
+  - recorded in the recovery-material inventory of 2026-10-30, which was copied to Recovery A and Recovery B.
+
+  **It is an interim manual Stage 3 copy, not Stage 4.** No `etcd-s3` setting was added and nothing was written under `etcd/`; Stage 4's scheduled snapshot uploads remain pending. No restore from it has been rehearsed.
 - **How it is verified, without displaying key material.** The plaintext is never printed, logged, copied to the controller or held in an Ansible fact. The helpers report metadata only: the source check (a nonempty regular `root:root` file at exactly the expected path, its mode with no group or other access, and a `root:root` credential directory that group and others cannot write to), the ciphertext's size and SHA-256, and the object key. They never report the plaintext's size or hash, and the object's version ID is kept in a private receipt, never printed. Two comparisons follow, each reporting only `MATCH`, `DIFFER` or `ERROR`: the ciphertext downloaded from the off-node destination by that exact version against the uploaded one, and a controlled decryption on `k3s01` with a recovery identity, whose output is compared with the servers' file inside a private tmpfs. The copy is verified only when both report `MATCH`; `DIFFER` or `ERROR` stops the procedure.
 - **If the copy cannot be completed.** Stop. The rollout is **not complete**: do not declare it complete, do not upload any snapshot off the node, and do not rotate again. The cluster keeps running encrypted, with the key on all three servers and in etcd. Resolve the problem and make the copy; restoring p0 instead is a separate decision with its own approval.
 
