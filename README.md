@@ -81,7 +81,7 @@ The addresses above use the RFC 5737 documentation range and are examples rather
 | Flux Git source reconciliation | Validated |
 | Flux Kustomization reconciliation | Validated |
 | Serial Chrony rollout and enforced one-hour stability window | Validated |
-| Kubernetes Secrets encryption at rest (secretbox) | Active on the live cluster since 2026-10-29 (`Enabled`, `reencrypt_finished`, matching hashes; p2 recorded; off-node key copy verified). Before that, it passed the required disposable k3d rehearsal, including the pre-enable snapshot restore, and the three-VM rehearsal passed on 2026-10-27 under systemd, including both restores and the ordered drop-in removal |
+| Kubernetes Secrets encryption at rest (secretbox) | Active on the live cluster since 2026-10-29 (`Enabled`, `reencrypt_finished`, matching hashes; p2 recorded; off-node key copy verified; interim manual off-node p2 snapshot copy verified on 2026-10-30, with Stage 4 uploads still pending). Before that, it passed the required disposable k3d rehearsal, including the pre-enable snapshot restore, and the three-VM rehearsal passed on 2026-10-27 under systemd, including both restores and the ordered drop-in removal |
 | GitOps platform-service expansion | In progress |
 
 The current Kubernetes baseline is pinned to **K3s v1.36.4+k3s1**. Flux **2.9.5** has been bootstrapped and validated against the V2 cluster.
