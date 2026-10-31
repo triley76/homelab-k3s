@@ -181,6 +181,31 @@ RESTORE_STEPS = ("### Restore procedure (manual, separately approved)", "#### Ac
 ENC_FILES = ("#### Encryption files during a restore", "### Restore in the k3d rehearsal")
 COMPLETE_CLAIM = re.compile(r"fresh-build (setting|secrets encryption|prerequisite)[^.\n]{0,40}\b(is |was )?(complete|completed|done|resolved|rehearsed)\b"
                             r"|template flip|template-flip|enabled by default", re.I)
+FRESH_RECORD = ("### Three-VM fresh-build rehearsal record (2026-10-31, commit 1dae28e: passed)", "## Rehearsals")
+# The fresh-build rehearsal passed on 2026-10-31; a claim that it is still pending is stale.
+FRESH_STALE = re.compile(r"fresh-build rehearsal pending|pending three-VM fresh-build rehearsal"
+                         r"|Nothing below has run on a fresh three-server build", re.I)
+FRESH_RECORD_FACTS = (
+    "`git archive` copy of `1dae28e405fa6590aa0ba34bd97759bb1dc3680a`",
+    "**It passed.**",
+    "any inventory or extra-vars value for `k3s_secrets_encryption_enabled` or `k3s_pre_encryption_restore_ack`",
+    "undefined from the inventory alone, and as `true` with the playbook's `group_vars`",
+    "**3/3 servers** built, joined and became Ready",
+    "`Enabled`, stage `start`, `All hashes match`",
+    "exactly one active key, of type `XSalsa20-POLY1305`",
+    "one `encryption-config.json` digest, the same on all three",
+    "containing `secrets-encryption: true`, identical on all three",
+    "no Stage 3 state directory existed, and the validator found no Stage 3 marker",
+    "It passed after the first build and again after the second run.",
+    "a protected path that did not exist (`protected artifact #2 missing`)",
+    "`secrets_encryption_expect=enabled`, which a fresh build at stage `start` does not meet",
+    "**zero changed tasks** on all three servers. **No restart and no encryption transition.**",
+    "platform-canary checks** were relaxed exactly as in the",
+    "**The standalone `validate-time-sync.yml` acceptance was not applicable.**",
+    "`p2-fresh-build-rehearsal-evidence-20261031.tar.gz`, 56 files, 36,797 bytes, SHA-256 "
+    "`62a24f9a0088be53ec55ba82f8f5d3a59ad965f710b4b77ebf6375c16c3734c8`",
+    "**Afterwards:** only the three live servers were running.",
+)
 
 
 def table_row(text, first_cell):
@@ -195,11 +220,13 @@ def docs_ok(doc, readme):
     step7 = next((l for l in steps.splitlines() if l.startswith("7. ")), "")
     return (
         fresh != "" and steps != "" and enc != ""
-        and "**Status: implementation present; three-VM fresh-build rehearsal pending.**" in fresh
+        and "**Status: implementation present; three-VM fresh-build rehearsal passed on 2026-10-31** at commit `1dae28e`" in fresh
         and "**enabled explicitly for the committed servers group**" in fresh
-        and "implementation present; three-VM fresh-build rehearsal pending" in readme
+        and "implementation present; three-VM fresh-build rehearsal passed on 2026-10-31 at `1dae28e`" in readme
         and "enabled explicitly for the committed servers group" in readme
-        and "the fresh-build setting: implementation present, three-VM fresh-build rehearsal pending" in doc
+        and "**The three-VM fresh-build rehearsal passed on 2026-10-31** at commit `1dae28e`" in section(doc, "## Status", "## Sources")
+        and not FRESH_STALE.search(doc) and not FRESH_STALE.search(readme)
+        and all(fact in section(doc, *FRESH_RECORD) for fact in FRESH_RECORD_FACTS)
         and not COMPLETE_CLAIM.search(doc) and not COMPLETE_CLAIM.search(readme)
         and "move the secrets-encryption drop-in out of `config.yaml.d`" in step3
         and "with the drop-in absent: `-e k3s_secrets_encryption_enabled=false -e k3s_pre_encryption_restore_ack=pre-encryption-restore`" in step7
@@ -313,8 +340,34 @@ STRUCTURAL_MUTANTS = (
     ("docs: 'enabled by default'", lambda: docs_ok(DOC.replace("**enabled explicitly for the committed servers group**",
                                                                 "**enabled explicitly for the committed servers group** (enabled by default)"), README)),
     ("docs: README claims the prerequisite complete", lambda: docs_ok(DOC, README.replace(
-        "implementation present; three-VM fresh-build rehearsal pending", "implementation present; three-VM fresh-build rehearsal pending. "
-        "The fresh-build setting is complete"))),
+        "implementation present; three-VM fresh-build rehearsal passed on 2026-10-31 at `1dae28e`",
+        "implementation present; three-VM fresh-build rehearsal passed on 2026-10-31 at `1dae28e`. The fresh-build setting is complete"))),
+    ("docs: README still says the fresh-build rehearsal is pending", lambda: docs_ok(DOC, README.replace(
+        "three-VM fresh-build rehearsal passed on 2026-10-31 at `1dae28e` (",
+        "three-VM fresh-build rehearsal passed on 2026-10-31 at `1dae28e`; three-VM fresh-build rehearsal pending ("))),
+    ("docs: a stale still-open fresh-build item reinstated", lambda: docs_ok(DOC.replace(
+        "  - the cleanup of the Stage 3 state directories;",
+        "  - the fresh-build setting: implementation present, three-VM fresh-build rehearsal pending;\n"
+        "  - the cleanup of the Stage 3 state directories;"), README)),
+    ("docs: source claims still awaiting the pending rehearsal", lambda: docs_ok(DOC.replace(
+        "These are read from the source.", "These are read from the source; they are confirmed by the pending three-VM fresh-build rehearsal."),
+        README)),
+    ("docs: Status bullet for the fresh-build rehearsal removed", lambda: docs_ok(DOC.replace(
+        "**The three-VM fresh-build rehearsal passed on 2026-10-31** at commit `1dae28e`", "The fresh-build rehearsal"), README)),
+    ("docs: record names another commit", lambda: docs_ok(DOC.replace(
+        "`git archive` copy of `1dae28e405fa6590aa0ba34bd97759bb1dc3680a`", "`git archive` copy of `5f77c57e20343575a7930541faa16e3d3a5a96b2`"),
+        README)),
+    ("docs: time-sync validator claimed passed", lambda: docs_ok(DOC.replace(
+        "**The standalone `validate-time-sync.yml` acceptance was not applicable.**", "**The standalone `validate-time-sync.yml` acceptance passed.**"),
+        README)),
+    ("docs: Flux and workload checks no longer recorded as relaxed", lambda: docs_ok(DOC.replace(
+        "platform-canary checks** were relaxed exactly as in the", "platform-canary checks** passed, as in the"), README)),
+    ("docs: second run recorded with changes", lambda: docs_ok(DOC.replace(
+        "**zero changed tasks** on all three servers.", "**two changed tasks** on all three servers."), README)),
+    ("docs: wrong-expectation negative control dropped", lambda: docs_ok(DOC.replace(
+        "`secrets_encryption_expect=enabled`, which a fresh build at stage `start` does not meet", "a second protected path"), README)),
+    ("docs: evidence digest altered", lambda: docs_ok(DOC.replace(
+        "62a24f9a0088be53ec55ba82f8f5d3a59ad965f710b4b77ebf6375c16c3734c8", "0" * 64), README)),
 )
 for label, fn in STRUCTURAL_MUTANTS:
     check("structural mutant killed", label, not fn())
