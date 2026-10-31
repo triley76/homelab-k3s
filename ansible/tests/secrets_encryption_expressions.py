@@ -777,10 +777,11 @@ require("canary.yml: verify always cleans up; create-control cleans up on failur
 
 # k3s-server and site.yml.
 inc = next(t for t in k3s_server_tasks if t.get("name") == "Install the secrets-encryption drop-in before K3s first starts")
-require("k3s-server: default keeps fresh builds unencrypted until the post-live flip",
-        k3s_server_defaults == {"k3s_secrets_encryption_enabled": False})
-require("k3s-server: installed-server markers are role vars", k3s_server_vars == {"k3s_server_binary_path": "/usr/local/bin/k3s",
-                                                                                  "k3s_server_data_dir": "/var/lib/rancher/k3s"})
+require("k3s-server: no role default for the fresh-build setting (explicit in group_vars/servers.yml; see fresh_build_expressions.py)",
+        not k3s_server_defaults)
+require("k3s-server: installed-server markers and the drop-in path are role vars, the path matching the secrets-encryption role's",
+        k3s_server_vars == {"k3s_server_binary_path": "/usr/local/bin/k3s", "k3s_server_data_dir": "/var/lib/rancher/k3s",
+                            "k3s_server_secrets_encryption_dropin_path": role_vars["secrets_encryption_dropin_path"]})
 require("k3s-server: the drop-in only when enabled and neither the K3s binary nor K3s data exists, before any K3s install",
         inc["when"] == ["k3s_secrets_encryption_enabled | bool", "not k3s_server_binary.stat.exists", "not k3s_server_data.stat.exists"]
         and inc["ansible.builtin.include_role"] == {"name": "secrets-encryption", "tasks_from": "dropin.yml"}
@@ -2413,6 +2414,36 @@ add_sc(CD_AFTER)
 add_sc(validate_scenario(validate_tasks, "enforced validation fails after a completed round with a stale marker",
                       cl(IDENT, phase="enable", events=STALE), True))
 
+# fresh-enabled: a cluster built with secrets encryption from its first start (Fresh Builds and Replacement Joins).
+# It must never match the live Stage 3 cluster, and the Stage 3 enabled expectation must never match a fresh build.
+FRESH = srv("enabled", "start", dropin=True, key_type="XSalsa20-POLY1305")
+FRESH_NONE = dict(cl(FRESH), secrets_encryption_ledger_events=[])
+for label, mocks, fail, expect in (
+        ("fresh-enabled passes on a fresh encrypted build", FRESH_NONE, False, "fresh-enabled"),
+        ("fresh-enabled fails on the live Stage 3 cluster (reencrypt_finished)", dict(cl(ENAB, phase="rotate-keys", events=STALE)), True, "fresh-enabled"),
+        ("fresh-enabled fails with a Stage 3 change recorded", dict(cl(FRESH, phase="rotate-keys", events=STALE)), True, "fresh-enabled"),
+        ("fresh-enabled fails when one server lacks the drop-in",
+         dict(FRESH_NONE, secrets_encryption_servers={"k3s01": FRESH, "k3s02": FRESH, "k3s03": srv("enabled", "start", key_type="XSalsa20-POLY1305")}),
+         True, "fresh-enabled"),
+        ("fresh-enabled fails with mismatched hashes",
+         dict(FRESH_NONE, secrets_encryption_servers={"k3s01": FRESH, "k3s02": srv("enabled", "start", dropin=True, hashes=False,
+                                                                                    key_type="XSalsa20-POLY1305"), "k3s03": FRESH}),
+         True, "fresh-enabled"),
+        ("fresh-enabled fails without the secretbox key type",
+         dict(FRESH_NONE, secrets_encryption_servers={"k3s01": srv("enabled", "start", dropin=True), "k3s02": FRESH, "k3s03": FRESH}),
+         True, "fresh-enabled"),
+        ("fresh-enabled fails when one server is not encrypted",
+         dict(FRESH_NONE, secrets_encryption_servers={"k3s01": FRESH, "k3s02": FRESH, "k3s03": NOCONF}), True, "fresh-enabled"),
+        ("fresh-enabled fails on an unencrypted build", dict(cl(NOCONF), secrets_encryption_ledger_events=[]), True, "fresh-enabled"),
+        ("the Stage 3 enabled expectation still fails on a fresh build (stage start)", FRESH_NONE, True, "enabled"),
+        ("the Stage 3 enabled expectation still passes on the live Stage 3 state", dict(cl(ENAB, phase="rotate-keys", events=STALE)),
+         False, "enabled")):
+    sc = validate_scenario(validate_tasks, label, mocks, fail, expect)
+    # These cases fail on the expectation itself, not on the enable round.
+    sc["checks"] = [f"(secrets_encryption_expectation.met | bool) == {not fail}",
+                    "not (secrets_encryption_expectation.enable_round_blocking | bool)"]
+    add_sc(sc)
+
 decide = picks("restart", "Decide the restart")
 R = "secrets_encryption_restart_required | bool"
 plays.append(play("restart decision: idempotent when already restarted and the drop-in is unchanged",
@@ -3229,7 +3260,7 @@ ks_tasks = [copy.deepcopy(t) for t in k3s_server_tasks if t.get("name") in (
 ks_tasks[2] = {"name": ks_tasks[2]["name"], "ansible.builtin.include_tasks": str(dropin_file), "vars": ks_tasks[2]["vars"],
                "when": ks_tasks[2]["when"]}
 for label, enabled, binary, data, mode, written in (
-        ("default (disabled) on a fresh server writes nothing", None, False, False, "init", False),
+        ("disabled on a fresh server writes nothing", None, False, False, "init", False),
         ("enabled on a fresh first server writes the drop-in", True, False, False, "init", True),
         ("enabled on a replacement join writes the drop-in", True, False, False, "join", True),
         ("enabled on an installed server (binary present) writes nothing", True, True, False, "join", False),

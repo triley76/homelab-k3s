@@ -6,13 +6,46 @@
       - k3s_mode in ['init', 'join']
     fail_msg: "k3s_mode must be explicitly set to 'init' or 'join'."
 
-- name: Ensure k3s configuration directory exists
-  ansible.builtin.file:
-    path: /etc/rancher/k3s
-    state: directory
-    owner: root
-    group: root
-    mode: '0755'
+# Fresh-build secrets encryption (docs/secrets-encryption.md, Fresh Builds and
+# Replacement Joins). Checked before any filesystem or installation task. K3s
+# refuses a server whose critical secrets-encryption arguments differ from the
+# cluster's, but a cluster built with the setting off on every server would
+# start without encryption, so the setting must be explicit and identical.
+- name: Require a boolean encryption setting, identical on all servers
+  vars:
+    k3s_server_secrets_encryption_values: >-
+      {{ groups['servers'] | map('extract', hostvars)
+         | map(attribute='k3s_secrets_encryption_enabled', default=none)
+         | list }}
+  ansible.builtin.assert:
+    that:
+      - k3s_secrets_encryption_enabled is defined
+      - k3s_secrets_encryption_enabled is boolean
+      - >-
+        k3s_server_secrets_encryption_values
+        | reject('boolean') | list | length == 0
+      - >-
+        k3s_server_secrets_encryption_values
+        | unique | list == [k3s_secrets_encryption_enabled]
+    fail_msg: >-
+      k3s_secrets_encryption_enabled must be a boolean (not a string), set for
+      the servers group in ansible/group_vars/servers.yml, with the same value
+      on every server in groups['servers'].
+    quiet: true
+
+- name: Permit no encryption only for a pre-encryption restore rebuild
+  ansible.builtin.assert:
+    that:
+      - >-
+        k3s_secrets_encryption_enabled
+        or (k3s_mode == 'join'
+            and (k3s_pre_encryption_restore_ack | default(''))
+                == 'pre-encryption-restore')
+    fail_msg: >-
+      k3s_secrets_encryption_enabled=false is accepted only in join mode, for a
+      peer rebuilt after a pre-encryption (p0) restore, with
+      -e k3s_pre_encryption_restore_ack=pre-encryption-restore.
+    quiet: true
 
 - name: Check for an existing k3s binary
   ansible.builtin.stat:
@@ -26,9 +59,50 @@
     get_checksum: false
   register: k3s_server_data
 
+# A fresh join must start with the critical arguments of the first server. Its
+# drop-in is checked by metadata only: no checksum, MIME type, attributes or
+# content.
+- name: Check the first server's encryption drop-in before a fresh join
+  ansible.builtin.stat:
+    path: "{{ k3s_server_secrets_encryption_dropin_path }}"
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  delegate_to: "{{ groups['servers'][0] }}"
+  register: k3s_first_server_dropin
+  when:
+    - k3s_mode == 'join'
+    - not k3s_server_binary.stat.exists
+    - not k3s_server_data.stat.exists
+
+- name: Require the first server's drop-in to match this fresh join
+  ansible.builtin.assert:
+    that:
+      - k3s_first_server_dropin.stat.exists == k3s_secrets_encryption_enabled
+      - >-
+        not k3s_first_server_dropin.stat.exists
+        or (k3s_first_server_dropin.stat.isreg
+            and not k3s_first_server_dropin.stat.islnk)
+    fail_msg: >-
+      The first server's secrets-encryption drop-in presence does not match
+      k3s_secrets_encryption_enabled for this join; K3s would refuse the join.
+    quiet: true
+  when:
+    - k3s_mode == 'join'
+    - not k3s_server_binary.stat.exists
+    - not k3s_server_data.stat.exists
+
+- name: Ensure k3s configuration directory exists
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
 # Fresh builds and replacement joins only: the drop-in must exist before K3s
-# first starts. Skipped by default, and always skipped where the K3s binary or
-# K3s data exists, so an installed server never gains or loses it here.
+# first starts. Always skipped where the K3s binary or K3s data exists, so an
+# installed server never gains or loses it here.
 - name: Install the secrets-encryption drop-in before K3s first starts
   ansible.builtin.include_role:
     name: secrets-encryption

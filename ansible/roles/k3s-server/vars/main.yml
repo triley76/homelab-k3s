@@ -3,3 +3,7 @@
 # role never writes or removes the secrets-encryption drop-in.
 k3s_server_binary_path: /usr/local/bin/k3s
 k3s_server_data_dir: /var/lib/rancher/k3s
+# The secrets-encryption drop-in, as secrets_encryption_dropin_path in
+# roles/secrets-encryption/vars/main.yml. A fresh join checks its presence on
+# the first server by metadata only; its content is never read.
+k3s_server_secrets_encryption_dropin_path: /etc/rancher/k3s/config.yaml.d/20-secrets-encryption.yaml

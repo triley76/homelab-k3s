@@ -166,7 +166,7 @@ The procedure now gates every phase on the durable state of that round. With sec
 - **Two live findings were corrected:** the post-restart counter check, and the Secret-decode window after `rotate-keys`.
 - **It reached every completion condition**, including the verified off-node copy of the encryption configuration.
 
-`site.yml` does not use it. The fresh-build template flip is still open. See [docs/secrets-encryption.md](docs/secrets-encryption.md#live-rollout-record-2026-10-28-to-2026-10-29-complete).
+`site.yml` does not use it. Fresh-build secrets encryption, enabled explicitly for the committed servers group: implementation present; three-VM fresh-build rehearsal passed on 2026-10-31 at `1dae28e` ([Fresh Builds and Replacement Joins](docs/secrets-encryption.md#fresh-builds-and-replacement-joins); [record](docs/secrets-encryption.md#three-vm-fresh-build-rehearsal-record-2026-10-31-commit-1dae28e-passed)). See [docs/secrets-encryption.md](docs/secrets-encryption.md#live-rollout-record-2026-10-28-to-2026-10-29-complete).
 
 ## GitOps Boundary
 

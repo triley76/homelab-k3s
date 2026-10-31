@@ -8,10 +8,10 @@ Kubernetes Secrets encryption at rest is **active on the live cluster**. The aut
 - **Two live findings changed this repository.** The post-restart counter check was corrected in `6cfa7fd` (merged in `7fd364f`), and the window after `rotate-keys` in which unrestarted servers cannot decode Secrets is now part of the [procedure](#live-rollout).
 - **The required disposable k3d rehearsal passed on 2026-10-26** (see the [run-8 record](#k3d-rehearsal-record-2026-10-26-run-8-passed)). Every forward phase and the explicit p0 restore passed every [acceptance criterion](#k3d-required-before-merge). Earlier attempts stopped at step 1 (2026-10-23), after `k3s01`'s restart (2026-10-24), at the in-place rollback that K3s rejects for secretbox (2026-10-25 and 2026-10-26), and at a reset delivered through configuration-file fields (2026-10-26).
 - **The three-VM rehearsal passed on 2026-10-27** at commit `825b09b` (see the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed)). It covered both cycles, the p2 and p0 restores and the ordered drop-in removal under systemd, after two repository defects found during it were corrected.
+- **The three-VM fresh-build rehearsal passed on 2026-10-31** at commit `1dae28e` (see the [fresh-build record](#three-vm-fresh-build-rehearsal-record-2026-10-31-commit-1dae28e-passed)). Three servers built with secrets encryption from their first start reported `Enabled` at stage `start`, and a second `site.yml` run changed nothing. It is separate from the Stage 3 rollout and did not touch the live cluster.
 - **The behavioral references are the [live rollout record](#live-rollout-record-2026-10-28-to-2026-10-29-complete) and the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed).** Where they differ, the live record wins. The k3d records remain historical evidence; in particular, k3d's readable status on every server after S1 alone is **not** a live expectation (under systemd, each server's status changed only with its own restart).
 - A passing static test run is not completion. Neither are the rehearsals: completion was established on the live servers.
 - **Still open:**
-  - the template flip for fresh builds ([Fresh Builds and Replacement Joins](#fresh-builds-and-replacement-joins));
   - the cleanup of the Stage 3 state directories;
   - any restore rehearsal from the off-node recovery material. None was performed;
   - Stage 4's scheduled K3s snapshot uploads. The [interim manual p2 copy](#key-material-and-the-off-node-recovery-copy) of 2026-10-30 is not Stage 4.
@@ -548,7 +548,7 @@ This automation does not run it. It is the K3s embedded-etcd restore for HA clus
 4. **Reset and restore on `k3s01`, by explicit invocation:** with `k3s.service` stopped, run `k3s server --cluster-reset --cluster-reset-restore-path=<p0 path>` in the foreground. K3s reads the server's normal configuration (`config.yaml` and `config.yaml.d`, now without the drop-in) as on any start. Never deliver the reset by writing `cluster-reset` fields into a configuration file and starting the service: in the k3d rehearsal that delivery did not complete (see the [2026-10-26 records](#k3d-rehearsal-record-2026-10-26-complete-lifecycle)). If the server's token has changed since p0, pass the token in use at p0 with `--token-file=<root-only file>`, never as `--token` on the command line. Accept the reset only as described in [Accepting the reset](#accepting-the-reset).
 5. **Start K3s on `k3s01` normally:** `systemctl start k3s`, without any reset option. The start clears the reset flag. Wait until the node is Ready and etcd is healthy as a single member.
 6. **Rejoin `k3s02`, then `k3s03`:** the K3s documentation deletes `/var/lib/rancher/k3s/server/db/` on each peer. This project **moves** it to a dated, preserved directory instead and never deletes it. Then `systemctl start k3s`, so that the server rejoins through `k3s01` as a new etcd member. Wait for the node to be Ready and for every etcd endpoint to be healthy before the next server.
-7. **Rebuild a peer that does not rejoin.** If a peer is refused (for example "critical configuration value mismatch") or does not become healthy, stop it, preserve its K3s data directory, and rebuild it as a replacement join with this repository's playbooks (`k3s_secrets_encryption_enabled: false`, the cluster token and the same critical arguments as `k3s01`). If it registers under a different name, delete the stale Node object it left behind. Rejoin the other peer first, so that quorum never depends on the rebuilt one.
+7. **Rebuild a peer that does not rejoin.** If a peer is refused (for example "critical configuration value mismatch") or does not become healthy, stop it, preserve its K3s data directory, and rebuild it as a replacement join with this repository's playbooks, with the drop-in absent: `-e k3s_secrets_encryption_enabled=false -e k3s_pre_encryption_restore_ack=pre-encryption-restore`, the cluster token and the same critical arguments as `k3s01` (see [Drop-in state for restores and rebuilt servers](#drop-in-state-for-restores-and-rebuilt-servers)). If it registers under a different name, delete the stale Node object it left behind. Rejoin the other peer first, so that quorum never depends on the rebuilt one.
 8. **Verify:**
    - three Ready nodes, and three healthy etcd endpoints;
    - `k3s secrets-encrypt status` reports `Disabled, no configuration file found` on all three servers, as before `enable`;
@@ -589,6 +589,8 @@ Observed in the 2026-10-26 restore diagnostic, after `enable` and its restart ro
 The complete run-8 rehearsal, after a real rotation, confirmed that the generated files (then holding the secretbox key) were **present before and after** the restore on every server, while status, readbacks and raw records showed the restored, unencrypted p0 state. It recorded their presence only: it did not compare their inode or modification time after the restore. The unchanged metadata is established by the earlier restore diagnostic, which used an identity-only configuration.
 
 In the source, a later `enable` reuses a non-empty encryption configuration file that already exists (`genEncryptionConfigAndState`). The retained files are therefore moved aside (preserved) before any new Stage 3 attempt (step 9).
+
+**A failed reset on a freshly built server.** With the drop-in present, K3s writes a new random key to `encryption-config.json` when it prepares a server that has none (`genEncryptionConfigAndState`, run before the reset), and a successful reset then replaces it from the snapshot. If the reset fails, that generated random key stays on disk and would be reused by the next start. It is moved aside (preserved) before any retry; see [Drop-in state for restores and rebuilt servers](#drop-in-state-for-restores-and-rebuilt-servers).
 
 ### Restore in the k3d rehearsal (rehearsal tooling only)
 
@@ -632,22 +634,94 @@ The rehearsal harness also captures Docker events with two collectors (servers a
 
 ## Fresh Builds and Replacement Joins
 
-[`roles/k3s-server`](../ansible/roles/k3s-server) has `k3s_secrets_encryption_enabled: false` by default.
+**Status: implementation present; three-VM fresh-build rehearsal passed on 2026-10-31** at commit `1dae28e` (see the [fresh-build record](#three-vm-fresh-build-rehearsal-record-2026-10-31-commit-1dae28e-passed)). None of it touches the live cluster.
 
-**When true:**
+[`group_vars/servers.yml`](../ansible/group_vars/servers.yml) sets `k3s_secrets_encryption_enabled: true`: secrets encryption is **enabled explicitly for the committed servers group**. [`roles/k3s-server`](../ansible/roles/k3s-server) has no default for it.
 
-- The role writes the same drop-in **only on a server where neither the K3s binary nor K3s data exists**, before K3s first starts.
-- A new cluster then starts with secretbox encryption, the documented path for new servers.
-- A replacement server joins with the critical arguments the cluster requires.
+**Checks before any filesystem or installation task** (`roles/k3s-server/tasks/main.yml`):
 
-**On a server with K3s installed**, the role never writes or removes the drop-in, and never restarts K3s.
+- the setting must be defined and a real boolean. A string such as `"true"` or `"false"` is refused;
+- it must have the same effective value for every host in `groups['servers']`, so a host or extra-vars override on one or two servers is refused;
+- `false` is accepted only in join mode, with `-e k3s_pre_encryption_restore_ack=pre-encryption-restore`: a peer rebuilt after a pre-encryption (p0) restore. It is refused when initializing a server;
+- on a fresh join, the first server's drop-in is checked by metadata only (its content is never read), and its presence must match the setting.
 
-**Timing of the flip:**
+The K3s initialization and join plays in `site.yml`, `init-first-server.yml` and `join-servers.yml` set `any_errors_fatal`, so a server refused by these checks stops the whole run.
 
-- **It was left false until the live procedure completed**, because the servers ran without the flag and a server built with it could not have joined them. The live procedure completed on 2026-10-29.
-- **Set it to true in the follow-up template-flip PR, not yet made.** Until then, a rebuilt or replacement server built from this repository could not join the encrypted cluster.
+**When true, on a server where neither the K3s binary nor K3s data exists:**
 
-`site.yml` is unchanged by Stage 3.
+- the role writes the drop-in before K3s first starts;
+- on a new cluster, K3s generates a secretbox key at its first start (`genEncryptionConfigAndState` in `v1.36.4+k3s1`), so Secrets are encrypted from their first write. No `enable`, rotation or restart is needed, and the one-rotation rule does not apply: the key never coexisted with plaintext;
+- a joining server receives the cluster's key through the bootstrap data before K3s would generate one, and K3s refuses it if its critical secrets-encryption arguments differ ("critical configuration value mismatch between servers").
+
+These are read from the source. The [fresh-build record](#three-vm-fresh-build-rehearsal-record-2026-10-31-commit-1dae28e-passed) observed the result on three servers: every server `Enabled` at stage `start`, with one secretbox key and matching hashes, and no `enable`, rotation or restart. K3s's refusal of a join with mismatched secrets-encryption arguments was not exercised.
+
+**On a server with K3s installed**, the role never writes or removes the drop-in, and never restarts K3s. The Stage 3 phase playbooks and the validation playbook never read `k3s_secrets_encryption_enabled`.
+
+**Validation.** `validate-secrets-encryption.yml -e secrets_encryption_expect=fresh-enabled` (read-only) requires every server to report `Enabled` at stage `start`, matching hashes, the secretbox key type and the drop-in, with no Stage 3 change recorded. The Stage 3 `enabled` expectation is unchanged; neither matches the other's cluster.
+
+**A new cluster has a new key.** A fresh build's key is not the live cluster's. It needs its own verified off-node encryption-configuration recovery copy before that build counts as complete.
+
+### Drop-in state for restores and rebuilt servers
+
+| Restore | Drop-in | Token | Encryption files |
+| --- | --- | --- | --- |
+| A pre-encryption snapshot (p0) on the existing servers | **Absent** on every server: moved aside before the reset (step 3). A peer rebuilt in step 7 is built with the drop-in absent: explicit `false` plus the acknowledgement | The token in use at p0, by `--token-file` if it has changed | The retained files are not read while the drop-in is absent, and are moved aside before any new Stage 3 attempt |
+| A post-encryption snapshot onto rebuilt servers (every server lost) | **Present** on the reset server before it first starts, and on every server that joins it | The token in use when the snapshot was taken, by `--token-file`: the snapshot's bootstrap data, and the key in it, is decrypted with that token | The reset replaces `encryption-config.json` and its state file from the snapshot's bootstrap data. After a **failed** reset, the random key K3s generated stays on disk and is moved aside before any retry |
+
+**An unresolved prerequisite: installing without starting.** The build playbooks start K3s through the installer, which creates a new cluster with a new token before any reset can run. Restoring a post-encryption snapshot when every server is lost therefore needs a way to install K3s without starting it, with the recovered token in place. That capability does not exist yet. It is an explicit prerequisite for Stage 4's isolated restore rehearsal (S4-4). Neither restore path above has been rehearsed onto rebuilt servers.
+
+### Three-VM fresh-build rehearsal record (2026-10-31, commit 1dae28e: passed)
+
+Three disposable Ubuntu VMs (`fbr01`, `fbr02`, `fbr03`, 4 GB and 2 vCPU each), full clones of this repository's Packer base image on the isolated NAT network. They were built from a `git archive` copy of `1dae28e405fa6590aa0ba34bd97759bb1dc3680a` with a generated rehearsal inventory, and no live inventory was present. Every command went through a wrapper that refused:
+
+- any other inventory;
+- any live host name or live address;
+- any address outside the rehearsal network;
+- any inventory or extra-vars value for `k3s_secrets_encryption_enabled` or `k3s_pre_encryption_restore_ack`.
+
+**It passed.** No repository defect was found.
+
+- **Where the setting came from:** the rehearsal inventory did not set it. `ansible-inventory` resolved it as undefined from the inventory alone, and as `true` with the playbook's `group_vars`. `group_vars/servers.yml` was its only definition and matched the commit byte for byte.
+- **Build:** `bootstrap.yml`, then a reboot onto the static addresses, then `site.yml`, on servers where K3s was absent. `site.yml` exited 0 with no failures.
+  - The setting checks ran on all three servers. The first server's drop-in check ran on each fresh join.
+  - **3/3 servers** built, joined and became Ready, with the etcd role, on `v1.36.4+k3s1`.
+  - Local `/readyz` and `/readyz/etcd` were `ok`.
+- **Encryption, on all three servers:**
+  - `Enabled`, stage `start`, `All hashes match`;
+  - exactly one active key, of type `XSalsa20-POLY1305`;
+  - one `encryption-config.json` digest, the same on all three, with only the `secretbox` and `identity` providers;
+  - the drop-in present as a regular root-owned file with mode 600, containing `secrets-encryption: true`, identical on all three.
+- **No Stage 3 state:** no Stage 3 state directory existed, and the validator found no Stage 3 marker. No `enable`, rotation or restart ran. Each K3s service started once, with `NRestarts` 0.
+- **Validation:** enforced `validate-secrets-encryption.yml -e secrets_encryption_expect=fresh-enabled` passed with no health problem and no preservation problem. It passed after the first build and again after the second run.
+  - Preservation was exercised with a protected directory and a protected file on every server.
+  - Service and file state were identical before and after validation.
+- **Negative controls, both refused:**
+  - a protected path that did not exist (`protected artifact #2 missing`);
+  - `secrets_encryption_expect=enabled`, which a fresh build at stage `start` does not meet.
+- **Second `site.yml` run:** exit 0, with **zero changed tasks** on all three servers. **No restart and no encryption transition.**
+  - Identical to the first build: the K3s main PID, start time and `NRestarts`, the boot IDs, and the inode, size and modification time of the encryption files and the drop-in.
+  - There was no additional K3s start, and the status and the configuration digest were unchanged.
+- **Not claimed:**
+  - **The validator's Flux, HelmRelease, monitoring and platform-canary checks** were relaxed exactly as in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed), because the disposable cluster had none of them. Without the relaxation, the enforced validation is refused.
+  - **The standalone `validate-time-sync.yml` acceptance was not applicable.** It reads the Flux kustomizations, which do not exist on this cluster, and it stopped at that check. Its node, readiness and etcd checks passed first.
+  - **Not exercised:** K3s's refusal of a mismatched join, a replacement join into an existing cluster with a rotated key, and the restore paths in the table above.
+- **Memory gate:** the host needed at least 24 GB free before cloning, a free-memory threshold before each VM start, and a 12 GB floor. Every gate passed; the lowest free memory was 17.96 GB. Each gate also checked:
+  - the exact running-VM set;
+  - the unchanged live and base VM configuration;
+  - the unchanged live inventories.
+
+  One unrelated VM was stopped by the operator beforehand to free memory.
+- **Cleanup and live-asset preservation:**
+  - **Evidence first:** the evidence was saved before teardown.
+  - **VMs:** each VM was verified by its exact path, display name and recorded MAC address, then soft-stopped and deleted.
+  - **Leftovers:** each folder's only leftover was the serial-console file named by the base image's configuration. That file was deleted, then the empty folder.
+  - **Controller:** the work folder was removed, and no rehearsal host key remained.
+  - **Live assets, unchanged:** all 19 baselined VM configuration files (the live servers, the other VMs and the base image), the base image lock and the live inventories, compared by SHA-256.
+  - **Afterwards:** only the three live servers were running.
+  - **Not contacted:** no live server, cloud service or other repository.
+- **Evidence:** `p2-fresh-build-rehearsal-evidence-20261031.tar.gz`, 56 files, 36,797 bytes, SHA-256 `62a24f9a0088be53ec55ba82f8f5d3a59ad965f710b4b77ebf6375c16c3734c8`. It holds metadata only, with addresses, MAC addresses and tokens masked, and it was scanned for secret material before it was saved. It is retained in private local operator storage outside the repository.
+
+The rehearsal is not a live change. A fresh build still needs its own verified off-node encryption-configuration recovery copy before it counts as complete (see above).
 
 ## Rehearsals
 

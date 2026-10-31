@@ -1,11 +1,6 @@
 ---
-# Whether a newly installed server starts with secrets encryption at rest
-# (secretbox; see docs/secrets-encryption.md). Honored only while K3s is absent
-# from the server: on an existing server this role never writes or removes the
-# drop-in, whatever this says.
-#
-# Keep false until the live Stage 3 procedure has completed. After it, every
-# server must carry the same critical secrets-encryption arguments, so a fresh
-# build or a replacement join must set this to true, or K3s refuses the join
-# with "critical configuration value mismatch".
-k3s_secrets_encryption_enabled: false
+# k3s_secrets_encryption_enabled has no default here. It is set explicitly for
+# the committed servers group in ansible/group_vars/servers.yml, and
+# tasks/main.yml refuses to run if it is missing, is not a boolean, or differs
+# between servers.
+# See docs/secrets-encryption.md (Fresh Builds and Replacement Joins).
