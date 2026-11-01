@@ -1,0 +1,56 @@
+---
+# Runs files/etcd_s3_probe.py on the server in mode etcd_s3_probe_mode and sets
+# etcd_s3_probe_result. The probe reads the drop-in (config, leaks), so the run
+# has no_log and diff off. Its output is accepted only if it is a JSON object of
+# booleans and integers; anything else becomes {probe_error: true}.
+- name: Run the Stage 4 probe
+  vars:
+    es_expected:
+      version: "{{ etcd_s3_supported_k3s_version }}"
+      owner_uid: "{{ etcd_s3_owner_uid | int }}"
+      scheduled_base: "{{ etcd_s3_scheduled_base_prefix ~ inventory_hostname }}"
+      ondemand_base: "{{ etcd_s3_ondemand_base_prefix ~ inventory_hostname }}"
+      scheduled_base_prefix: "{{ etcd_s3_scheduled_base_prefix }}"
+      ondemand_base_prefix: "{{ etcd_s3_ondemand_base_prefix }}"
+      scheduled_name: "{{ etcd_s3_scheduled_base_prefix ~ inventory_hostname }}"
+      approved_bases: "{{ etcd_s3_approved_bases }}"
+      keys: "{{ etcd_s3_dropin_keys }}"
+      values: "{{ etcd_s3_dropin_values | default({}) }}"
+      access_key_pattern: "{{ etcd_s3_access_key_pattern }}"
+      secret_key_pattern: "{{ etcd_s3_secret_key_pattern }}"
+      bucket_pattern: "{{ etcd_s3_bucket_pattern }}"
+      wait: "{{ etcd_s3_probe_wait | default({}) }}"
+  ansible.builtin.script:
+    cmd: >-
+      etcd_s3_probe.py --mode {{ etcd_s3_probe_mode }} --host {{ inventory_hostname }}
+      --k3s {{ etcd_s3_k3s_bin }} --systemctl {{ etcd_s3_systemctl }} --journalctl {{ etcd_s3_journalctl }}
+      --service {{ etcd_s3_service }} --config-file {{ etcd_s3_config_file }} --config-dir {{ etcd_s3_config_dir }}
+      --dropin {{ etcd_s3_dropin_path }} --unit {{ etcd_s3_unit_file }} --unit-env {{ etcd_s3_unit_env_file }}
+      --root-aws {{ etcd_s3_root_aws_dir }} --snapshot-dir {{ etcd_s3_snapshot_dir }}
+      --hostname-file {{ etcd_s3_hostname_file }} --localtime {{ etcd_s3_localtime }}
+      --metrics-url {{ etcd_s3_etcd_metrics_url }} --expected {{ es_expected | to_json | b64encode }}
+    executable: python3
+  register: etcd_s3_probe_raw
+  changed_when: false
+  failed_when: false
+  no_log: true
+  diff: false
+
+# One template: a task variable holding the raw text would already be parsed
+# by Ansible before the character check.
+- name: Accept only booleans and integers from the probe
+  ansible.builtin.set_fact:
+    etcd_s3_probe_result: >-
+      {%- set out = (etcd_s3_probe_raw.stdout | default('')).strip().splitlines() | last | default('') -%}
+      {%- set safe = etcd_s3_probe_raw.rc | default(1) == 0 and out is match('^\{[a-z0-9_":, {}-]*\}$') -%}
+      {{ out | from_json if safe else {'probe_error': true} }}
+  no_log: true
+  diff: false
+
+- name: Require a readable probe result
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_probe_result is mapping
+      - not (etcd_s3_probe_result.probe_error | default(false))
+    fail_msg: "The Stage 4 probe ({{ etcd_s3_probe_mode }}) did not return a readable result; nothing is displayed."
+    quiet: true

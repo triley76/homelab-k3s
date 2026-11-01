@@ -1,0 +1,49 @@
+---
+# Read-only Stage 4 state of one server, for validate-etcd-s3.yml: the
+# configuration (config_check.yml), the leak counts, and local and S3 snapshot
+# counts and ages per base. Reports counts, ages and booleans only. With
+# etcd_s3_enforce=true, a check that is not met fails the run.
+- name: Probe the local and S3 snapshots
+  ansible.builtin.include_tasks: probe.yml
+  vars:
+    etcd_s3_probe_mode: snapshots
+
+- name: Record the snapshot state
+  ansible.builtin.set_fact:
+    etcd_s3_snapshot_state: "{{ etcd_s3_probe_result }}"
+
+- name: Evaluate the Stage 4 snapshot state
+  vars:
+    es_s: "{{ etcd_s3_snapshot_state }}"
+    es_age_limit: "{{ etcd_s3_max_upload_age_hours | int * 3600 }}"
+  ansible.builtin.set_fact:
+    etcd_s3_report_problems: >-
+      {{ ([] if es_s.local_read and es_s.records_read else ['local snapshots or records unreadable'])
+      + ([] if es_s.local.scheduled_s4 | int <= etcd_s3_snapshot_retention | int else ['more local scheduled snapshots than the retention'])
+      + ([] if es_s.local.ondemand_s4 | int <= etcd_s3_snapshot_retention | int else ['more local on-demand-s4 snapshots than the retention'])
+      + ([] if es_s.s3.scheduled_s4 | int <= etcd_s3_s3_retention | int else ['more S3 scheduled snapshots than the retention'])
+      + ([] if es_s.s3.ondemand_s4 | int <= etcd_s3_s3_retention | int else ['more S3 on-demand-s4 snapshots than the retention'])
+      + ([] if es_s.s3.unapproved_base | int == 0 else ['S3 records with an unapproved base'])
+      + ([] if es_s.local.other_server_s4 | int == 0 else ["local files with another server's Stage 4 base"])
+      + ([] if etcd_s3_expect != 'uploading'
+         else ([] if es_s.local.scheduled_s4 | int >= 1 and es_s.s3.scheduled_s4 | int >= 1 else ['no scheduled upload yet'])
+         + ([] if 0 <= es_s.s3_newest_scheduled_age_s | int <= es_age_limit | int else ['newest scheduled upload older than the limit'])) }}
+
+- name: Show the Stage 4 state (counts, ages and booleans only)
+  ansible.builtin.debug:
+    msg:
+      local: "{{ etcd_s3_snapshot_state.local }}"
+      s3_ready_records: "{{ etcd_s3_snapshot_state.s3 }}"
+      newest_scheduled_upload_age_hours: >-
+        {{ (etcd_s3_snapshot_state.s3_newest_scheduled_age_s | int / 3600) | round(1)
+        if etcd_s3_snapshot_state.s3_newest_scheduled_age_s | int >= 0 else 'none' }}
+      integrity: not verified (no rehearsal-approved method; an ETag is not an integrity check)
+      problems: "{{ etcd_s3_report_problems }}"
+
+- name: Require the expected Stage 4 state
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_report_problems | length == 0
+    fail_msg: "Stage 4 state on {{ inventory_hostname }}: {{ etcd_s3_report_problems }}"
+    quiet: true
+  when: etcd_s3_enforce | bool

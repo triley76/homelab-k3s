@@ -1,0 +1,41 @@
+---
+# Read-only preconditions on this server (gate S4-5 and every mutating phase):
+# the pinned K3s version, PyYAML for the probe, the UTC time zone, the node name
+# equal to the inventory host name (the bases are built from it), no
+# node-name override, no root AWS credentials file for K3s to fall back to, no
+# AWS variables in the K3s environment, no Stage 4 flags in the unit, and one
+# running K3s process. Sets etcd_s3_preflight.
+- name: Probe the Stage 4 preconditions
+  ansible.builtin.include_tasks: probe.yml
+  vars:
+    etcd_s3_probe_mode: preflight
+
+- name: Record the preconditions
+  ansible.builtin.set_fact:
+    etcd_s3_preflight: "{{ etcd_s3_probe_result }}"
+
+- name: Require the Stage 4 preconditions on this server
+  vars:
+    es_p: "{{ etcd_s3_preflight }}"
+  ansible.builtin.assert:
+    that:
+      - es_p.k3s_version_ok | bool
+      - es_p.yaml_available | bool
+      - es_p.timezone_utc | bool
+      - es_p.hostname_matches | bool
+      - es_p.config_unparsable | int == 0
+      - es_p.node_name_overrides | int == 0
+      - es_p.root_aws_absent | bool
+      - es_p.aws_env_vars | int == 0
+      - es_p.unit_stage4_flags | int == 0
+      - es_p.k3s_processes | int == 1
+      - es_p.snapshot_dir_read | bool
+    fail_msg: >-
+      A Stage 4 precondition failed on {{ inventory_hostname }}:
+      {{ es_p | dict2items | selectattr('key', 'in', ['k3s_version_ok', 'yaml_available', 'timezone_utc',
+      'hostname_matches', 'root_aws_absent', 'snapshot_dir_read']) | selectattr('value', 'false') | map(attribute='key') | list }}
+      false; config_unparsable={{ es_p.config_unparsable }}, node_name_overrides={{ es_p.node_name_overrides }},
+      aws_env_vars={{ es_p.aws_env_vars }}, unit_stage4_flags={{ es_p.unit_stage4_flags }},
+      k3s_processes={{ es_p.k3s_processes }}.
+    quiet: true
+  when: etcd_s3_preflight_required | bool

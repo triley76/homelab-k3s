@@ -1,0 +1,29 @@
+---
+# D3 leak checks, by count only: the drop-in's access key, its secret and any
+# key-shaped string in the K3s journal, the K3s process's command line and
+# environment, the ETCDSnapshotFile records and the k3s-etcd-snapshots
+# ConfigMap. The probe reads them as root and prints counts; no value, record,
+# annotation or object metadata is displayed.
+- name: Count credential occurrences outside the drop-in
+  ansible.builtin.include_tasks: probe.yml
+  vars:
+    etcd_s3_probe_mode: leaks
+
+- name: Require no credential outside the drop-in
+  vars:
+    es_l: "{{ etcd_s3_probe_result }}"
+  ansible.builtin.assert:
+    that:
+      - es_l.dropin_secrets_read | bool
+      - es_l.unavailable | int == 0
+      - es_l.k3s_processes | int == 1
+      - es_l.journal | int == 0
+      - es_l.process | int == 0
+      - es_l.records | int == 0
+      - es_l.configmap | int == 0
+    fail_msg: >-
+      Credential leak check on {{ inventory_hostname }} (counts only): journal={{ es_l.journal }},
+      process={{ es_l.process }}, records={{ es_l.records }}, configmap={{ es_l.configmap }},
+      sources unavailable={{ es_l.unavailable }}, K3s processes={{ es_l.k3s_processes }},
+      drop-in key read={{ es_l.dropin_secrets_read }}. Stop and follow the revocation procedure if any count is not 0.
+    quiet: true

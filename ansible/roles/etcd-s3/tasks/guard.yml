@@ -1,0 +1,246 @@
+---
+# Guard for every Stage 4 play. The playbooks import it as their first pre-task,
+# with fact gathering off and privilege escalation off, so a refused invocation
+# stops before facts, credentials, privilege escalation or any node task. Every
+# check here runs on the controller and reads no credential.
+
+# The phase comes from the play that runs, never from the operator: extra vars
+# outrank play vars, and ansible_play_name cannot be overridden.
+- name: Bind the phase to the running play
+  ansible.builtin.assert:
+    that:
+      - ansible_play_name in etcd_s3_play_phases
+      - etcd_s3_phase | default('') == etcd_s3_play_phases[ansible_play_name]
+    fail_msg: >-
+      Play '{{ ansible_play_name }}' may run only as its own committed phase. Do not set
+      etcd_s3_phase on the command line.
+    quiet: true
+  run_once: true
+
+# Credentials, the bucket, snapshot names and every fact or result the role
+# sets are set only by the role, after this check. Extra vars outrank facts and
+# registered results, so a value injected under one of these names would
+# replace them.
+- name: Refuse reserved variables from the command line or inventory
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item, default='__not-defined__') == '__not-defined__'
+    fail_msg: >-
+      {{ item }} is set by the Stage 4 role and may not be passed. Credentials enter only from the
+      files named by {{ etcd_s3_key_file_env }} and {{ etcd_s3_bucket_file_env }}.
+    quiet: true
+  loop: "{{ etcd_s3_reserved_vars }}"
+  run_once: true
+
+# The same holds for every other name the role uses: facts, registered results
+# and task variables (es_*). Only the committed values, the defaults and the
+# three operator inputs may exist before the role runs.
+- name: Refuse unknown Stage 4 variables
+  ansible.builtin.assert:
+    that:
+      - >-
+        query('ansible.builtin.varnames', '^etcd_s3_')
+        | difference(lookup('ansible.builtin.file', role_path ~ '/vars/main.yml') | from_yaml | list)
+        | difference(lookup('ansible.builtin.file', role_path ~ '/defaults/main.yml') | from_yaml | list)
+        | difference(['etcd_s3_phase', 'etcd_s3_environment', 'etcd_s3_confirm'])
+        | length == 0
+      - query('ansible.builtin.varnames', '^es_') | length == 0
+    fail_msg: >-
+      Only etcd_s3_environment, etcd_s3_confirm and the documented defaults may be passed; every other
+      etcd_s3_* or es_* name is set by the role.
+    quiet: true
+  run_once: true
+
+# Credential-bearing arguments and results must never be displayed, logged or
+# kept: no verbosity, check or diff mode, debug output, kept remote files, log
+# file, displayed task arguments, other stdout callback or extra callbacks.
+- name: Refuse output modes that could expose credentials
+  ansible.builtin.assert:
+    that:
+      - ansible_verbosity | int == 0
+      - not ansible_check_mode
+      - not ansible_diff_mode
+      - lookup('ansible.builtin.env', 'ANSIBLE_DEBUG') == ''
+      - lookup('ansible.builtin.env', 'ANSIBLE_KEEP_REMOTE_FILES') == ''
+      - lookup('ansible.builtin.env', 'ANSIBLE_LOG_PATH') == ''
+      - query('ansible.builtin.config', 'DEFAULT_LOG_PATH') | first in [none, '']
+      - query('ansible.builtin.config', 'DEFAULT_STDOUT_CALLBACK') | first == 'default'
+      - query('ansible.builtin.config', 'CALLBACKS_ENABLED') | first | length == 0
+    fail_msg: >-
+      Stage 4 playbooks refuse -v, --check, --diff, ANSIBLE_DEBUG, ANSIBLE_KEEP_REMOTE_FILES, a log
+      path, any stdout callback but default, and extra callbacks.
+    quiet: true
+  run_once: true
+
+- name: Refuse configuration that displays or keeps task data
+  ansible.builtin.assert:
+    that:
+      - not (query('ansible.builtin.config', item) | first | bool)
+    fail_msg: "{{ item }} is enabled; Stage 4 playbooks refuse it."
+    quiet: true
+  loop: "{{ etcd_s3_refused_config }}"
+  run_once: true
+
+# Mutating phases act on exactly one inventory host: no omitted limit, pattern,
+# group, list, regex or exclusion.
+- name: Require an exact single-host limit for a mutating phase
+  ansible.builtin.assert:
+    that:
+      - ansible_limit is defined
+      - ansible_limit is string
+      - ansible_limit in groups['servers']
+      - ansible_play_hosts_all | length == 1
+      - ansible_play_hosts_all[0] == ansible_limit
+    fail_msg: >-
+      Phase {{ etcd_s3_phase }} runs only with --limit set to exactly one server name: no pattern,
+      group, list, regex or exclusion.
+    quiet: true
+  run_once: true
+  when: etcd_s3_phase in etcd_s3_mutating_phases
+
+# A confirmation names the phase, the target host and the current UTC time. It
+# goes stale after etcd_s3_confirm_max_age_minutes, and the target's ledger
+# refuses any value already used (ledger.yml).
+- name: Evaluate the phase confirmation
+  vars:
+    es_parts: "{{ (etcd_s3_confirm | default('') | string).split(':') }}"
+    es_id: "{{ es_parts[2] if es_parts | length == 3 else '' }}"
+    es_id_ok: "{{ es_id is match('^[0-9]{8}T[0-9]{6}Z$') }}"
+    es_age: >-
+      {{ ((now(utc=true) - (es_id | to_datetime('%Y%m%dT%H%M%SZ'))).total_seconds() | int)
+      if es_id_ok | bool else -999999 }}
+  ansible.builtin.set_fact:
+    etcd_s3_confirm_id: "{{ es_id }}"
+    etcd_s3_confirm_ok: >-
+      {{ es_parts | length == 3 and es_parts[0] == etcd_s3_phase and es_parts[1] == ansible_limit
+      and es_id_ok | bool and es_age | int >= -60
+      and es_age | int <= (etcd_s3_confirm_max_age_minutes | int) * 60 }}
+  run_once: true
+  when: etcd_s3_phase in etcd_s3_mutating_phases
+
+- name: Require a fresh confirmation for this phase and host
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_confirm is defined
+      - etcd_s3_confirm is string
+      - etcd_s3_confirm_ok | bool
+    fail_msg: >-
+      Phase {{ etcd_s3_phase }} requires
+      -e etcd_s3_confirm={{ etcd_s3_phase }}:{{ ansible_limit }}:<current UTC time, for example
+      $(date -u +%Y%m%dT%H%M%SZ)>, at most {{ etcd_s3_confirm_max_age_minutes }} minutes old and
+      never used before.
+    quiet: true
+  run_once: true
+  when: etcd_s3_phase in etcd_s3_mutating_phases
+
+# "live" must be the exact live inventory; "rehearsal" must share no host name
+# with it.
+- name: Require a declared environment that matches the inventory
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_environment is defined
+      - etcd_s3_environment in ['live', 'rehearsal']
+      - groups['servers'] | length == 3
+      - >-
+        (etcd_s3_environment == 'live' and groups['servers'] == etcd_s3_live_hosts
+         and groups['all'] | difference(etcd_s3_live_hosts) | length == 0)
+        or (etcd_s3_environment == 'rehearsal'
+            and groups['all'] | intersect(etcd_s3_live_hosts) | length == 0)
+    fail_msg: >-
+      Set -e etcd_s3_environment=live for the live inventory ({{ etcd_s3_live_hosts | join(', ') }},
+      in that order) or =rehearsal for a three-server rehearsal inventory that contains none of
+      those names.
+    quiet: true
+  run_once: true
+
+# An S3-compatible rehearsal endpoint is refused near the live cluster, whatever
+# environment is declared.
+- name: Refuse rehearsal endpoints near the live cluster
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_rehearsal_endpoint is string
+      - etcd_s3_rehearsal_endpoint_ca is string
+      - >-
+        (etcd_s3_rehearsal_endpoint == '' and etcd_s3_rehearsal_endpoint_ca == '')
+        or (etcd_s3_environment == 'rehearsal'
+            and groups['all'] | intersect(etcd_s3_live_hosts) | length == 0
+            and etcd_s3_rehearsal_endpoint is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$')
+            and (etcd_s3_rehearsal_endpoint_ca == '' or etcd_s3_rehearsal_endpoint_ca is match('^/[^\s]*[^/\s]$')))
+    fail_msg: >-
+      etcd_s3_rehearsal_endpoint and etcd_s3_rehearsal_endpoint_ca are for a rehearsal inventory only
+      (a host name or address with an optional port, and an absolute CA path on the servers).
+    quiet: true
+  run_once: true
+
+# Extra vars outrank role vars, so the committed file is read and every value
+# compared.
+- name: Require the committed fixed values
+  vars:
+    es_committed: "{{ lookup('ansible.builtin.file', role_path ~ '/vars/main.yml') | from_yaml }}"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item.key) == item.value
+    fail_msg: "{{ item.key }} differs from the committed role value; overriding it is not allowed."
+    quiet: true
+  loop: "{{ es_committed | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  run_once: true
+
+- name: Require well-formed operator settings
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_enforce is boolean
+      - etcd_s3_expect in ['configured', 'uploading']
+      - etcd_s3_expect_integrity is boolean
+      - etcd_s3_max_upload_age_hours | int > 0
+      - etcd_s3_restart_timeout_seconds | int > 0
+      - etcd_s3_record_retries | int > 0
+      - etcd_s3_record_delay_seconds | int > 0
+    fail_msg: >-
+      etcd_s3_enforce and etcd_s3_expect_integrity must be booleans, etcd_s3_expect configured or
+      uploading, and the limits positive integers.
+    quiet: true
+  run_once: true
+
+# D1: retention is a plain string prefix with no node filter. Every server's
+# scheduled and on-demand bases are built from its inventory host name (which
+# preflight requires to be its node name); none may be a string prefix of
+# another server's, or one server's retention would prune another's snapshots.
+- name: Require non-overlapping per-server snapshot bases
+  vars:
+    es_hosts: "{{ groups['servers'] }}"
+    es_bases: >-
+      {{ (es_hosts | map('regex_replace', '^', etcd_s3_scheduled_base_prefix) | list)
+      + (es_hosts | map('regex_replace', '^', etcd_s3_ondemand_base_prefix) | list) }}
+    es_overlaps: >-
+      {%- set ns = namespace(n=0) -%}
+      {%- for a in es_bases -%}{%- for b in es_bases -%}
+      {%- if a != b and b.startswith(a) -%}{%- set ns.n = ns.n + 1 -%}{%- endif -%}
+      {%- endfor -%}{%- endfor -%}
+      {{ ns.n }}
+  ansible.builtin.assert:
+    that:
+      - es_hosts | length == es_hosts | unique | length
+      - es_hosts | reject('match', etcd_s3_host_pattern) | list | length == 0
+      - es_overlaps | int == 0
+      - etcd_s3_scheduled_base_prefix == 'etcd-snapshot-s4-'
+      - etcd_s3_ondemand_base_prefix == 'on-demand-s4-'
+    fail_msg: >-
+      The per-server snapshot bases overlap ({{ es_overlaps | trim }} prefix pairs) or a host name is not
+      a lowercase DNS label. K3s retention would prune across servers. Rename the inventory hosts.
+    quiet: true
+  run_once: true
+
+# S4-1 decision 4: no integrity claim from an ETag, and no claim at all until a
+# rehearsal-approved method exists. Unknown or unsupported remote-checksum
+# behavior is never accepted as a pass.
+- name: Refuse an integrity expectation without an approved method
+  ansible.builtin.assert:
+    that:
+      - not etcd_s3_expect_integrity or etcd_s3_integrity_approved_methods | length > 0
+    fail_msg: >-
+      No upload integrity method is rehearsal-approved yet (S4-2). An ETag is not an integrity check,
+      and unknown or unsupported remote-checksum behavior fails closed.
+    quiet: true
+  run_once: true

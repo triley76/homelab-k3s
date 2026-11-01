@@ -1,0 +1,25 @@
+---
+# This server's D1 and D4 settings, from the committed values. The proxy
+# setting follows the preflight probe (D4: none if proxy variables exist); the
+# endpoint and CA follow the rehearsal-only overrides, which the guard refuses
+# near the live cluster. The bucket and the key are added only when the drop-in
+# is written (dropin.yml). One expression, so that the retentions stay integers
+# and compression a boolean in the drop-in.
+- name: Compute this server's Stage 4 settings
+  ansible.builtin.set_fact:
+    etcd_s3_scheduled_name: "{{ etcd_s3_scheduled_base_prefix ~ inventory_hostname }}"
+    etcd_s3_ondemand_name: "{{ etcd_s3_ondemand_base_prefix ~ inventory_hostname }}"
+    etcd_s3_dropin_values: >-
+      {{ {'etcd-snapshot-name': etcd_s3_scheduled_base_prefix ~ inventory_hostname,
+          'etcd-snapshot-retention': etcd_s3_snapshot_retention | int,
+          'etcd-snapshot-schedule-cron': etcd_s3_schedule_cron,
+          'etcd-snapshot-compress': etcd_s3_compress | bool,
+          'etcd-s3': true,
+          'etcd-s3-endpoint': etcd_s3_rehearsal_endpoint if etcd_s3_rehearsal_endpoint != '' else etcd_s3_endpoint,
+          'etcd-s3-region': etcd_s3_region,
+          'etcd-s3-folder': etcd_s3_folder,
+          'etcd-s3-retention': etcd_s3_s3_retention | int,
+          'etcd-s3-bucket-lookup-type': etcd_s3_bucket_lookup_type,
+          'etcd-s3-timeout': etcd_s3_timeout}
+         | combine({'etcd-s3-proxy': 'none'} if (etcd_s3_preflight.proxy_env_vars | int) > 0 else {})
+         | combine({'etcd-s3-endpoint-ca': etcd_s3_rehearsal_endpoint_ca} if etcd_s3_rehearsal_endpoint_ca != '' else {}) }}

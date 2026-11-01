@@ -82,6 +82,7 @@ The addresses above use the RFC 5737 documentation range and are examples rather
 | Flux Kustomization reconciliation | Validated |
 | Serial Chrony rollout and enforced one-hour stability window | Validated |
 | Kubernetes Secrets encryption at rest (secretbox) | Active on the live cluster since 2026-10-29 (`Enabled`, `reencrypt_finished`, matching hashes; p2 recorded; off-node key copy verified; interim manual off-node p2 snapshot copy verified on 2026-10-30, with Stage 4 uploads still pending). Before that, it passed the required disposable k3d rehearsal, including the pre-enable snapshot restore, and the three-VM rehearsal passed on 2026-10-27 under systemd, including both restores and the ordered drop-in removal |
+| etcd snapshot uploads to S3 (Stage 4) | Implemented with static tests (S4-1); not rehearsed, not deployed |
 | GitOps platform-service expansion | In progress |
 
 The current Kubernetes baseline is pinned to **K3s v1.36.4+k3s1**. Flux **2.9.5** has been bootstrapped and validated against the V2 cluster.
@@ -168,6 +169,8 @@ The procedure now gates every phase on the durable state of that round. With sec
 
 `site.yml` does not use it. Fresh-build secrets encryption, enabled explicitly for the committed servers group: implementation present; three-VM fresh-build rehearsal passed on 2026-10-31 at `1dae28e` ([Fresh Builds and Replacement Joins](docs/secrets-encryption.md#fresh-builds-and-replacement-joins); [record](docs/secrets-encryption.md#three-vm-fresh-build-rehearsal-record-2026-10-31-commit-1dae28e-passed)). See [docs/secrets-encryption.md](docs/secrets-encryption.md#live-rollout-record-2026-10-28-to-2026-10-29-complete).
 
+The `etcd-s3` role and its playbooks implement Stage 4 of the backup design: K3s's built-in upload of each etcd snapshot to the S3 backup bucket. Each server gets its own snapshot base in one shared folder, with retention 5 locally and in S3. The access key enters Ansible only from the operator's private files and is never displayed, and the drop-in that holds it on each server is root-only. Uploads start only through these playbooks, behind the enforced Stage 3 validation; `site.yml` does not configure them. The role is statically tested (S4-1) and has not been rehearsed or run against a node; see [docs/etcd-s3-uploads.md](docs/etcd-s3-uploads.md).
+
 ## GitOps Boundary
 
 This repository is responsible for **constructing the Kubernetes infrastructure**:
@@ -194,6 +197,7 @@ The GitOps foundation has been validated. Networking services, ingress, persiste
 |-- docs/
 |   |-- architecture.md      Detailed platform architecture
 |   |-- build.md             Reproducible build procedure
+|   |-- etcd-s3-uploads.md   etcd snapshot uploads to S3 (Stage 4)
 |   |-- recovery-tools.md    Pinned age installation for recovery operations
 |   |-- secrets-encryption.md  Secrets encryption at rest (Stage 3) procedure
 |   |-- time-synchronization.md  Chrony configuration and per-node rollout

@@ -28,9 +28,12 @@ secrets_encryption_state_dir: /var/lib/homelab-secrets-encryption
 # metadata and SHA-256 (D4). Nothing in them is ever removed or moved.
 secrets_encryption_snapshot_dir: /var/lib/rancher/k3s/server/db/snapshots
 secrets_encryption_db_dir: /var/lib/rancher/k3s/server/db
-# Scheduled snapshots are pruned by K3s's own retention; they are excluded from
-# the preservation baseline. Everything else is tracked.
-secrets_encryption_scheduled_snapshot_pattern: '^etcd-snapshot-'
+# Snapshots that K3s prunes by its own retention are excluded from the
+# preservation baseline: scheduled snapshots (etcd-snapshot-*, including the
+# Stage 4 etcd-snapshot-s4-<host> base) and the Stage 4 on-demand base
+# on-demand-s4-<host> (docs/etcd-s3-uploads.md). Everything else, including
+# default-named on-demand-* files and stage3-* checkpoints, is tracked.
+secrets_encryption_scheduled_snapshot_pattern: '^(etcd-snapshot-|on-demand-s4-)'
 secrets_encryption_snapshot_name_pattern: '^stage3-[a-z0-9]+(-[a-z0-9]+)*$'
 
 # p0, the pre-enable checkpoint and the only rollback after activation: the

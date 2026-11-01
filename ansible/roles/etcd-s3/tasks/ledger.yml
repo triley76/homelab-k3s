@@ -1,0 +1,69 @@
+---
+# The used-confirmation ledger on the target server. A confirmation is recorded
+# before the phase acts, whatever its outcome, and is never accepted again on
+# that server. The ledger holds confirmation IDs, phases and host names only.
+- name: Inspect the Stage 4 state directory
+  ansible.builtin.stat:
+    path: "{{ etcd_s3_state_dir }}"
+    follow: false
+    get_checksum: false
+  register: etcd_s3_statedir
+
+- name: Require the state directory to be absent or a root-only directory
+  ansible.builtin.assert:
+    that:
+      - >-
+        not etcd_s3_statedir.stat.exists
+        or (etcd_s3_statedir.stat.isdir and not etcd_s3_statedir.stat.islnk
+            and etcd_s3_statedir.stat.uid == etcd_s3_owner_uid | int and etcd_s3_statedir.stat.mode == '0700')
+    fail_msg: "{{ etcd_s3_state_dir }} is not a root-only directory."
+    quiet: true
+
+- name: Ensure the Stage 4 state directory exists
+  ansible.builtin.file:
+    path: "{{ etcd_s3_state_dir }}"
+    state: directory
+    owner: "{{ etcd_s3_owner }}"
+    group: "{{ etcd_s3_owner }}"
+    mode: '0700'
+  when: not etcd_s3_statedir.stat.exists
+
+- name: Inspect the confirmation ledger
+  ansible.builtin.stat:
+    path: "{{ etcd_s3_state_dir }}/confirmations"
+    follow: false
+    get_checksum: false
+  register: etcd_s3_ledger_stat
+
+- name: Read the confirmation ledger
+  ansible.builtin.slurp:
+    src: "{{ etcd_s3_state_dir }}/confirmations"
+  register: etcd_s3_ledger
+  when: etcd_s3_ledger_stat.stat.exists
+
+- name: Refuse a reused confirmation or an unsafe ledger
+  vars:
+    es_used: >-
+      {{ (etcd_s3_ledger.content | b64decode).splitlines() | map('split', ' ') | map('first') | list
+      if etcd_s3_ledger_stat.stat.exists else [] }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        not etcd_s3_ledger_stat.stat.exists
+        or (etcd_s3_ledger_stat.stat.isreg and not etcd_s3_ledger_stat.stat.islnk
+            and etcd_s3_ledger_stat.stat.uid == etcd_s3_owner_uid | int)
+      - etcd_s3_confirm_id not in es_used
+    fail_msg: >-
+      This confirmation was already used on {{ inventory_hostname }}, or the ledger is not a root-owned
+      regular file. Use a new confirmation with the current UTC time.
+    quiet: true
+
+- name: Record the confirmation as used
+  ansible.builtin.lineinfile:
+    path: "{{ etcd_s3_state_dir }}/confirmations"
+    line: "{{ etcd_s3_confirm_id }} {{ etcd_s3_phase }} {{ inventory_hostname }}"
+    create: true
+    owner: "{{ etcd_s3_owner }}"
+    group: "{{ etcd_s3_owner }}"
+    mode: '0600'
+    backup: false

@@ -1315,7 +1315,8 @@ def latch_wired(checks_text, gate_tasks):
 
 # Phase binding (live-readiness review, 2026-10-27): every guarded play has
 # exactly one committed mapping entry, from its exact name to its own phase.
-GUARDED_FILES = sorted(p.stem for p in ans.glob("*.yml") if "tasks_from: guard.yml" in p.read_text())
+# The Stage 3 guard only; the Stage 4 playbooks import the etcd-s3 role's own guard (tests/etcd_s3_expressions.py).
+GUARDED_FILES = sorted(p.stem for p in ans.glob("*.yml") if re.search(r"name: secrets-encryption\s+tasks_from: guard\.yml", p.read_text()))
 BIND_THAT = ["se_expected in se_allowed", "secrets_encryption_phase | default('') == se_expected"]
 
 
@@ -1887,6 +1888,19 @@ plays.append(play("preservation: a pruned scheduled snapshot is not a problem",
                   store(storage(snapshot_names=["on-demand-stage2-1"], baseline=base)), checks_tasks, False, [f"{PP} == ''"]))
 plays.append(play("preservation: a missing on-demand snapshot fails", store(storage(snapshot_names=["etcd-snapshot-k3s01-1"], baseline=base)),
                   checks_tasks, False, [f"{PP} is search('snapshot missing since baseline: on-demand-stage2-1')"]))
+# Stage 4 (docs/etcd-s3-uploads.md): on-demand-s4-<host> and etcd-snapshot-s4-<host> are pruned by K3s retention, like
+# scheduled snapshots, even if an older baseline recorded them. Default-named on-demand-* and stage3-* files stay tracked.
+s4_base = {"snapshots": ["on-demand-s4-k3s01-k3s01-1", "etcd-snapshot-s4-k3s01-k3s01-1", "on-demand-k3s01-1", "stage3-p2-x-k3s01-1"],
+           "db_dirs": ["etcd-old-1"]}
+plays.append(play("preservation: Stage 4 snapshots pruned by K3s retention are not a problem",
+                  store(storage(snapshot_names=["on-demand-k3s01-1", "stage3-p2-x-k3s01-1"], baseline=s4_base)), checks_tasks, False,
+                  [f"{PP} == ''"]))
+plays.append(play("preservation: a missing default-named on-demand snapshot still fails beside Stage 4 names",
+                  store(storage(snapshot_names=["on-demand-s4-k3s01-k3s01-2", "stage3-p2-x-k3s01-1"], baseline=s4_base)), checks_tasks, False,
+                  [f"{PP} is search('snapshot missing since baseline: on-demand-k3s01-1')", f"{PP} is not search('on-demand-s4-')"]))
+plays.append(play("preservation: a missing stage3 checkpoint still fails beside Stage 4 names",
+                  store(storage(snapshot_names=["on-demand-k3s01-1"], baseline=s4_base)), checks_tasks, False,
+                  [f"{PP} is search('snapshot missing since baseline: stage3-p2-x-k3s01-1')", f"{PP} is not search('s4-')"]))
 plays.append(play("preservation: a missing preserved database directory fails", store(storage(baseline=base), storage(db_dirs=[], baseline=base)),
                   checks_tasks, False, [f"{PP} is search('k3s02: database directory missing since baseline: etcd-old-1')"]))
 plays.append(play("preservation: a malformed baseline fails", store(storage(baseline={"snapshots": []})), checks_tasks, False,
@@ -2046,6 +2060,18 @@ for label, files, fail, checks in (
         ("two new snapshots", dict(before, **NEW, **{f"{SN}-k3s01-2": {"size": 1, "mtime": 1}}), RS, []),
         ("new snapshot with another name", dict(before, **{"etcd-snapshot-k3s01-3": {"size": 1, "mtime": 1}}), RS, [])):
     plays.append(play(f"snapshot metadata: {label}", dict(snap_mock, secrets_encryption_snapshots_after=after_files(files)), snap_cmp, fail, checks))
+# Stage 4: an on-demand-s4-<host> file pruned by K3s retention during a Stage 3 save is reported with the scheduled
+# changes; a default-named on-demand file that disappears is still refused.
+S4OD = "on-demand-s4-k3s01-k3s01-1"
+before_s4 = dict(before, **{S4OD: {"size": 5, "mtime": 0.5}})
+for label, files, fail, checks in (
+        ("a Stage 4 on-demand-s4 snapshot pruned by K3s retention is reported, not refused",
+         dict({k: v for k, v in before_s4.items() if k != S4OD}, **NEW), False,
+         [f"secrets_encryption_snapshot_scheduled_changes == ['{S4OD}']", "secrets_encryption_snapshot_protected_changes == ''"]),
+        ("a default-named on-demand snapshot that disappears beside Stage 4 files is still refused",
+         dict({k: v for k, v in before_s4.items() if k != "on-demand-stage2"}, **NEW), RS, [])):
+    plays.append(play(f"snapshot metadata: {label}", dict(snap_mock, secrets_encryption_snapshot_meta_before=before_s4,
+                                                         secrets_encryption_snapshots_after=after_files(files)), snap_cmp, fail, checks))
 
 # ---------------------------------------------------------------- phase decisions
 

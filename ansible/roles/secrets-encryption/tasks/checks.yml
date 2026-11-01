@@ -7,8 +7,10 @@
 #    exist, keep its type, and, for files, keep its size and modification time
 #    from the first baseline;
 #  - every on-demand snapshot and database directory recorded in the baseline
-#    must still exist. Scheduled snapshots (etcd-snapshot-*) are excluded
-#    because K3s prunes them by its own retention; that is not Stage 3 deletion.
+#    must still exist. Snapshots that K3s prunes by its own retention
+#    (secrets_encryption_scheduled_snapshot_pattern: etcd-snapshot-* and the
+#    Stage 4 on-demand-s4-*) are excluded, even if an older baseline recorded
+#    them; that is not Stage 3 deletion.
 - name: Evaluate snapshot and database preservation
   ansible.builtin.set_fact:
     secrets_encryption_preservation_problems: >-
@@ -34,7 +36,7 @@
       {%- if st.baseline is not mapping or st.baseline.snapshots is not defined or st.baseline.db_dirs is not defined -%}
       {%- set ns.out = ns.out + [name ~ ': preservation baseline malformed'] -%}
       {%- else -%}
-      {%- for f in st.baseline.snapshots if f not in st.snapshot_names -%}
+      {%- for f in st.baseline.snapshots if f not in st.snapshot_names and f is not match(secrets_encryption_scheduled_snapshot_pattern) -%}
       {%- set ns.out = ns.out + [name ~ ': snapshot missing since baseline: ' ~ f] -%}
       {%- endfor -%}
       {%- for d in st.baseline.db_dirs if d not in st.db_dirs -%}

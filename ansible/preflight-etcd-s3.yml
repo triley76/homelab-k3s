@@ -1,0 +1,62 @@
+---
+# Stage 4: read-only preflight (gate S4-5). Nothing is written. See
+# docs/etcd-s3-uploads.md.
+#
+#   ansible-playbook preflight-etcd-s3.yml -e etcd_s3_environment=live
+#   ansible-playbook preflight-etcd-s3.yml -e etcd_s3_environment=live -e etcd_s3_enforce=true
+#
+# Reports booleans and counts only: the version, the UTC time zone, the node
+# name, fallback credentials, AWS and proxy variables, Stage 4 flags or keys
+# outside the drop-in, existing names with the new bases, the extra-metadata
+# ConfigMap, and each member's database size in use as a percentage. The AWS
+# side (an empty etcd/, no access key) is checked separately, in home-cluster.
+- name: Report the Stage 4 etcd S3 preflight
+  hosts: servers
+  become: true
+  gather_facts: false
+
+  vars:
+    etcd_s3_phase: preflight
+
+  pre_tasks:
+    # Runs on the controller, before facts, privilege escalation or any other task.
+    - name: Guard the phase
+      ansible.builtin.import_role:
+        name: etcd-s3
+        tasks_from: guard.yml
+      become: false
+
+  tasks:
+    - name: Check the preconditions
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: preflight.yml
+      vars:
+        etcd_s3_preflight_required: "{{ etcd_s3_enforce }}"
+
+    - name: Check the configuration sources
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: config_check.yml
+      vars:
+        etcd_s3_config_expected: "{{ 'before-write' if etcd_s3_enforce | bool else 'report' }}"
+
+    - name: Show the preflight (booleans and counts only)
+      ansible.builtin.debug:
+        msg:
+          preconditions: "{{ etcd_s3_preflight }}"
+          dropin_present: "{{ etcd_s3_config_state.dropin_exists }}"
+          stage4_keys_outside_dropin: "{{ etcd_s3_config_state.stage4_keys_elsewhere }}"
+
+    - name: Require a server ready for its first configuration
+      ansible.builtin.assert:
+        that:
+          - not etcd_s3_config_state.dropin_exists
+          - etcd_s3_preflight.existing_new_base_files | int == 0
+          - etcd_s3_preflight.db_in_use_percent | int >= 0
+        fail_msg: >-
+          {{ inventory_hostname }}: drop-in present={{ etcd_s3_config_state.dropin_exists }},
+          files with a new base={{ etcd_s3_preflight.existing_new_base_files }},
+          database in use={{ etcd_s3_preflight.db_in_use_percent }}% (-1: unreadable).
+        quiet: true
+      when: etcd_s3_enforce | bool

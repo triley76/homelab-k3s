@@ -1,0 +1,89 @@
+---
+# A node-specific on-demand snapshot: k3s etcd-snapshot save --name
+# on-demand-s4-<host>, always with that explicit name (the default on-demand is
+# shared by every server and prefix-matches earlier on-demand files). The CLI
+# reads the drop-in on every run, so the save uploads with the drop-in's key;
+# that is how a new key is proved before any restart.
+#
+# K3s prints the bucket name, so the save's output is never displayed. Its
+# local retention prunes only on-demand-s4-<host> files. Every other file except
+# the K3s-retained names (the Stage 3 pattern) must keep its size and time.
+- name: List local snapshot files before the save
+  ansible.builtin.find:
+    paths: "{{ etcd_s3_snapshot_dir }}"
+    file_type: file
+    recurse: false
+    hidden: true
+    get_checksum: false
+  register: etcd_s3_snapshots_before
+
+- name: Read the server time before the save
+  ansible.builtin.command:
+    argv: [date, +%s]
+  register: etcd_s3_save_started
+  changed_when: false
+
+- name: Take the on-demand snapshot
+  ansible.builtin.command:
+    argv: ["{{ etcd_s3_k3s_bin }}", etcd-snapshot, save, --name, "{{ etcd_s3_ondemand_name }}"]
+  register: etcd_s3_save
+  changed_when: true
+  failed_when: false
+  no_log: true
+  diff: false
+
+- name: Require a successful save
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_save.rc | default(1) == 0
+    fail_msg: >-
+      The on-demand save on {{ inventory_hostname }} failed (exit {{ etcd_s3_save.rc | default('unknown') }}).
+      Its output is not displayed because K3s prints the bucket name; read the K3s journal on the server.
+    quiet: true
+
+- name: List local snapshot files after the save
+  ansible.builtin.find:
+    paths: "{{ etcd_s3_snapshot_dir }}"
+    file_type: file
+    recurse: false
+    hidden: true
+    get_checksum: false
+  register: etcd_s3_snapshots_after
+
+- name: Compare the local snapshot files
+  vars:
+    es_retained: '^(etcd-snapshot-|on-demand-s4-)'
+    es_before: >-
+      {{ dict(etcd_s3_snapshots_before.files | map(attribute='path') | map('basename')
+      | zip(etcd_s3_snapshots_before.files | map(attribute='size') | zip(etcd_s3_snapshots_before.files | map(attribute='mtime')))) }}
+    es_after: >-
+      {{ dict(etcd_s3_snapshots_after.files | map(attribute='path') | map('basename')
+      | zip(etcd_s3_snapshots_after.files | map(attribute='size') | zip(etcd_s3_snapshots_after.files | map(attribute='mtime')))) }}
+  ansible.builtin.set_fact:
+    etcd_s3_snapshot_new: "{{ es_after.keys() | reject('in', es_before.keys() | list) | list }}"
+    etcd_s3_snapshot_changed: >-
+      {{ es_before.keys() | reject('match', es_retained)
+         | select('in', es_after.keys() | list) | list
+         | map('extract', es_before) | list != (es_before.keys() | reject('match', es_retained)
+         | select('in', es_after.keys() | list) | list | map('extract', es_after) | list) }}
+    etcd_s3_snapshot_missing: "{{ es_before.keys() | reject('match', es_retained) | reject('in', es_after.keys() | list) | list | length }}"
+    etcd_s3_ondemand_local: "{{ es_after.keys() | select('match', '^' ~ (etcd_s3_ondemand_name ~ '-') | regex_escape) | list | length }}"
+
+- name: Require exactly one new on-demand snapshot and no other change
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_snapshot_new | length == 1
+      - etcd_s3_snapshot_new[0] is match('^' ~ ((etcd_s3_ondemand_name ~ '-' ~ inventory_hostname ~ '-') | regex_escape) ~ '[0-9]+$')
+      - etcd_s3_snapshot_missing | int == 0
+      - not (etcd_s3_snapshot_changed | bool)
+      - etcd_s3_ondemand_local | int <= etcd_s3_snapshot_retention | int
+    fail_msg: >-
+      Local snapshots changed unexpectedly on {{ inventory_hostname }}: {{ etcd_s3_snapshot_new | length }} new,
+      {{ etcd_s3_snapshot_missing }} protected missing, protected size or time changed={{ etcd_s3_snapshot_changed }},
+      {{ etcd_s3_ondemand_local }} on-demand-s4 files (retention {{ etcd_s3_snapshot_retention }}).
+    quiet: true
+
+# The upload is reported by the server's ETCDSnapshotFile record for the new
+# object: ready, created after the save started, under the node's own base.
+- name: Wait for the uploaded snapshot's record
+  ansible.builtin.include_tasks: record_wait.yml

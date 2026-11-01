@@ -1,0 +1,109 @@
+---
+# Stage 4: configure etcd S3 uploads on one server. See docs/etcd-s3-uploads.md.
+#
+#   export HOMELAB_ETCD_S3_KEY_FILE=<0600 key file in a 0700 tmpfs directory>
+#   export HOMELAB_ETCD_S3_BUCKET_FILE=<0600 bucket file>
+#   ansible-playbook configure-etcd-s3.yml --limit k3s01 \
+#     -e etcd_s3_environment=live \
+#     -e etcd_s3_confirm=configure:k3s01:$(date -u +%Y%m%dT%H%M%SZ)
+#
+# Writes the drop-in (root-only, 0600; it holds the access key persistently),
+# then proves it with an on-demand upload under on-demand-s4-<host>. It does not
+# restart K3s: scheduled uploads start only after restart-etcd-s3.yml.
+- name: Configure etcd S3 uploads on one server
+  hosts: servers
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  max_fail_percentage: 0
+
+  vars:
+    etcd_s3_phase: configure
+
+  pre_tasks:
+    # Runs on the controller, before facts, credentials, privilege escalation or any other task.
+    - name: Guard the phase
+      ansible.builtin.import_role:
+        name: etcd-s3
+        tasks_from: guard.yml
+      become: false
+
+    - name: Require the Stage 3 enabled state
+      ansible.builtin.import_role:
+        name: etcd-s3
+        tasks_from: stage3.yml
+      become: false
+
+    - name: Load the credentials from the operator's files
+      ansible.builtin.import_role:
+        name: etcd-s3
+        tasks_from: credentials.yml
+      become: false
+
+  tasks:
+    - name: Check the preconditions
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: preflight.yml
+      vars:
+        etcd_s3_preflight_required: true
+
+    - name: Compute the settings
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: values.yml
+
+    - name: Check the configuration before the write
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: config_check.yml
+      vars:
+        etcd_s3_config_expected: before-write
+
+    # D1: on the first configuration no local file may start with a new base.
+    # A rotation (the drop-in already exists) keeps the server's own Stage 4 files.
+    - name: Require no file with a new base before the first configuration
+      ansible.builtin.assert:
+        that:
+          - etcd_s3_config_state.dropin_exists or etcd_s3_preflight.existing_new_base_files | int == 0
+        fail_msg: >-
+          {{ etcd_s3_preflight.existing_new_base_files }} local snapshot files on {{ inventory_hostname }}
+          already start with a Stage 4 base, but no drop-in exists. K3s retention would prune them.
+        quiet: true
+
+    - name: Consume the confirmation
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: ledger.yml
+
+    - name: Write the drop-in
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: dropin.yml
+
+    - name: Verify the configuration
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: config_check.yml
+      vars:
+        etcd_s3_config_expected: present
+
+    - name: Prove the drop-in with an on-demand upload
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: ondemand.yml
+
+    - name: Check for credential leaks
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: leaks.yml
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          dropin: written, root-owned 0600 (holds the key persistently)
+          on_demand_upload: ready
+          leak_counts: 0
+          next: restart-etcd-s3.yml on this server, before scheduled uploads use the drop-in

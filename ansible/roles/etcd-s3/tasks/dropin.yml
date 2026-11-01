@@ -1,0 +1,75 @@
+---
+# D3: writes /etc/rancher/k3s/config.yaml.d/30-etcd-s3.yaml, root-owned 0600,
+# with the D1 and D4 settings, the bucket and the access key. The file holds
+# the key persistently on the server until a rotation replaces it; only root
+# (and so K3s) can read it. The write has no_log, no diff and no backup, and is
+# verified by stat without checksums and by the probe's booleans only.
+- name: Inspect the K3s configuration directory
+  ansible.builtin.stat:
+    path: "{{ etcd_s3_config_dir }}"
+    follow: false
+    get_checksum: false
+  register: etcd_s3_config_dir_stat
+
+- name: Require a root-owned configuration directory that only root can write
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_config_dir_stat.stat.exists and etcd_s3_config_dir_stat.stat.isdir
+      - not etcd_s3_config_dir_stat.stat.islnk
+      - etcd_s3_config_dir_stat.stat.uid == etcd_s3_owner_uid | int
+      - not etcd_s3_config_dir_stat.stat.wgrp and not etcd_s3_config_dir_stat.stat.woth
+    fail_msg: "{{ etcd_s3_config_dir }} is missing, a link, not root-owned, or writable by others."
+    quiet: true
+
+- name: Inspect the existing drop-in
+  ansible.builtin.stat:
+    path: "{{ etcd_s3_dropin_path }}"
+    follow: false
+    get_checksum: false
+  register: etcd_s3_dropin_before
+
+- name: Require the drop-in to be absent or a regular file
+  ansible.builtin.assert:
+    that:
+      - not etcd_s3_dropin_before.stat.exists or (etcd_s3_dropin_before.stat.isreg and not etcd_s3_dropin_before.stat.islnk)
+    fail_msg: "{{ etcd_s3_dropin_path }} exists but is not a regular file; nothing was written."
+    quiet: true
+
+- name: Write the Stage 4 drop-in
+  ansible.builtin.copy:
+    content: >-
+      {{ etcd_s3_dropin_values
+         | combine({'etcd-s3-bucket': etcd_s3_credentials.bucket,
+                    'etcd-s3-access-key': etcd_s3_credentials.access_key,
+                    'etcd-s3-secret-key': etcd_s3_credentials.secret_key})
+         | to_nice_yaml(indent=2) }}
+    dest: "{{ etcd_s3_dropin_path }}"
+    owner: "{{ etcd_s3_owner }}"
+    group: "{{ etcd_s3_owner }}"
+    mode: '0600'
+    follow: false
+    backup: false
+  register: etcd_s3_dropin_write
+  no_log: true
+  diff: false
+
+- name: Inspect the written drop-in
+  ansible.builtin.stat:
+    path: "{{ etcd_s3_dropin_path }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: etcd_s3_dropin_after
+  no_log: true
+  diff: false
+
+- name: Require a root-owned 0600 regular drop-in
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_dropin_after.stat.exists and etcd_s3_dropin_after.stat.isreg
+      - not etcd_s3_dropin_after.stat.islnk
+      - etcd_s3_dropin_after.stat.mode == '0600'
+      - etcd_s3_dropin_after.stat.uid == etcd_s3_owner_uid | int
+    quiet: true
+  no_log: true
+  diff: false

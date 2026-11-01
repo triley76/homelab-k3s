@@ -1,0 +1,77 @@
+---
+# Stage 4: restart one K3s server so that its scheduled snapshots use the
+# drop-in. See docs/etcd-s3-uploads.md.
+#
+#   ansible-playbook restart-etcd-s3.yml --limit k3s01 \
+#     -e etcd_s3_environment=live \
+#     -e etcd_s3_confirm=restart:k3s01:$(date -u +%Y%m%dT%H%M%SZ)
+#
+# Refuses before the restart unless the drop-in is the approved one (D1 name
+# included), the Stage 3 enabled validation passes and the preconditions hold.
+- name: Restart one K3s server for etcd S3 uploads
+  hosts: servers
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  max_fail_percentage: 0
+
+  vars:
+    etcd_s3_phase: restart
+
+  pre_tasks:
+    # Runs on the controller, before facts, privilege escalation or any other task.
+    - name: Guard the phase
+      ansible.builtin.import_role:
+        name: etcd-s3
+        tasks_from: guard.yml
+      become: false
+
+    - name: Require the Stage 3 enabled state
+      ansible.builtin.import_role:
+        name: etcd-s3
+        tasks_from: stage3.yml
+      become: false
+
+  tasks:
+    - name: Check the preconditions
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: preflight.yml
+      vars:
+        etcd_s3_preflight_required: true
+
+    - name: Compute the settings
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: values.yml
+
+    - name: Verify the configuration before the restart
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: config_check.yml
+      vars:
+        etcd_s3_config_expected: present
+
+    - name: Consume the confirmation
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: ledger.yml
+
+    - name: Restart K3s
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: restart.yml
+
+    - name: Check for credential leaks
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: leaks.yml
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          restarted: true
+          every_server_ready: true
+          leak_counts: 0

@@ -1,0 +1,58 @@
+---
+# Server-side S3 settings are read only when K3s starts, so scheduled snapshots
+# use the drop-in (or a rotated key) only after this restart. One server per
+# invocation, after the drop-in has been verified (config_check.yml), the
+# Stage 3 enabled validation and the preconditions; the next server only after
+# this one is ready and every server is Ready.
+- name: Read the K3s service before the restart
+  ansible.builtin.command:
+    argv: ["{{ etcd_s3_systemctl }}", show, --property, MainPID, --value, "{{ etcd_s3_service }}"]
+  register: etcd_s3_pid_before
+  changed_when: false
+
+- name: Restart K3s
+  ansible.builtin.command:
+    argv: ["{{ etcd_s3_systemctl }}", restart, "{{ etcd_s3_service }}"]
+  register: etcd_s3_restart
+  changed_when: true
+  no_log: true
+  diff: false
+
+- name: Wait for the local API to be ready
+  ansible.builtin.command:
+    argv: ["{{ etcd_s3_k3s_bin }}", kubectl, get, --raw, /readyz]
+  register: etcd_s3_readyz
+  until: etcd_s3_readyz.rc == 0 and etcd_s3_readyz.stdout | trim == 'ok'
+  retries: "{{ (etcd_s3_restart_timeout_seconds | int / 10) | round(0, 'ceil') | int }}"
+  delay: 10
+  changed_when: false
+
+- name: Wait for every server to be Ready
+  ansible.builtin.command:
+    argv:
+      - "{{ etcd_s3_k3s_bin }}"
+      - kubectl
+      - get
+      - node
+      - "{{ item }}"
+      - --output=jsonpath={.status.conditions[?(@.type=="Ready")].status}
+  register: etcd_s3_node_ready
+  until: etcd_s3_node_ready.rc == 0 and etcd_s3_node_ready.stdout | trim == 'True'
+  retries: "{{ (etcd_s3_restart_timeout_seconds | int / 10) | round(0, 'ceil') | int }}"
+  delay: 10
+  changed_when: false
+  loop: "{{ groups['servers'] }}"
+
+- name: Read the K3s service after the restart
+  ansible.builtin.command:
+    argv: ["{{ etcd_s3_systemctl }}", show, --property, MainPID, --value, "{{ etcd_s3_service }}"]
+  register: etcd_s3_pid_after
+  changed_when: false
+
+- name: Require a new K3s process
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_pid_after.stdout | trim is match('^[1-9][0-9]*$')
+      - etcd_s3_pid_after.stdout | trim != etcd_s3_pid_before.stdout | trim
+    fail_msg: "K3s on {{ inventory_hostname }} did not come back as a new process."
+    quiet: true
