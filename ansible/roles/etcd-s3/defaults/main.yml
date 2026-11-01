@@ -1,0 +1,24 @@
+---
+# Settings an operator may pass. Everything else is fixed in vars/main.yml.
+
+# validate-etcd-s3.yml and preflight-etcd-s3.yml: report only (false) or fail
+# when an expectation is not met (true).
+etcd_s3_enforce: false
+# validate-etcd-s3.yml: configured (drop-in and leak checks) or uploading (also
+# scheduled uploads from this server within the freshness limit).
+etcd_s3_expect: configured
+etcd_s3_max_upload_age_hours: 14
+# true requires an approved integrity method; none is approved yet, so true
+# always fails (closed).
+etcd_s3_expect_integrity: false
+
+# Rehearsal only (an S3-compatible endpoint such as MinIO): refused for any
+# inventory that contains a live host name, whatever environment is declared.
+etcd_s3_rehearsal_endpoint: ""
+etcd_s3_rehearsal_endpoint_ca: ""
+
+# restart: how long to wait for the restarted server to become ready.
+etcd_s3_restart_timeout_seconds: 600
+# snapshot and configure: how long to wait for the on-demand record.
+etcd_s3_record_retries: 12
+etcd_s3_record_delay_seconds: 10

@@ -1,0 +1,35 @@
+---
+# D5: the enforced Stage 3 enabled validation must pass on all three servers
+# immediately before the drop-in is written, before each restart and before
+# each on-demand save, so that no pre-encryption snapshot is ever uploaded
+# (for example after a restore of the pre-encryption checkpoint). It runs as a
+# separate ansible-playbook process against the same inventory, because
+# validate-secrets-encryption.yml targets servers[0], which the single-host
+# limit of a Stage 4 phase would otherwise exclude. Its report is not
+# displayed here; only its exit status decides.
+- name: Run the enforced Stage 3 enabled validation
+  ansible.builtin.command:
+    argv: >-
+      {{ ['ansible-playbook']
+         + (ansible_inventory_sources | map('regex_replace', '^', '--inventory=') | list)
+         + [playbook_dir ~ '/validate-secrets-encryption.yml',
+            '--extra-vars', 'secrets_encryption_enforce=true',
+            '--extra-vars', 'secrets_encryption_expect=enabled'] }}
+    chdir: "{{ playbook_dir }}"
+  register: etcd_s3_stage3
+  changed_when: false
+  failed_when: false
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Require the Stage 3 enabled state on every server
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_stage3.rc | default(1) == 0
+    fail_msg: >-
+      The enforced Stage 3 validation (validate-secrets-encryption.yml -e secrets_encryption_enforce=true
+      -e secrets_encryption_expect=enabled) failed with exit {{ etcd_s3_stage3.rc | default('unknown') }}.
+      Run it directly to see why. Stage 4 uploads only snapshots of the encrypted cluster.
+    quiet: true
+  run_once: true

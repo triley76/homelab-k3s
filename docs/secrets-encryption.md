@@ -14,7 +14,7 @@ Kubernetes Secrets encryption at rest is **active on the live cluster**. The aut
 - **Still open:**
   - the cleanup of the Stage 3 state directories;
   - any restore rehearsal from the off-node recovery material. None was performed;
-  - Stage 4's scheduled K3s snapshot uploads. The [interim manual p2 copy](#key-material-and-the-off-node-recovery-copy) of 2026-10-30 is not Stage 4.
+  - Stage 4's scheduled K3s snapshot uploads. They are implemented with static tests only ([etcd snapshot uploads](etcd-s3-uploads.md)), not rehearsed or deployed. The [interim manual p2 copy](#key-material-and-the-off-node-recovery-copy) of 2026-10-30 is not Stage 4.
 - [`site.yml`](../ansible/site.yml) does not run any of it.
 
 Statements about K3s behavior below are the documented or source-code behavior of K3s `v1.36.4+k3s1`, except where they are marked as observed in a rehearsal or in the live record. Behavior under systemd is as observed in the [three-VM record](#three-vm-rehearsal-record-2026-10-27-commit-825b09b-passed) and on the live servers.
@@ -247,7 +247,8 @@ Every line must be recognized, and every field must appear exactly once where re
 
 Whether a CLI save prunes with the CLI's `--name` or with the server's configured snapshot name is a [rehearsal question](#rehearsal-questions). Preservation is therefore checked, not assumed:
 
-- **Before and after the save:** the size and time of every non-scheduled snapshot file are compared. Any missing or changed file stops the run. Changes among scheduled snapshots (`etcd-snapshot-*`), which K3s prunes by its own retention, are reported separately as scheduled retention and are not Stage 3 deletions.
+- **Before and after the save:** the size and time of every snapshot file that K3s does not prune itself are compared. Any missing or changed file stops the run. Changes among the snapshots K3s prunes by its own retention, matched by `^(etcd-snapshot-|on-demand-s4-)`, are reported separately as K3s retention and are not Stage 3 deletions. That pattern covers the scheduled snapshots (`etcd-snapshot-*`, including the Stage 4 base `etcd-snapshot-s4-<host>`) and the Stage 4 on-demand base `on-demand-s4-<host>` ([etcd snapshot uploads](etcd-s3-uploads.md#stage-3-interaction)). Default-named `on-demand-*` files and `stage3-*` checkpoints stay tracked.
+- **Uploads:** once Stage 4 has written a server's S3 drop-in, this save is uploaded too. Its unique name keeps S3 retention from pruning it.
 - **After the save:** the full preservation gate runs again, including the protected Stage 2 artifacts.
 - **Record:** the name, size, time and SHA-256 of the new snapshot file are reported, and appended with the checkpoint label to the `checkpoints` file in the state directory on the first server (decision D4). The file is never read into Ansible.
 - **Token:** before the save, the server token file is checked by `lstat` alone (present, non-empty, root-owned, regular, not a link). Its content is never read, and the record holds only `token=present`.
@@ -255,7 +256,7 @@ Whether a CLI save prunes with the CLI's `--name` or with the server's configure
 **Preservation on every mutating run:**
 
 - **Protected Stage 2 artifacts** (`secrets_encryption_protected_paths`, mandatory live) must exist, must not be symbolic links, and must keep their type. Files must also keep their size and modification time from the first baseline. They are inspected by `stat` alone: no content is read and no checksum is computed. Reports refer to them by number only.
-- **Recorded entries:** every on-demand snapshot name and database directory name recorded in the baseline must still exist. Scheduled snapshots are excluded.
+- **Recorded entries:** every on-demand snapshot name and database directory name recorded in the baseline must still exist. Snapshots that K3s prunes by its own retention (the pattern above) are excluded, including any that an older baseline recorded.
 - **The baseline** lives in the state directory, only grows, and also records each server's swap size for the swap-invariance check.
 
 The automation contains no snapshot deletion, prune, restore, cluster reset, rejoin, database removal or move.

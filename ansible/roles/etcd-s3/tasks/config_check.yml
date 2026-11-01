@@ -1,0 +1,63 @@
+---
+# D1 and D3 checks of the server's K3s configuration, by the probe: the drop-in
+# is a root-owned 0600 regular file with only allowlisted keys and the expected
+# values; the effective etcd-snapshot-name, across config.yaml and every
+# drop-in, is defined exactly once, in the drop-in, as this server's
+# etcd-snapshot-s4- base; no other source sets a Stage 4 key; the unit carries
+# no Stage 4 flag; and root has no AWS credentials file. Values are never
+# displayed: only the probe's booleans and counts.
+- name: Probe the K3s configuration
+  ansible.builtin.include_tasks: probe.yml
+  vars:
+    etcd_s3_probe_mode: config
+
+- name: Record the configuration state
+  ansible.builtin.set_fact:
+    etcd_s3_config_state: "{{ etcd_s3_probe_result }}"
+
+- name: Require the approved Stage 4 configuration
+  vars:
+    es_c: "{{ etcd_s3_probe_result }}"
+  ansible.builtin.assert:
+    that:
+      - es_c.unparsable | int == 0
+      - es_c.dropin_exists | bool and es_c.dropin_regular | bool
+      - es_c.dropin_mode_ok | bool and es_c.dropin_owner_ok | bool
+      - es_c.dropin_unknown_keys | int == 0
+      - es_c.dropin_missing_keys | int == 0
+      - es_c.values_match | bool
+      - es_c.name_definitions | int == 1
+      - es_c.name_ok | bool
+      - es_c.access_key_format_ok | bool and es_c.secret_key_format_ok | bool and es_c.bucket_format_ok | bool
+      - es_c.stage4_keys_elsewhere | int == 0
+      - es_c.unit_stage4_flags | int == 0
+      - es_c.root_aws_absent | bool
+    fail_msg: >-
+      The Stage 4 configuration on {{ inventory_hostname }} is not the approved one (values are not
+      displayed): {{ es_c | dict2items | rejectattr('key', 'in', ['unparsable', 'dropin_unknown_keys',
+      'dropin_missing_keys', 'name_definitions', 'stage4_keys_elsewhere', 'unit_stage4_flags'])
+      | selectattr('value', 'false') | map(attribute='key') | list }} false;
+      unparsable={{ es_c.unparsable }}, unknown keys={{ es_c.dropin_unknown_keys }},
+      missing keys={{ es_c.dropin_missing_keys }}, name definitions={{ es_c.name_definitions }},
+      Stage 4 keys elsewhere={{ es_c.stage4_keys_elsewhere }}, unit flags={{ es_c.unit_stage4_flags }}.
+    quiet: true
+  when: etcd_s3_config_expected == 'present'
+
+# Before the first write: no other source may set a Stage 4 key, and the unit
+# carries no Stage 4 flag. The drop-in itself may be absent (first
+# configuration) or present (a rotation).
+- name: Require no Stage 4 setting outside the drop-in
+  vars:
+    es_c: "{{ etcd_s3_probe_result }}"
+  ansible.builtin.assert:
+    that:
+      - es_c.unparsable | int == 0
+      - es_c.stage4_keys_elsewhere | int == 0
+      - es_c.unit_stage4_flags | int == 0
+      - not es_c.dropin_exists or (es_c.dropin_regular | bool)
+    fail_msg: >-
+      A K3s configuration source other than the Stage 4 drop-in sets etcd-s3 or etcd-snapshot keys
+      ({{ es_c.stage4_keys_elsewhere }}), the unit carries such flags ({{ es_c.unit_stage4_flags }}), a source
+      is unparsable ({{ es_c.unparsable }}), or the drop-in is not a regular file.
+    quiet: true
+  when: etcd_s3_config_expected == 'before-write'

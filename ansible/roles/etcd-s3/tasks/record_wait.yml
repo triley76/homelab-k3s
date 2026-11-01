@@ -1,0 +1,31 @@
+---
+# After an on-demand save: this server's ETCDSnapshotFile records must show the
+# new upload, ready, under its own on-demand base, within the S3 retention,
+# and no S3 record under the folder may use an unapproved base. Records are
+# read by the probe; only counts and times are returned (never annotations,
+# which hold K3s's token hash, or the bucket).
+- name: Wait for this server's ready on-demand S3 record
+  ansible.builtin.include_tasks: probe.yml
+  vars:
+    etcd_s3_probe_mode: snapshots
+    etcd_s3_probe_wait:
+      since: "{{ etcd_s3_save_started.stdout | int }}"
+      seconds: "{{ etcd_s3_record_retries | int * etcd_s3_record_delay_seconds | int }}"
+      delay: "{{ etcd_s3_record_delay_seconds | int }}"
+
+- name: Require the uploaded on-demand snapshot
+  vars:
+    es_s: "{{ etcd_s3_probe_result }}"
+  ansible.builtin.assert:
+    that:
+      - es_s.records_read | bool
+      - es_s.s3_newest_ondemand_epoch | int >= etcd_s3_save_started.stdout | int
+      - es_s.s3.ondemand_s4 | int >= 1
+      - es_s.s3.ondemand_s4 | int <= etcd_s3_s3_retention | int
+      - es_s.s3.unapproved_base | int == 0
+    fail_msg: >-
+      No ready S3 record for the new on-demand snapshot on {{ inventory_hostname }}, or the S3 records are
+      outside the approved state: records read={{ es_s.records_read }}, ready on-demand-s4
+      records={{ es_s.s3.ondemand_s4 }} (retention {{ etcd_s3_s3_retention }}), not ready={{ es_s.s3.not_ready }},
+      unapproved bases={{ es_s.s3.unapproved_base }}.
+    quiet: true

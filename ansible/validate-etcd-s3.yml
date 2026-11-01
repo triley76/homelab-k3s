@@ -1,0 +1,56 @@
+---
+# Stage 4: read-only report of each server's upload state. Nothing is written,
+# restarted or uploaded. See docs/etcd-s3-uploads.md.
+#
+#   ansible-playbook validate-etcd-s3.yml -e etcd_s3_environment=live
+#   ansible-playbook validate-etcd-s3.yml -e etcd_s3_environment=live \
+#     -e etcd_s3_enforce=true -e etcd_s3_expect=uploading
+#
+# Reports counts, ages and booleans only. Upload integrity is reported as not
+# verified; -e etcd_s3_expect_integrity=true fails closed until a method is
+# rehearsal-approved.
+- name: Report the Stage 4 etcd S3 state
+  hosts: servers
+  become: true
+  gather_facts: false
+
+  vars:
+    etcd_s3_phase: validate
+
+  pre_tasks:
+    # Runs on the controller, before facts, privilege escalation or any other task.
+    - name: Guard the phase
+      ansible.builtin.import_role:
+        name: etcd-s3
+        tasks_from: guard.yml
+      become: false
+
+  tasks:
+    - name: Check the preconditions
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: preflight.yml
+      vars:
+        etcd_s3_preflight_required: "{{ etcd_s3_enforce }}"
+
+    - name: Compute the settings
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: values.yml
+
+    - name: Check the configuration
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: config_check.yml
+      vars:
+        etcd_s3_config_expected: "{{ 'present' if etcd_s3_enforce | bool else 'report' }}"
+
+    - name: Check for credential leaks
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: leaks.yml
+
+    - name: Report the snapshots
+      ansible.builtin.include_role:
+        name: etcd-s3
+        tasks_from: report.yml

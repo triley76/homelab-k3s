@@ -11,9 +11,10 @@
 # server's configured snapshot name is a rehearsal question, so preservation is
 # checked by metadata before and after, not assumed: every non-scheduled
 # snapshot must keep its size and time, and the protected Stage 2 artifacts are
-# re-checked. Changes among scheduled snapshots (etcd-snapshot-*), which K3s
-# prunes by its own retention, are reported separately and are not Stage 3
-# deletions.
+# re-checked. Changes among the snapshots K3s prunes by its own retention
+# (etcd-snapshot-* and the Stage 4 on-demand-s4-*) are reported separately and
+# are not Stage 3 deletions. Once Stage 4 has written the S3 drop-in, this save
+# is also uploaded; its unique name keeps S3 retention from pruning it.
 - name: Require a checkpoint label
   ansible.builtin.assert:
     that:

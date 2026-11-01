@@ -1,0 +1,144 @@
+---
+# Fixed values of the Stage 4 etcd S3 upload configuration (home-cluster backup
+# design, Stage 4, decisions D1 to D4). They are role vars, not defaults, so
+# inventory cannot override them by accident; the guard compares every value
+# with this file. See docs/etcd-s3-uploads.md.
+
+# The only K3s release this configuration was written and reviewed for.
+etcd_s3_supported_k3s_version: v1.36.4+k3s1
+
+etcd_s3_k3s_bin: /usr/local/bin/k3s
+etcd_s3_systemctl: /usr/bin/systemctl
+etcd_s3_journalctl: /usr/bin/journalctl
+etcd_s3_service: k3s
+
+# K3s reads config.yaml, then config.yaml.d/*.yaml in alphabetical order. The
+# Stage 4 drop-in holds the D1 and D4 settings and the access key.
+etcd_s3_config_file: /etc/rancher/k3s/config.yaml
+etcd_s3_config_dir: /etc/rancher/k3s/config.yaml.d
+etcd_s3_dropin_path: /etc/rancher/k3s/config.yaml.d/30-etcd-s3.yaml
+etcd_s3_unit_file: /etc/systemd/system/k3s.service
+etcd_s3_unit_env_file: /etc/systemd/system/k3s.service.env
+# K3s falls back to root's AWS credentials file; preflight requires it absent.
+etcd_s3_root_aws_dir: /root/.aws
+etcd_s3_snapshot_dir: /var/lib/rancher/k3s/server/db/snapshots
+etcd_s3_hostname_file: /etc/hostname
+etcd_s3_localtime: /etc/localtime
+# Read only for the database size against its size in use, reported as a ratio.
+etcd_s3_etcd_metrics_url: http://127.0.0.1:2381/metrics
+# Owner of the drop-in and the state directory.
+etcd_s3_owner: root
+etcd_s3_owner_uid: 0
+# The used-confirmation ledger. It holds confirmation IDs only.
+etcd_s3_state_dir: /var/lib/homelab-etcd-s3
+
+# D1: a per-server base in one shared folder. K3s retention matches plain string
+# prefixes with no node filter, so no rendered base may be a string prefix of
+# another (checked by the guard over the whole inventory).
+etcd_s3_scheduled_base_prefix: etcd-snapshot-s4-
+etcd_s3_ondemand_base_prefix: on-demand-s4-
+etcd_s3_snapshot_retention: 5
+etcd_s3_s3_retention: 5
+# Shared by every server: each server's reconciliation lists the whole folder
+# and deletes the records of objects it cannot see.
+etcd_s3_folder: etcd
+# Bases that may appear under the folder. Anything else is reported.
+etcd_s3_approved_bases:
+  - etcd-snapshot-s4-
+  - on-demand-s4-
+  - stage3-
+# Inventory host names (and so K3s node names) that the bases are built from.
+etcd_s3_host_pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+
+# D4.
+etcd_s3_schedule_cron: "0 */12 * * *"
+etcd_s3_compress: false
+etcd_s3_region: us-east-1
+etcd_s3_endpoint: s3.amazonaws.com
+etcd_s3_bucket_lookup_type: auto
+etcd_s3_timeout: 5m0s
+
+# D3: credentials enter Ansible only from the operator's files, named by these
+# environment variables. The key file must be a 0600 file owned by the
+# operator, in a 0700 directory on tmpfs; it is the AWS CLI's create-access-key
+# JSON output. The bucket file is the operator's existing 0600 file; its first
+# line is the bucket name.
+etcd_s3_key_file_env: HOMELAB_ETCD_S3_KEY_FILE
+etcd_s3_bucket_file_env: HOMELAB_ETCD_S3_BUCKET_FILE
+etcd_s3_identity_user: home-cluster-etcd-backup
+etcd_s3_access_key_pattern: '^AKIA[0-9A-Z]{16}$'
+etcd_s3_secret_key_pattern: '^[A-Za-z0-9/+]{40}$'
+etcd_s3_bucket_pattern: '^home-cluster-backup-[a-z0-9]{8,32}$'
+etcd_s3_key_file_max_bytes: 4096
+
+# Every key the drop-in may hold. The two credential keys are never displayed.
+etcd_s3_dropin_keys:
+  - etcd-snapshot-name
+  - etcd-snapshot-retention
+  - etcd-snapshot-schedule-cron
+  - etcd-snapshot-compress
+  - etcd-s3
+  - etcd-s3-endpoint
+  - etcd-s3-endpoint-ca
+  - etcd-s3-region
+  - etcd-s3-bucket
+  - etcd-s3-folder
+  - etcd-s3-retention
+  - etcd-s3-bucket-lookup-type
+  - etcd-s3-timeout
+  - etcd-s3-proxy
+  - etcd-s3-access-key
+  - etcd-s3-secret-key
+
+# The live cluster. Rehearsal inventories must not use these names.
+etcd_s3_live_hosts:
+  - k3s01
+  - k3s02
+  - k3s03
+
+# The phase each play may run, keyed by its exact play name. The guard binds
+# etcd_s3_phase to ansible_play_name, which extra vars cannot override.
+etcd_s3_play_phases:
+  Configure etcd S3 uploads on one server: configure
+  Restart one K3s server for etcd S3 uploads: restart
+  Take a Stage 4 on-demand etcd snapshot: snapshot
+  Report the Stage 4 etcd S3 preflight: preflight
+  Report the Stage 4 etcd S3 state: validate
+etcd_s3_mutating_phases:
+  - configure
+  - restart
+  - snapshot
+etcd_s3_confirm_max_age_minutes: 30
+
+# Names that only the role sets. A run in which any of them is already defined
+# (extra vars or inventory) is refused, so no credential, bucket, snapshot name
+# or gathered state can enter from the command line.
+etcd_s3_reserved_vars:
+  - etcd_s3_access_key
+  - etcd_s3_secret_key
+  - etcd_s3_bucket
+  - etcd_s3_key_file
+  - etcd_s3_bucket_file
+  - etcd_s3_credentials
+  - etcd_s3_sources
+  - etcd_s3_ondemand_name
+  - etcd_s3_scheduled_name
+  - etcd_s3_dropin_values
+  - etcd_s3_probe_result
+  - etcd_s3_confirm_id
+  - etcd_s3_save_started
+  - secrets_encryption_enforce
+  - secrets_encryption_expect
+
+# Upload integrity (home-cluster design, S4-1 decision 4). An ETag is never an
+# integrity check. A check is accepted only by a method listed here, added by a
+# reviewed change that cites the S4-2 rehearsal record. Empty: every integrity
+# expectation fails closed.
+etcd_s3_integrity_approved_methods: []
+
+# Output settings the guard refuses, because they could display or keep
+# credential-bearing task arguments or results.
+etcd_s3_refused_config:
+  - DEFAULT_DEBUG
+  - DEFAULT_KEEP_REMOTE_FILES
+  - DISPLAY_ARGS_TO_STDOUT
